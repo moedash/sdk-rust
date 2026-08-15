@@ -72,8 +72,8 @@ pub(super) struct ManagedRun {
     ///
     /// This field is `None` when `WorkerTaskTypes.enable_local_activities` is false.
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
-    /// Set if the run is currently waiting on the execution of some local activities.
-    waiting_on_la: Option<WaitingOnLAs>,
+    /// Local work that may retain the open workflow task -- today, outstanding local activities.
+    waiting_on_local_work: WaitingOnLocalWork,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
     /// do is be evicted.
     am_broken: bool,
@@ -114,7 +114,7 @@ impl ManagedRun {
         let mut me = Self {
             wfm,
             local_activity_request_sink,
-            waiting_on_la: None,
+            waiting_on_local_work: Default::default(),
             am_broken: false,
             wft: None,
             activation: None,
@@ -141,7 +141,7 @@ impl ManagedRun {
     }
 
     pub(super) fn waiting_on_local_activities(&self) -> bool {
-        self.waiting_on_la.is_some()
+        self.waiting_on_local_work.local_activities.is_some()
     }
 
     pub(super) fn have_seen_terminal_event(&self) -> bool {
@@ -227,7 +227,7 @@ impl ManagedRun {
             start_time,
             permit: pwft.permit,
         });
-        if let Some(waiting) = self.waiting_on_la.as_mut() {
+        if let Some(waiting) = self.waiting_on_local_work.local_activities.as_mut() {
             waiting.hb_timeout_handle.abort();
             waiting.heartbeat_timeout_pending = false;
         }
@@ -266,7 +266,7 @@ impl ManagedRun {
             if self.wfm.machines.outstanding_local_activity_count() > 0 {
                 // If the activation has no jobs but there are outstanding LAs, we need to restart
                 // the WFT heartbeat.
-                if let Some(ref mut lawait) = self.waiting_on_la {
+                if let Some(ref mut lawait) = self.waiting_on_local_work.local_activities {
                     lawait.hb_timeout_handle.abort();
                     lawait.hb_timeout_handle = sink_heartbeat_timeout_start(
                         self.wfm.machines.run_id.clone(),
@@ -367,12 +367,14 @@ impl ManagedRun {
             Ok(Some(ActivationOrAuto::LangActivation(
                 self.wfm.get_next_activation()?,
             )))
-        } else if self.waiting_on_la.is_some()
-            && self.wfm.machines.outstanding_local_activity_count() == 0
+        } else if self
+            .waiting_on_local_work
+            .finished(self.wfm.machines.outstanding_local_activity_count())
         {
-            self.waiting_on_la
+            self.waiting_on_local_work
+                .local_activities
                 .take()
-                .expect("waiting_on_la was just checked")
+                .expect("local work was just checked to be present")
                 .hb_timeout_handle
                 .abort();
             Ok(Some(ActivationOrAuto::Autocomplete {
@@ -392,7 +394,8 @@ impl ManagedRun {
                 }
             }
             if self
-                .waiting_on_la
+                .waiting_on_local_work
+                .local_activities
                 .as_ref()
                 .is_some_and(|waiting| waiting.heartbeat_timeout_pending)
             {
@@ -744,10 +747,11 @@ impl ManagedRun {
     ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
         let completing_heartbeat_autocomplete =
             matches!(self.activation, Some(OutstandingActivation::Autocomplete))
-                && self.waiting_on_la.is_some();
+                && self.waiting_on_local_work.local_activities.is_some();
         let completing_la_heartbeat = completing_heartbeat_autocomplete
             || self
-                .waiting_on_la
+                .waiting_on_local_work
+                .local_activities
                 .as_ref()
                 .is_some_and(|waiting| waiting.heartbeat_timeout_pending);
         let data = CompletionDataForWFT {
@@ -806,7 +810,7 @@ impl ManagedRun {
 
         match outcome {
             Ok(None) => {
-                if let Some(waiting) = self.waiting_on_la.take() {
+                if let Some(waiting) = self.waiting_on_local_work.local_activities.take() {
                     waiting.hb_timeout_handle.abort();
                 }
                 Ok(Some(self.prepare_complete_resp(
@@ -816,7 +820,7 @@ impl ManagedRun {
                 )))
             }
             Ok(Some((start_t, wft_timeout))) => {
-                if let Some(wola) = self.waiting_on_la.as_mut() {
+                if let Some(wola) = self.waiting_on_local_work.local_activities.as_mut() {
                     wola.hb_timeout_handle.abort();
                 }
                 if completing_la_heartbeat || !data.query_responses.is_empty() {
@@ -829,30 +833,32 @@ impl ManagedRun {
                         wft_timeout,
                     );
                     hb_timeout_handle.abort();
-                    self.waiting_on_la = Some(WaitingOnLAs {
-                        wft_timeout,
-                        hb_timeout_handle,
-                        // Keep this set until the replacement WFT arrives. If pending workflow
-                        // jobs prevent this completion from being reported, the heartbeat still
-                        // needs to be honored after those jobs are processed.
-                        heartbeat_timeout_pending: completing_la_heartbeat,
-                    });
+                    self.waiting_on_local_work.local_activities =
+                        Some(LocalActivityHeartbeatState {
+                            wft_timeout,
+                            hb_timeout_handle,
+                            // Keep this set until the replacement WFT arrives. If pending workflow
+                            // jobs prevent this completion from being reported, the heartbeat still
+                            // needs to be honored after those jobs are processed.
+                            heartbeat_timeout_pending: completing_la_heartbeat,
+                        });
                     Ok(Some(self.prepare_complete_resp(
                         completion.resp_chan,
                         data,
                         true,
                     )))
                 } else {
-                    self.waiting_on_la = Some(WaitingOnLAs {
-                        wft_timeout,
-                        hb_timeout_handle: sink_heartbeat_timeout_start(
-                            self.run_id().to_string(),
-                            self.local_activity_request_sink.as_deref(),
-                            start_t,
+                    self.waiting_on_local_work.local_activities =
+                        Some(LocalActivityHeartbeatState {
                             wft_timeout,
-                        ),
-                        heartbeat_timeout_pending: false,
-                    });
+                            hb_timeout_handle: sink_heartbeat_timeout_start(
+                                self.run_id().to_string(),
+                                self.local_activity_request_sink.as_deref(),
+                                start_t,
+                                wft_timeout,
+                            ),
+                            heartbeat_timeout_pending: false,
+                        });
                     Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -894,7 +900,7 @@ impl ManagedRun {
     }
     /// Returns `true` if autocompletion should be issued to report the heartbeat WFT completion.
     fn _heartbeat_timeout(&mut self) -> bool {
-        if let Some(ref mut wait_dat) = self.waiting_on_la {
+        if let Some(ref mut wait_dat) = self.waiting_on_local_work.local_activities {
             wait_dat.hb_timeout_handle.abort();
             wait_dat.heartbeat_timeout_pending = true;
             return self.activation.is_none();
@@ -1398,13 +1404,41 @@ fn sink_heartbeat_timeout_start(
 }
 
 /// Tracks the heartbeat while a workflow task has outstanding local activities.
-struct WaitingOnLAs {
+struct LocalActivityHeartbeatState {
     wft_timeout: Duration,
     /// Can be used to abort heartbeat timeouts
     hb_timeout_handle: AbortHandle,
     /// Defers the heartbeat when lang must finish an outstanding activation before Core can safely
     /// complete the workflow task.
     heartbeat_timeout_pending: bool,
+}
+
+/// Local work that may retain the open workflow task.
+///
+/// Retention used to be a local-activity concept, expressed as `Option<WaitingOnLAs>` and keyed
+/// off `outstanding_local_activity_count()`. The broader per-run concept is *local work that may
+/// retain the workflow task*, of which outstanding local activities are one kind and an external
+/// stream wait set is another, so the two can be asked the same question without either knowing
+/// about the other.
+#[derive(Default)]
+struct WaitingOnLocalWork {
+    /// Present while local activities are outstanding, or while a heartbeat is deferred waiting
+    /// for lang to finish an activation.
+    local_activities: Option<LocalActivityHeartbeatState>,
+}
+
+impl WaitingOnLocalWork {
+    /// Whether local work was retaining the task and has now finished.
+    ///
+    /// The outstanding local activity count lives on the machines rather than here, so it is
+    /// passed in. Asking through this method is what keeps the retention decision in one place as
+    /// more kinds of local work are added, instead of each caller keying off the count directly.
+    ///
+    /// Note this is not the negation of "retains": a run that never had local work at all has not
+    /// "finished", and autocompleting it would report a workflow task nothing was waiting on.
+    fn finished(&self, outstanding_local_activities: usize) -> bool {
+        self.local_activities.is_some() && outstanding_local_activities == 0
+    }
 }
 #[derive(Debug)]
 struct CompletionDataForWFT {

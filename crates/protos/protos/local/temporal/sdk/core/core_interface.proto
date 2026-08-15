@@ -14,6 +14,7 @@ import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/activity_task/activity_task.proto";
 import "temporal/sdk/core/common/common.proto";
 import "temporal/sdk/core/external_data/external_data.proto";
+import "temporal/sdk/core/external_stream/external_stream.proto";
 import "temporal/sdk/core/workflow_activation/workflow_activation.proto";
 import "temporal/sdk/core/workflow_commands/workflow_commands.proto";
 import "temporal/sdk/core/workflow_completion/workflow_completion.proto";

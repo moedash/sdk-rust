@@ -1081,6 +1081,28 @@ pub mod coresdk {
             }
         }
     }
+    pub mod external_stream {
+        tonic::include_proto!("coresdk.external_stream");
+
+        /// The reserved Signal name external stream wakeups are sent under.
+        ///
+        /// Core intercepts this before user Signal dispatch and suppresses it from user handlers
+        /// whether or not the envelope validates, so an unknown version or a stale generation can
+        /// never reach Workflow code as an unhandled Signal.
+        pub const WAKE_SIGNAL_NAME: &str = "__temporal_external_stream_wake";
+
+        /// The `messageType` metadata a [`WakeSignal`] payload carries.
+        pub const WAKE_SIGNAL_MESSAGE_TYPE: &str = "coresdk.external_stream.WakeSignal";
+
+        /// The only envelope version Core understands today.
+        pub const WAKE_SIGNAL_ENVELOPE_VERSION: u32 = 1;
+
+        /// Reserved `park_generation` meaning "the sender knows of no confirmed park".
+        ///
+        /// Park generations are quiescence generations, which start at 1, so this value cannot
+        /// collide with a real one.
+        pub const UNPARKED_WAKE_GENERATION: u64 = 0;
+    }
     pub mod workflow_activation {
         tonic::include_proto!("coresdk.workflow_activation");
         pub use self::sdk_helpers::*;
@@ -1276,6 +1298,38 @@ pub mod coresdk {
                         }
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
+                        }
+                        workflow_activation_job::Variant::ResolveExternalStreamWaits(r) => {
+                            write!(
+                                f,
+                                "ResolveExternalStreamWaits({}, {} hint(s))",
+                                r.quiescence_generation,
+                                r.ready_hints.len()
+                            )
+                        }
+                        workflow_activation_job::Variant::PrepareExternalStreamPark(p) => {
+                            write!(
+                                f,
+                                "PrepareExternalStreamPark({}, {:?})",
+                                p.quiescence_generation,
+                                p.reason()
+                            )
+                        }
+                        workflow_activation_job::Variant::ReplayExternalStreams(r) => {
+                            write!(
+                                f,
+                                "ReplayExternalStreams({}, {} byte(s))",
+                                r.quiescence_generation,
+                                r.replay_annotation.len()
+                            )
+                        }
+                        workflow_activation_job::Variant::FinalizeExternalStreams(fin) => {
+                            write!(
+                                f,
+                                "FinalizeExternalStreams({}, {:?})",
+                                fin.quiescence_generation,
+                                fin.reason()
+                            )
                         }
                     }
                 }
@@ -1640,6 +1694,60 @@ pub mod coresdk {
             impl Display for RequestCancelNexusOperation {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "RequestCancelNexusOperation({})", self.seq)
+                }
+            }
+
+            impl Display for WorkflowStreamProgress {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "WorkflowStreamProgress({} byte(s){})",
+                        self.observation_delta.len(),
+                        if self.request_rollover {
+                            ", rollover requested"
+                        } else {
+                            ""
+                        }
+                    )
+                }
+            }
+
+            impl Display for WorkflowStreamQuiescent {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "WorkflowStreamQuiescent({}, {} wait(s))",
+                        self.quiescence_generation,
+                        self.waits.len()
+                    )
+                }
+            }
+
+            impl Display for ExternalStreamParkResult {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    let outcome = match self.outcome {
+                        Some(external_stream_park_result::Outcome::Confirmed(_)) => "confirmed",
+                        Some(external_stream_park_result::Outcome::BecameReady(_)) => {
+                            "became ready"
+                        }
+                        None => "no outcome",
+                    };
+                    write!(
+                        f,
+                        "ExternalStreamParkResult({}, {})",
+                        self.quiescence_generation, outcome
+                    )
+                }
+            }
+
+            impl Display for ExternalStreamFinalized {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "ExternalStreamFinalized({}, {} byte(s))",
+                        self.quiescence_generation,
+                        self.final_observation_delta.len()
+                    )
                 }
             }
 
