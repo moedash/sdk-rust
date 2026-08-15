@@ -8,14 +8,17 @@ use crate::{
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
             ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
-            LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
-            OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
-            ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
-            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
-            WorkflowTaskInfo,
+            FailedActivationWFTReport, HistoryUpdate, LocalActivityRequestSink, LocalResolution,
+            NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT, RequestEvictMsg,
+            RunBasics, RunTimerSink, ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand,
+            WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus,
+            WftFailureKind, WorkflowTaskInfo,
+            external_streams::{
+                ExternalStreamReadyResult, ExternalStreamRunStatus, ExternalWaitSet, ParkTrigger,
+            },
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
+            workflow_stream::LocalInputs,
         },
     },
 };
@@ -72,6 +75,9 @@ pub(super) struct ManagedRun {
     ///
     /// This field is `None` when `WorkerTaskTypes.enable_local_activities` is false.
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+    /// Schedules this run's timers without going through the local-activity sink, so a
+    /// workflow-only worker still gets its deadlines.
+    run_timers: RunTimerSink,
     /// Local work that may retain the open workflow task -- today, outstanding local activities.
     waiting_on_local_work: WaitingOnLocalWork,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
@@ -107,6 +113,7 @@ impl ManagedRun {
         basics: RunBasics,
         wft: PermittedWFT,
         local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+        run_timers: RunTimerSink,
     ) -> (Self, RunUpdateAct) {
         let metrics = basics.metrics.clone();
         let config = basics.worker_config.clone();
@@ -114,6 +121,7 @@ impl ManagedRun {
         let mut me = Self {
             wfm,
             local_activity_request_sink,
+            run_timers,
             waiting_on_local_work: Default::default(),
             am_broken: false,
             wft: None,
@@ -268,11 +276,12 @@ impl ManagedRun {
                 // the WFT heartbeat.
                 if let Some(ref mut lawait) = self.waiting_on_local_work.local_activities {
                     lawait.hb_timeout_handle.abort();
-                    lawait.hb_timeout_handle = sink_heartbeat_timeout_start(
-                        self.wfm.machines.run_id.clone(),
-                        self.local_activity_request_sink.as_deref(),
+                    let wft_timeout = lawait.wft_timeout;
+                    lawait.hb_timeout_handle = Self::start_la_heartbeat_timeout_with(
+                        &self.run_timers,
+                        &self.wfm.machines.run_id,
                         start_time,
-                        lawait.wft_timeout,
+                        wft_timeout,
                     );
                     // No activation needs to be sent to lang. We just need to wait for another
                     // heartbeat timeout or LAs to resolve
@@ -754,6 +763,10 @@ impl ManagedRun {
                 .local_activities
                 .as_ref()
                 .is_some_and(|waiting| waiting.heartbeat_timeout_pending);
+        // A run-level rollover deadline forces a replacement task on its own, with no local
+        // activity involved -- which is the whole point of the deadline being the run's rather
+        // than the local-activity subsystem's.
+        let completing_rollover = mem::take(&mut self.waiting_on_local_work.rollover_pending);
         let data = CompletionDataForWFT {
             task_token: completion.task_token,
             query_responses: completion.query_responses,
@@ -816,7 +829,7 @@ impl ManagedRun {
                 Ok(Some(self.prepare_complete_resp(
                     completion.resp_chan,
                     data,
-                    completing_heartbeat_autocomplete,
+                    completing_heartbeat_autocomplete || completing_rollover,
                 )))
             }
             Ok(Some((start_t, wft_timeout))) => {
@@ -826,9 +839,9 @@ impl ManagedRun {
                 if completing_la_heartbeat || !data.query_responses.is_empty() {
                     // Reporting a query while an LA is still running must request another WFT;
                     // otherwise the LA could resolve without a task on which to deliver its job.
-                    let hb_timeout_handle = sink_heartbeat_timeout_start(
-                        self.run_id().to_string(),
-                        self.local_activity_request_sink.as_deref(),
+                    let hb_timeout_handle = Self::start_la_heartbeat_timeout_with(
+                        &self.run_timers,
+                        self.run_id(),
                         start_t,
                         wft_timeout,
                     );
@@ -851,14 +864,19 @@ impl ManagedRun {
                     self.waiting_on_local_work.local_activities =
                         Some(LocalActivityHeartbeatState {
                             wft_timeout,
-                            hb_timeout_handle: sink_heartbeat_timeout_start(
-                                self.run_id().to_string(),
-                                self.local_activity_request_sink.as_deref(),
+                            hb_timeout_handle: Self::start_la_heartbeat_timeout_with(
+                                &self.run_timers,
+                                self.run_id(),
                                 start_t,
                                 wft_timeout,
                             ),
                             heartbeat_timeout_pending: false,
                         });
+                    // Retaining the task reports nothing to the server, so a rollover that was
+                    // pending has not been acted on and must stay pending -- otherwise the
+                    // deadline would be silently swallowed by the very completion that keeps the
+                    // task open past it.
+                    self.waiting_on_local_work.rollover_pending |= completing_rollover;
                     Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -886,6 +904,145 @@ impl ManagedRun {
         } else {
             Ok(None)
         }
+    }
+
+    // --- Run-level timers --------------------------------------------------
+
+    /// The local-activity heartbeat deadline, now scheduled through the run's own timer facility.
+    ///
+    /// A static so it can be called while `self.waiting_on_local_work` is mutably borrowed. The
+    /// deadline itself is unchanged: 80% of the workflow task timeout.
+    fn start_la_heartbeat_timeout_with(
+        timers: &RunTimerSink,
+        run_id: &str,
+        wft_start_time: Instant,
+        wft_timeout: Duration,
+    ) -> AbortHandle {
+        let deadline = wft_start_time.add(wft_timeout.mul_f32(WFT_HEARTBEAT_TIMEOUT_FRACTION));
+        timers.start(deadline, LocalInputs::HeartbeatTimeout(run_id.to_string()))
+    }
+
+    /// Starts (or restarts) this run's workflow task rollover deadline.
+    ///
+    /// A retained workflow task is bounded by the server's workflow task timeout, so a
+    /// continuously fed stream whose gaps stay below the idle timeout would otherwise hold the
+    /// task until it *fails* rather than merely being held too long.
+    #[allow(dead_code, reason = "started by the retention path in C6")]
+    pub(super) fn start_wft_rollover_timer(
+        &mut self,
+        wft_start_time: Instant,
+        wft_timeout: Duration,
+    ) {
+        self.cancel_wft_rollover_timer();
+        let deadline = wft_start_time.add(wft_timeout.mul_f32(WFT_HEARTBEAT_TIMEOUT_FRACTION));
+        self.waiting_on_local_work.wft_rollover_timer = Some(self.run_timers.start(
+            deadline,
+            LocalInputs::WftRolloverDeadline(self.wfm.machines.run_id.clone()),
+        ));
+    }
+
+    #[allow(dead_code, reason = "cancelled by the retention path in C6")]
+    pub(super) fn cancel_wft_rollover_timer(&mut self) {
+        if let Some(handle) = self.waiting_on_local_work.wft_rollover_timer.take() {
+            handle.abort();
+        }
+    }
+
+    /// The rollover deadline expired.
+    ///
+    /// Records that the next completion must request a replacement task, and autocompletes if
+    /// there is no activation outstanding to carry it. Preserving every subscription, cursor, and
+    /// readiness generation across that replacement is C12a's.
+    pub(super) fn wft_rollover_deadline(&mut self) -> RunUpdateAct {
+        self.waiting_on_local_work.wft_rollover_timer = None;
+        self.waiting_on_local_work.rollover_pending = true;
+        let maybe_act = if self.activation.is_none() && self.wft.is_some() {
+            Some(ActivationOrAuto::Autocomplete {
+                run_id: self.wfm.machines.run_id.clone(),
+            })
+        } else {
+            None
+        };
+        self.update_to_acts(Ok(maybe_act.into()))
+    }
+
+    // --- External Workflow Streams -----------------------------------------
+
+    /// A watcher reports a record is buffered for one wait.
+    ///
+    /// Returns the acknowledgement alongside any activation, because the watcher's next action
+    /// depends on which of the five results this was and only the wait set can say.
+    pub(super) fn external_stream_ready(
+        &mut self,
+        wait_id: u32,
+        wait_generation: u64,
+    ) -> (ExternalStreamReadyResult, RunUpdateAct) {
+        let outcome = self
+            .waiting_on_local_work
+            .external_wait_set
+            .notify_ready(wait_id, wait_generation);
+        // Issuing the resolve activation, cancelling the idle timer, and aborting an in-flight
+        // park belong to C7 and C8. Until then readiness is recorded and coalesced, which is what
+        // makes the acknowledgement already meaningful to a watcher.
+        (outcome.into(), None)
+    }
+
+    /// Test scaffolding -- see [`ExternalStreamSeedWaitsMsg`].
+    #[cfg(test)]
+    pub(super) fn seed_external_wait_set(&mut self, msg: &super::ExternalStreamSeedWaitsMsg) {
+        let set = &mut self.waiting_on_local_work.external_wait_set;
+        set.become_quiescent(
+            msg.wait_ids
+                .iter()
+                .map(|id| super::external_streams::ExternalWaitState::new(*id, 0, false)),
+            msg.idle_timeout,
+        );
+        if let Some(generation) = msg.parked_at {
+            set.force_parked(generation);
+        } else {
+            set.set_wft_open(msg.wft_open);
+        }
+    }
+
+    /// The read-only status probe. Must leave the run exactly as it was.
+    pub(super) fn external_stream_run_status(&self) -> ExternalStreamRunStatus {
+        if self.waiting_on_local_work.external_wait_set.is_empty() {
+            // No waits registered at all. The run is cached but holds nothing this probe is
+            // about, which for the sweep is the same instruction as "no open Workflow Task".
+            return ExternalStreamRunStatus::NoOpenWorkflowTask;
+        }
+        self.waiting_on_local_work
+            .external_wait_set
+            .run_status()
+            .into()
+    }
+
+    /// The global quiescence timer for `quiescence_generation` expired.
+    pub(super) fn external_stream_idle_timeout(
+        &mut self,
+        quiescence_generation: u64,
+    ) -> RunUpdateAct {
+        let _ = self
+            .waiting_on_local_work
+            .external_wait_set
+            .start_parking(quiescence_generation, ParkTrigger::IdleTimeout);
+        // Issuing `PrepareExternalStreamPark` is C8's.
+        None
+    }
+
+    /// Lang answered `PrepareExternalStreamPark`.
+    pub(super) fn external_stream_park_result(
+        &mut self,
+        quiescence_generation: u64,
+        confirmed: bool,
+    ) -> RunUpdateAct {
+        let _ = self
+            .waiting_on_local_work
+            .external_wait_set
+            .resolve_park(quiescence_generation, confirmed);
+        // Writing the marker and completing the Workflow Task on `Confirmed`, and issuing a
+        // resolve activation on `Aborted`, are C8's.
+        None
     }
 
     pub(super) fn heartbeat_timeout(&mut self) -> RunUpdateAct {
@@ -1381,27 +1538,6 @@ fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
         .map(|q| workflow_activation_job::Variant::QueryWorkflow(q).into());
     act.jobs.extend(query_jobs);
 }
-fn sink_heartbeat_timeout_start(
-    run_id: String,
-    sink: Option<&dyn LocalActivityRequestSink>,
-    wft_start_time: Instant,
-    wft_timeout: Duration,
-) -> AbortHandle {
-    // The heartbeat deadline is 80% of the WFT timeout
-    let deadline = wft_start_time.add(wft_timeout.mul_f32(WFT_HEARTBEAT_TIMEOUT_FRACTION));
-    let (abort_handle, abort_reg) = AbortHandle::new_pair();
-    if let Some(la_sink) = sink {
-        la_sink.sink_reqs(vec![LocalActRequest::StartHeartbeatTimeout {
-            send_on_elapse: HeartbeatTimeoutMsg {
-                run_id,
-                span: Span::current(),
-            },
-            deadline,
-            abort_reg,
-        }]);
-    }
-    abort_handle
-}
 
 /// Tracks the heartbeat while a workflow task has outstanding local activities.
 struct LocalActivityHeartbeatState {
@@ -1425,6 +1561,15 @@ struct WaitingOnLocalWork {
     /// Present while local activities are outstanding, or while a heartbeat is deferred waiting
     /// for lang to finish an activation.
     local_activities: Option<LocalActivityHeartbeatState>,
+    /// This run's external stream waits. Empty until lang reports quiescence.
+    external_wait_set: ExternalWaitSet,
+    /// Cancels the run-level workflow task rollover deadline, when one is running.
+    ///
+    /// Separate from the local-activity heartbeat handle: a retained task needs a rollover
+    /// deadline whether or not any local activity is outstanding.
+    wft_rollover_timer: Option<AbortHandle>,
+    /// Set when that deadline expired. Flows into `force_new_wft` on the next completion.
+    rollover_pending: bool,
 }
 
 impl WaitingOnLocalWork {

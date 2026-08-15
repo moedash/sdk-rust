@@ -42,6 +42,7 @@ pub(crate) use wft_poller::WFTPollerShared;
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
+pub use workflow::{ExternalStreamReadyResult, ExternalStreamRunStatus};
 
 use crate::{
     ActivityHeartbeat,
@@ -1416,6 +1417,99 @@ impl Worker {
             if let Err(e) = at_mgr.record_heartbeat(details) {
                 warn!(task_token = %tt, details = ?e, "Activity heartbeat failed.");
             }
+        }
+    }
+
+    /// Tell the worker a record is buffered for one of a workflow's External Stream waits.
+    ///
+    /// Thread-safe and freely callable concurrently. Unlike the local-activity notification path
+    /// this is **acknowledged**, because the caller is a watcher whose next action depends
+    /// entirely on the answer -- see [`ExternalStreamReadyResult`].
+    ///
+    /// "Buffered", not "available": a notification for a record the caller has not yet read into
+    /// its buffer would produce an activation whose drain must block, which is exactly the
+    /// deadlock hazard the out-of-thread buffer exists to remove.
+    pub async fn notify_external_stream_ready(
+        &self,
+        run_id: &str,
+        wait_id: u32,
+        wait_generation: u64,
+    ) -> ExternalStreamReadyResult {
+        let Some(workflows) = self.task_subsystems.workflows.as_ref() else {
+            dbg_panic!("external stream readiness on a worker with workflows disabled");
+            return ExternalStreamReadyResult::RunNotFound;
+        };
+        workflows
+            .notify_external_stream_ready(run_id, wait_id, wait_generation)
+            .await
+    }
+
+    /// Ask what state a run's External Stream wait set is in, changing nothing.
+    ///
+    /// Answered on the same serialized lane as
+    /// [`Worker::notify_external_stream_ready`], so the answer is as authoritative as a readiness
+    /// acknowledgement. It is a separate call on purpose: readiness means "a record is buffered",
+    /// so using it as a probe would be a false claim that manufactures a spurious activation on
+    /// the way out of a shutting-down worker.
+    pub async fn external_stream_run_status(&self, run_id: &str) -> ExternalStreamRunStatus {
+        let Some(workflows) = self.task_subsystems.workflows.as_ref() else {
+            dbg_panic!("external stream status on a worker with workflows disabled");
+            return ExternalStreamRunStatus::RunNotFound;
+        };
+        workflows.external_stream_run_status(run_id).await
+    }
+
+    /// Test-only: start a run's workflow task rollover deadline.
+    ///
+    /// Starting it for real belongs to the retention path (C6), which is what decides a task is
+    /// being held open in the first place.
+    #[cfg(test)]
+    pub(crate) async fn start_wft_rollover_timer(&self, run_id: &str, wft_timeout: Duration) {
+        if let Some(workflows) = self.task_subsystems.workflows.as_ref() {
+            workflows
+                .start_wft_rollover_timer(run_id, wft_timeout)
+                .await;
+        }
+    }
+
+    /// Test-only reach into the idle-timeout input, which Core's own timer will fire (C6).
+    #[cfg(test)]
+    pub(crate) fn notify_external_stream_idle_timeout(
+        &self,
+        run_id: &str,
+        quiescence_generation: u64,
+    ) {
+        if let Some(workflows) = self.task_subsystems.workflows.as_ref() {
+            workflows.notify_external_stream_idle_timeout(run_id, quiescence_generation);
+        }
+    }
+
+    /// Test-only reach into the park-result input, which lang's completion will carry (C8).
+    #[cfg(test)]
+    pub(crate) fn notify_external_stream_park_result(
+        &self,
+        run_id: &str,
+        quiescence_generation: u64,
+        confirmed: bool,
+    ) {
+        if let Some(workflows) = self.task_subsystems.workflows.as_ref() {
+            workflows.notify_external_stream_park_result(run_id, quiescence_generation, confirmed);
+        }
+    }
+
+    /// Test scaffolding: put a cached run's external stream wait set into a given state.
+    #[cfg(test)]
+    pub(crate) async fn seed_external_stream_waits(
+        &self,
+        run_id: &str,
+        wait_ids: Vec<u32>,
+        parked_at: Option<u64>,
+        wft_open: bool,
+    ) {
+        if let Some(workflows) = self.task_subsystems.workflows.as_ref() {
+            workflows
+                .seed_external_stream_waits(run_id, wait_ids, parked_at, wft_open)
+                .await;
         }
     }
 
