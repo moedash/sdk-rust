@@ -16,12 +16,16 @@ use crate::{
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use temporalio_common::{
-    protos::coresdk::workflow_completion::WorkflowActivationCompletion, worker::WorkerTaskTypes,
+    protos::coresdk::{
+        workflow_commands::{ExternalStreamWait, WorkflowStreamQuiescent, workflow_command},
+        workflow_completion::WorkflowActivationCompletion,
+    },
+    worker::WorkerTaskTypes,
 };
 
 /// A worker holding one run in its cache, with the first activation left outstanding.
@@ -384,5 +388,215 @@ async fn a_cancelled_rollover_timer_does_not_force_a_new_task() {
         !saw_force_new_wft.load(Ordering::Relaxed),
         "a rollover deadline that has not expired must not force a replacement task"
     );
+    worker.drain_pollers_and_shutdown().await;
+}
+
+// --- quiescence retains the Workflow Task (C6) -------------------------------
+
+fn quiescent_command(
+    quiescence_generation: u64,
+    wait_ids: &[u32],
+    idle_timeout: Duration,
+) -> workflow_command::Variant {
+    workflow_command::Variant::WorkflowStreamQuiescent(WorkflowStreamQuiescent {
+        quiescence_generation,
+        waits: wait_ids
+            .iter()
+            .map(|id| ExternalStreamWait {
+                wait_id: *id,
+                generation: 0,
+                immediately_parkable: false,
+            })
+            .collect(),
+        idle_timeout: Some(idle_timeout.try_into().unwrap()),
+    })
+}
+
+/// A worker whose completions are all recorded, so a test can assert that a retained task
+/// reported *nothing* to the server.
+fn worker_recording_completions(completions: Arc<AtomicUsize>) -> crate::Worker {
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        for _ in 0..4 {
+            let counter = completions.clone();
+            asserts.then(move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+#[tokio::test]
+async fn quiescence_holds_the_workflow_task_open() {
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1, 2], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completions.load(Ordering::Relaxed),
+        0,
+        "a retained Workflow Task must report nothing to the server"
+    );
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen
+    );
+    // And the wait set really is the one lang described, not an empty stand-in.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 2, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn the_idle_timer_fires_and_moves_the_set_to_parking() {
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_millis(30)),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The timer fired and the set entered `Parking`. Readiness is still accepted there, and
+    // accepting it is what aborts the parking attempt -- the handshake that would confirm it is
+    // C8's.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn readiness_does_not_cancel_a_timer_for_a_superseded_snapshot() {
+    // A timer that fires for a generation the Workflow has already run past must be discarded
+    // rather than parking the set it finds.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+
+    // A timer for a stale generation arrives late.
+    worker.notify_external_stream_idle_timeout(&run_id, 99);
+
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "a stale idle timeout must leave the wait set alone"
+    );
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_quiescent_command_with_a_non_positive_idle_timeout_is_malformed() {
+    // Rejected rather than coerced: zero would park instantly and absent would hold the task
+    // until it timed out, and neither is something a caller can have meant. The mock's
+    // `num_expected_fails` is what asserts the failure actually reached the server.
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    mock_cfg.num_expected_fails = 1_usize.into();
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            workflow_command::Variant::WorkflowStreamQuiescent(WorkflowStreamQuiescent {
+                quiescence_generation: 1,
+                waits: vec![ExternalStreamWait {
+                    wait_id: 1,
+                    generation: 0,
+                    immediately_parkable: false,
+                }],
+                idle_timeout: None,
+            }),
+        ))
+        .await
+        .unwrap();
+
+    // Nothing was retained: no wait set was recorded for the malformed snapshot.
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "a malformed quiescence command must not retain the Workflow Task"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_completion_with_server_bound_commands_does_not_retain() {
+    // Subscriptions stay registered, but the task must be reported so the server can act on the
+    // timer -- the wake Signal is what covers the window that leaves.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completions.load(Ordering::Relaxed),
+        1,
+        "a completion carrying a server-bound command must be reported, not retained"
+    );
+
     worker.drain_pollers_and_shutdown().await;
 }
