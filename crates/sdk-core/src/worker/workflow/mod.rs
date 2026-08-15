@@ -782,6 +782,20 @@ impl Workflows {
         });
     }
 
+    /// Test scaffolding -- see [`ExternalStreamAnnotationMsg`].
+    #[cfg(test)]
+    pub(super) fn external_stream_annotation(
+        &self,
+        run_id: impl Into<String>,
+    ) -> impl Future<Output = Vec<u8>> {
+        let (tx, rx) = oneshot::channel();
+        self.send_local(ExternalStreamAnnotationMsg {
+            run_id: run_id.into(),
+            response_tx: tx,
+        });
+        async move { rx.await.unwrap_or_default() }
+    }
+
     /// Test scaffolding -- see [`StartRolloverTimerMsg`].
     #[cfg(test)]
     pub(super) fn start_wft_rollover_timer(
@@ -1495,6 +1509,14 @@ pub(crate) struct ExternalStreamRunStatusMsg {
 /// C8's handshake, neither of which exists yet. This rides the same serialized local-input lane
 /// as everything else, so a test that uses it still exercises the real routing rather than
 /// reaching into `ManagedRun`'s state.
+/// Test scaffolding: read a run's accumulated, unwritten replay annotation.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ExternalStreamAnnotationMsg {
+    pub(crate) run_id: String,
+    pub(crate) response_tx: oneshot::Sender<Vec<u8>>,
+}
+
 /// Test scaffolding: ask a run to start its workflow task rollover deadline.
 #[cfg(test)]
 #[derive(Debug)]

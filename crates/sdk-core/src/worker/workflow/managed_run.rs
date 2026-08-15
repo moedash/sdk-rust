@@ -16,7 +16,7 @@ use crate::{
             WorkflowTaskInfo,
             external_streams::{
                 ExternalStreamReadyResult, ExternalStreamRunStatus, ExternalWaitSet,
-                ExternalWaitState, ParkTrigger,
+                ExternalWaitState, ParkTrigger, ReadinessOutcome,
             },
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
@@ -38,12 +38,12 @@ use temporalio_common::protos::{
     coresdk::{
         common::ExternalStorageMetrics,
         workflow_activation::{
-            WorkflowActivation, create_evict_activation, query_to_job,
+            ResolveExternalStreamWaits, WorkflowActivation, create_evict_activation, query_to_job,
             remove_from_cache::EvictionReason, workflow_activation_job,
         },
         workflow_commands::{
-            ExternalStreamFinalized, ExternalStreamParkResult, FailWorkflowExecution, QueryResult,
-            WorkflowStreamProgress,
+            ExternalStreamFinalized, ExternalStreamParkResult, ExternalStreamWait,
+            FailWorkflowExecution, QueryResult, WorkflowStreamProgress,
         },
         workflow_completion,
     },
@@ -297,11 +297,22 @@ impl ManagedRun {
                      was no waiting on LA info."
                     )
                 }
-            } else {
-                return Ok(Some(ActivationOrAuto::Autocomplete {
-                    run_id: self.wfm.machines.run_id.clone(),
-                }));
             }
+            if self.waiting_on_local_work.external_wait_set.retains_wft() {
+                // The replacement task after a rollover. Lang has not been activated, so it
+                // cannot re-request retention -- Core carries it across instead, along with every
+                // subscription, cursor, and readiness generation the wait set already holds.
+                // Autocompleting here would report the replacement task straight back and undo
+                // the rollover it was created for.
+                self.waiting_on_local_work
+                    .external_wait_set
+                    .set_wft_open(true);
+                self.restart_external_stream_deadlines(start_time);
+                return self._check_more_activations();
+            }
+            return Ok(Some(ActivationOrAuto::Autocomplete {
+                run_id: self.wfm.machines.run_id.clone(),
+            }));
         }
 
         Ok(Some(ActivationOrAuto::LangActivation(activation)))
@@ -315,6 +326,12 @@ impl ManagedRun {
         task_storage_metrics: &TaskStorageMetrics,
     ) -> Option<OutstandingTask> {
         debug!("Marking WFT completed");
+        // No task is open again until a replacement arrives. The wait set itself survives -- the
+        // subscriptions are still registered and their cursors still hold -- but readiness can no
+        // longer be delivered locally, which is what `NoOpenWorkflowTask` tells a watcher.
+        self.waiting_on_local_work
+            .external_wait_set
+            .set_wft_open(false);
         let retme = self.wft.take();
 
         if let Some(ot) = &retme
@@ -376,6 +393,11 @@ impl ManagedRun {
             // It doesn't make sense to do workflow work unless we have a WFT
             return Ok(None);
         }
+
+        // Ready waits become a job here rather than at the notification, so readiness that
+        // arrived while an activation was outstanding is picked up the moment that activation
+        // completes -- with no separate path to keep in step.
+        self.maybe_issue_external_stream_resolve();
 
         if self.wfm.machines.has_pending_jobs() && !self.am_broken {
             Ok(Some(ActivationOrAuto::LangActivation(
@@ -807,19 +829,32 @@ impl ManagedRun {
             }
         };
         let has_server_bound_commands = !lang_commands.is_empty();
-        if !stream_commands.progress.is_empty()
-            || stream_commands.park_result.is_some()
-            || stream_commands.finalized.is_some()
-        {
+        if stream_commands.park_result.is_some() || stream_commands.finalized.is_some() {
             return Err(RunUpdateErr {
                 source: WFMachinesError::Fatal(
-                    "external stream progress, park, and finalization commands are not \
-                     handled yet"
+                    "external stream park and finalization commands are not handled yet"
                         .to_string(),
                 ),
                 complete_resp_chan: completion.resp_chan,
             });
         }
+
+        // Accumulate on *every* completion path, retained or not: consuming a record and
+        // committing that consumption are separate steps, and the second is not conditional on
+        // why the Workflow Task ended. An empty delta accumulates like any other -- it is how a
+        // subscription that observed nothing still records that it observed.
+        for progress in &stream_commands.progress {
+            self.waiting_on_local_work
+                .external_wait_set
+                .accumulate_annotation(&progress.observation_delta);
+            if progress.request_rollover {
+                // Lang decided this boundary, so the rollover needs no finalization round trip --
+                // this very command already carried the terminal.
+                self.waiting_on_local_work.rollover_pending = true;
+            }
+        }
+        let completing_rollover =
+            completing_rollover || mem::take(&mut self.waiting_on_local_work.rollover_pending);
 
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
@@ -1002,6 +1037,40 @@ impl ManagedRun {
                 quiescence_generation: generation,
             }),
         ));
+
+        // Readiness that arrived while lang was computing this snapshot survives it when the
+        // generations match, and must still reach lang.
+        self.maybe_issue_external_stream_resolve();
+    }
+
+    /// Re-arms the idle and rollover deadlines for a wait set carried onto a replacement task.
+    ///
+    /// The quiescent snapshot is *not* renewed: the same generation continues, so a readiness
+    /// notification in flight across the rollover still matches and is not lost.
+    fn restart_external_stream_deadlines(&mut self, start_time: Instant) {
+        let wft_timeout = self.wft_timeout();
+        if let Some(wft_timeout) = wft_timeout {
+            self.start_wft_rollover_timer(start_time, wft_timeout);
+        }
+        let idle_timeout = clamp_idle_below_rollover(
+            self.waiting_on_local_work
+                .external_wait_set
+                .idle_timeout()
+                .unwrap_or(Duration::from_secs(1)),
+            wft_timeout,
+        );
+        let generation = self
+            .waiting_on_local_work
+            .external_wait_set
+            .quiescence_generation();
+        self.cancel_external_stream_idle_timer();
+        self.waiting_on_local_work.idle_timer = Some(self.run_timers.start(
+            start_time.add(idle_timeout),
+            LocalInputs::ExternalStreamIdleTimeout(ExternalStreamIdleTimeoutMsg {
+                run_id: self.wfm.machines.run_id.clone(),
+                quiescence_generation: generation,
+            }),
+        ));
     }
 
     fn cancel_external_stream_idle_timer(&mut self) {
@@ -1085,10 +1154,59 @@ impl ManagedRun {
             .waiting_on_local_work
             .external_wait_set
             .notify_ready(wait_id, wait_generation);
-        // Issuing the resolve activation, cancelling the idle timer, and aborting an in-flight
-        // park belong to C7 and C8. Until then readiness is recorded and coalesced, which is what
-        // makes the acknowledgement already meaningful to a watcher.
-        (outcome.into(), None)
+
+        if outcome != ReadinessOutcome::Accepted {
+            return (outcome.into(), None);
+        }
+
+        // Readiness ends this quiescent snapshot, so the timer measuring it must not survive it.
+        // The rollover deadline is *not* cancelled: it bounds the workflow task itself, which is
+        // still open and still being held.
+        self.cancel_external_stream_idle_timer();
+
+        // `_check_more_activations` is what turns pending readiness into an activation, and it
+        // does so whether readiness arrived now or while an earlier activation was outstanding --
+        // so both orderings coalesce through one path.
+        let act = match self._check_more_activations() {
+            Ok(act) => self.update_to_acts(Ok(act.into())),
+            Err(err) => self.update_to_acts(Err(err)),
+        };
+        (outcome.into(), act)
+    }
+
+    /// Queues one `ResolveExternalStreamWaits` if readiness is pending and a task can carry it.
+    ///
+    /// Coalescing lives here rather than at the notification: every wait known ready ships in one
+    /// activation, and notifications arriving while an activation is outstanding accumulate for
+    /// the next one. There is never more than one outstanding activation per run.
+    fn maybe_issue_external_stream_resolve(&mut self) {
+        if self.activation.is_some() || self.wft.is_none() || self.am_broken {
+            return;
+        }
+        let set = &mut self.waiting_on_local_work.external_wait_set;
+        if !set.has_pending_readiness() {
+            return;
+        }
+        let quiescence_generation = set.quiescence_generation();
+        let ready_hints = set
+            .take_ready_wait_ids()
+            .into_iter()
+            .filter_map(|wait_id| {
+                set.wait(wait_id).map(|w| ExternalStreamWait {
+                    wait_id: w.wait_id,
+                    generation: w.wait_generation,
+                    immediately_parkable: w.immediately_parkable,
+                })
+            })
+            .collect();
+        self.wfm.machines.send_core_generated_job(
+            workflow_activation_job::Variant::ResolveExternalStreamWaits(
+                ResolveExternalStreamWaits {
+                    quiescence_generation,
+                    ready_hints,
+                },
+            ),
+        );
     }
 
     /// Test scaffolding -- see [`ExternalStreamSeedWaitsMsg`].
@@ -1106,6 +1224,14 @@ impl ManagedRun {
         } else {
             set.set_wft_open(msg.wft_open);
         }
+    }
+
+    /// The accumulated, unwritten replay annotation. Core never parses it.
+    #[cfg(test)]
+    pub(super) fn external_stream_annotation(&self) -> &[u8] {
+        self.waiting_on_local_work
+            .external_wait_set
+            .replay_annotation()
     }
 
     /// The read-only status probe. Must leave the run exactly as it was.
@@ -1668,6 +1794,7 @@ fn take_external_stream_commands(
 ) -> Result<ExternalStreamCommands, WFMachinesError> {
     let mut taken = ExternalStreamCommands::default();
     let mut remaining = Vec::with_capacity(commands.len());
+    let mut seen_other_command = false;
     for command in commands.drain(..) {
         match command.variant {
             WFCommandVariant::ExternalStreamQuiescent(q) => {
@@ -1694,10 +1821,26 @@ fn take_external_stream_commands(
                     idle_timeout,
                 });
             }
-            WFCommandVariant::ExternalStreamProgress(p) => taken.progress.push(p),
+            WFCommandVariant::ExternalStreamProgress(p) => {
+                // Ordering is normative, not stylistic. On replay this is what guarantees a
+                // record's integrity is validated *before* the command derived from it is
+                // matched; the other way round, a damaged stream would be discovered only after
+                // its consequences had already been accepted as durable.
+                if seen_other_command {
+                    return Err(WFMachinesError::Fatal(
+                        "WorkflowStreamProgress must precede every command whose value could \
+                         depend on the consumed data, but one followed another command"
+                            .to_string(),
+                    ));
+                }
+                taken.progress.push(p);
+            }
             WFCommandVariant::ExternalStreamParkResult(p) => taken.park_result = Some(p),
             WFCommandVariant::ExternalStreamFinalized(f) => taken.finalized = Some(f),
-            _ => remaining.push(command),
+            _ => {
+                seen_other_command = true;
+                remaining.push(command);
+            }
         }
     }
     *commands = remaining;

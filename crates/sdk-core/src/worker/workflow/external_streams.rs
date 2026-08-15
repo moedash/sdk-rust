@@ -21,10 +21,7 @@
 // then only the unit tests below reach them.
 #![allow(dead_code)]
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 /// The reserved `park_generation` meaning "the sender knows of no confirmed park".
 ///
@@ -236,9 +233,14 @@ pub(crate) struct ExternalWaitSet {
     /// the first snapshot is 1, which is why `UNPARKED_WAKE_GENERATION` can be 0.
     quiescence_generation: u64,
     waits: HashMap<u32, ExternalWaitState>,
-    /// Wait ids known ready but not yet shipped in an activation. Coalescing lives here so
-    /// several notifications arriving while an activation is outstanding become one next time.
-    ready_wait_ids: HashSet<u32>,
+    /// Waits known ready but not yet shipped, each with the `wait_generation` its readiness was
+    /// accepted at. Coalescing lives here so several notifications arriving while an activation
+    /// is outstanding become one next time.
+    ///
+    /// The generation is kept because a new quiescent snapshot can land *after* readiness was
+    /// accepted: if the snapshot reports the same generation, lang has not re-blocked and has not
+    /// seen the record, so the readiness must survive. See `become_quiescent`.
+    ready: HashMap<u32, u64>,
     idle_timeout: Option<Duration>,
     /// Set when a park is confirmed; cleared when the set becomes quiescent again.
     park_generation: Option<u64>,
@@ -279,13 +281,13 @@ impl ExternalWaitSet {
 
     /// The wait ids Core has accepted readiness for and not yet shipped.
     pub(crate) fn take_ready_wait_ids(&mut self) -> Vec<u32> {
-        let mut ids: Vec<_> = self.ready_wait_ids.drain().collect();
+        let mut ids: Vec<_> = self.ready.drain().map(|(id, _)| id).collect();
         ids.sort_unstable();
         ids
     }
 
     pub(crate) fn has_pending_readiness(&self) -> bool {
-        !self.ready_wait_ids.is_empty()
+        !self.ready.is_empty()
     }
 
     /// Whether this set holds the current Workflow Task open.
@@ -319,7 +321,24 @@ impl ExternalWaitSet {
     ) -> u64 {
         self.quiescence_generation += 1;
         self.waits = waits.into_iter().map(|w| (w.wait_id, w)).collect();
-        self.ready_wait_ids.clear();
+
+        // Readiness accepted before this snapshot was processed is kept only where the snapshot
+        // reports the *same* `wait_generation`. Same generation means lang has not re-blocked, so
+        // it never saw the record and dropping the readiness would strand it until the idle timer
+        // or a producer's Signal. A bumped generation means lang re-blocked after draining, so
+        // the readiness refers to a block that is already resolved.
+        let waits = &self.waits;
+        self.ready.retain(|wait_id, generation| {
+            waits
+                .get(wait_id)
+                .is_some_and(|w| w.wait_generation == *generation)
+        });
+        for wait_id in self.ready.keys() {
+            if let Some(wait) = self.waits.get_mut(wait_id) {
+                wait.status = ExternalWaitStatus::Ready;
+            }
+        }
+
         self.idle_timeout = Some(idle_timeout);
         // A new quiescent snapshot supersedes any earlier park: the Workflow ran again, so
         // whatever generation a producer may still be holding is no longer the live one.
@@ -358,7 +377,7 @@ impl ExternalWaitSet {
                 // Readiness during `Parking` aborts that parking generation -- see
                 // `resolve_park`, which will report the later confirmation as stale.
                 wait.status = ExternalWaitStatus::Ready;
-                self.ready_wait_ids.insert(wait_id);
+                self.ready.insert(wait_id, wait_generation);
                 ReadinessOutcome::Accepted
             }
         }
@@ -586,6 +605,67 @@ mod tests {
 
         assert_eq!(set.take_ready_wait_ids(), vec![1, 3]);
         assert!(!set.has_pending_readiness());
+    }
+
+    #[test]
+    fn readiness_survives_a_snapshot_that_reports_the_same_generation() {
+        // Lang computed its snapshot from what it had drained, so a notification accepted
+        // afterwards refers to a record lang never saw. Same generation means lang has not
+        // re-blocked, so dropping the readiness would strand that record until the idle timer or a
+        // producer's Signal.
+        let mut set = quiescent_set(&[1, 2]);
+        set.notify_ready(1, 0);
+
+        set.become_quiescent(
+            [
+                ExternalWaitState::new(1, 0, false),
+                ExternalWaitState::new(2, 0, false),
+            ],
+            IDLE,
+        );
+
+        assert!(set.has_pending_readiness());
+        assert_eq!(set.take_ready_wait_ids(), vec![1]);
+    }
+
+    #[test]
+    fn readiness_is_dropped_when_the_snapshot_bumps_the_generation() {
+        // A bumped generation means lang re-blocked after draining, so it *did* see the record and
+        // the readiness refers to a block that is already resolved.
+        let mut set = quiescent_set(&[1]);
+        set.notify_ready(1, 0);
+
+        set.become_quiescent([ExternalWaitState::new(1, 1, false)], IDLE);
+
+        assert!(!set.has_pending_readiness());
+    }
+
+    #[test]
+    fn readiness_is_dropped_for_a_wait_the_snapshot_no_longer_lists() {
+        // The subscription was cancelled, or the Workflow is no longer blocked on it.
+        let mut set = quiescent_set(&[1, 2]);
+        set.notify_ready(2, 0);
+
+        set.become_quiescent([ExternalWaitState::new(1, 0, false)], IDLE);
+
+        assert!(!set.has_pending_readiness());
+    }
+
+    #[test]
+    fn a_surviving_ready_wait_is_restored_to_ready_not_blocked() {
+        // Otherwise the set would look fully blocked and the idle timer could park it while a
+        // record it has not delivered is sitting in the buffer.
+        let mut set = quiescent_set(&[1]);
+        set.notify_ready(1, 0);
+
+        set.become_quiescent([ExternalWaitState::new(1, 0, false)], IDLE);
+
+        assert_eq!(set.wait(1).unwrap().status, ExternalWaitStatus::Ready);
+        let generation = set.quiescence_generation();
+        assert_eq!(
+            set.start_parking(generation, ParkTrigger::IdleTimeout),
+            ParkStartOutcome::AlreadyReady
+        );
     }
 
     // --- the park/readiness race, both orderings ---------------------------

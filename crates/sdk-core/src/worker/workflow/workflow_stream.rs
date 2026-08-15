@@ -179,6 +179,16 @@ impl WFStream {
                                 None
                             }
                             #[cfg(test)]
+                            LocalInputs::ExternalStreamAnnotation(msg) => {
+                                let annotation = state
+                                    .runs
+                                    .peek(&msg.run_id)
+                                    .map(|rh| rh.external_stream_annotation().to_vec())
+                                    .unwrap_or_default();
+                                let _ = msg.response_tx.send(annotation);
+                                None
+                            }
+                            #[cfg(test)]
                             LocalInputs::StartRolloverTimer(msg) => {
                                 if let Some(rh) = state.runs.get_mut(&msg.run_id) {
                                     rh.start_wft_rollover_timer(
@@ -788,6 +798,8 @@ pub(super) enum LocalInputs {
     ExternalStreamSeedWaits(ExternalStreamSeedWaitsMsg),
     #[cfg(test)]
     StartRolloverTimer(StartRolloverTimerMsg),
+    #[cfg(test)]
+    ExternalStreamAnnotation(ExternalStreamAnnotationMsg),
     BumpStream,
 }
 impl LocalInputs {
@@ -808,6 +820,8 @@ impl LocalInputs {
             LocalInputs::ExternalStreamSeedWaits(sw) => &sw.run_id,
             #[cfg(test)]
             LocalInputs::StartRolloverTimer(sr) => &sr.run_id,
+            #[cfg(test)]
+            LocalInputs::ExternalStreamAnnotation(a) => &a.run_id,
             LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
         })
     }

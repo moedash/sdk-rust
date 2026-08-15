@@ -1459,6 +1459,15 @@ impl Worker {
         workflows.external_stream_run_status(run_id).await
     }
 
+    /// Test-only: read a run's accumulated, unwritten replay annotation.
+    #[cfg(test)]
+    pub(crate) async fn external_stream_annotation(&self, run_id: &str) -> Vec<u8> {
+        match self.task_subsystems.workflows.as_ref() {
+            Some(workflows) => workflows.external_stream_annotation(run_id).await,
+            None => Vec::new(),
+        }
+    }
+
     /// Test-only: start a run's workflow task rollover deadline.
     ///
     /// Starting it for real belongs to the retention path (C6), which is what decides a task is
