@@ -8,13 +8,15 @@ use crate::{
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
             ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HistoryUpdate, LocalActivityRequestSink, LocalResolution,
-            NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT, RequestEvictMsg,
-            RunBasics, RunTimerSink, ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand,
-            WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus,
-            WftFailureKind, WorkflowTaskInfo,
+            ExternalStreamIdleTimeoutMsg, FailedActivationWFTReport, HistoryUpdate,
+            LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
+            OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics, RunTimerSink,
+            ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
+            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
+            WorkflowTaskInfo,
             external_streams::{
-                ExternalStreamReadyResult, ExternalStreamRunStatus, ExternalWaitSet, ParkTrigger,
+                ExternalStreamReadyResult, ExternalStreamRunStatus, ExternalWaitSet,
+                ExternalWaitState, ParkTrigger,
             },
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
@@ -39,7 +41,10 @@ use temporalio_common::protos::{
             WorkflowActivation, create_evict_activation, query_to_job,
             remove_from_cache::EvictionReason, workflow_activation_job,
         },
-        workflow_commands::{FailWorkflowExecution, QueryResult},
+        workflow_commands::{
+            ExternalStreamFinalized, ExternalStreamParkResult, FailWorkflowExecution, QueryResult,
+            WorkflowStreamProgress,
+        },
         workflow_completion,
     },
     temporal::api::{
@@ -788,10 +793,38 @@ impl ManagedRun {
             )));
         }
 
+        // External stream commands are consumed here rather than by the machines. Taking them
+        // first is also what makes "no server-bound command accompanies the completion" checkable:
+        // whatever is left after this *is* the server-bound set.
+        let mut lang_commands = completion.commands;
+        let stream_commands = match take_external_stream_commands(&mut lang_commands) {
+            Ok(taken) => taken,
+            Err(source) => {
+                return Err(RunUpdateErr {
+                    source,
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+        };
+        let has_server_bound_commands = !lang_commands.is_empty();
+        if !stream_commands.progress.is_empty()
+            || stream_commands.park_result.is_some()
+            || stream_commands.finalized.is_some()
+        {
+            return Err(RunUpdateErr {
+                source: WFMachinesError::Fatal(
+                    "external stream progress, park, and finalization commands are not \
+                     handled yet"
+                        .to_string(),
+                ),
+                complete_resp_chan: completion.resp_chan,
+            });
+        }
+
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
-            self.wfm.push_commands_and_iterate(completion.commands)?;
+            self.wfm.push_commands_and_iterate(lang_commands)?;
             if let Some(update) = update_from_new_page {
                 self.wfm.feed_history_from_new_page(update)?;
             }
@@ -826,6 +859,31 @@ impl ManagedRun {
                 if let Some(waiting) = self.waiting_on_local_work.local_activities.take() {
                     waiting.hb_timeout_handle.abort();
                 }
+
+                // Retention applies only when nothing server-bound rides along. A completion that
+                // also produced a timer, activity, child workflow, or signal must be reported so
+                // the server can act on it; the subscriptions stay registered and are woken by
+                // the wake Signal instead.
+                if let Some(request) = stream_commands.quiescence
+                    && !has_server_bound_commands
+                    && !data.activation_was_eviction
+                    && data.query_responses.is_empty()
+                {
+                    self.begin_external_stream_quiescence(request);
+                    return Ok(Some(FulfillableActivationComplete {
+                        result: ActivationCompleteResult {
+                            outcome: ActivationCompleteOutcome::DoNothing,
+                            replaying: self.wfm.machines.replaying,
+                        },
+                        resp_chan: completion.resp_chan,
+                    }));
+                }
+
+                // Not retaining: whatever quiescent snapshot was recorded no longer holds a task
+                // open, so its timers must not outlive it.
+                self.cancel_external_stream_idle_timer();
+                self.cancel_wft_rollover_timer();
+
                 Ok(Some(self.prepare_complete_resp(
                     completion.resp_chan,
                     data,
@@ -903,6 +961,52 @@ impl ManagedRun {
             self._check_more_activations()
         } else {
             Ok(None)
+        }
+    }
+
+    // --- External stream retention (C6) ------------------------------------
+
+    /// This run's workflow task timeout, which both run-level deadlines derive from.
+    fn wft_timeout(&self) -> Option<Duration> {
+        self.wfm
+            .machines
+            .get_started_info()
+            .and_then(|attrs| attrs.workflow_task_timeout)
+    }
+
+    /// Records a quiescent snapshot and starts the timers that bound it.
+    ///
+    /// **One** idle timer for the whole wait set, not one per subscription: the timeout measures
+    /// *global* quiescence, so an idle stream cannot park a workflow task another stream is still
+    /// driving.
+    fn begin_external_stream_quiescence(&mut self, request: QuiescenceRequest) {
+        let wft_timeout = self.wft_timeout();
+
+        // The rollover deadline is what stops a continuously fed stream -- one whose gaps never
+        // reach the idle timeout -- from holding the task until it *fails*.
+        if let Some(wft_timeout) = wft_timeout {
+            self.start_wft_rollover_timer(Instant::now(), wft_timeout);
+        }
+
+        let idle_timeout = clamp_idle_below_rollover(request.idle_timeout, wft_timeout);
+        let generation = self
+            .waiting_on_local_work
+            .external_wait_set
+            .become_quiescent(request.waits, idle_timeout);
+
+        self.cancel_external_stream_idle_timer();
+        self.waiting_on_local_work.idle_timer = Some(self.run_timers.start(
+            Instant::now().add(idle_timeout),
+            LocalInputs::ExternalStreamIdleTimeout(ExternalStreamIdleTimeoutMsg {
+                run_id: self.wfm.machines.run_id.clone(),
+                quiescence_generation: generation,
+            }),
+        ));
+    }
+
+    fn cancel_external_stream_idle_timer(&mut self) {
+        if let Some(handle) = self.waiting_on_local_work.idle_timer.take() {
+            handle.abort();
         }
     }
 
@@ -1539,6 +1643,80 @@ fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
     act.jobs.extend(query_jobs);
 }
 
+/// Lang's `WorkflowStreamQuiescent`, validated.
+struct QuiescenceRequest {
+    waits: Vec<ExternalWaitState>,
+    idle_timeout: Duration,
+}
+
+/// The external stream commands pulled out of a completion.
+///
+/// They are consumed above the state machines: progress accumulates into the wait set, and the
+/// other three answer runtime-internal activations. Letting them reach the machines would drop a
+/// replay-visible observation delta on the floor.
+#[derive(Default)]
+struct ExternalStreamCommands {
+    quiescence: Option<QuiescenceRequest>,
+    progress: Vec<WorkflowStreamProgress>,
+    park_result: Option<ExternalStreamParkResult>,
+    finalized: Option<ExternalStreamFinalized>,
+}
+
+/// Splits lang's commands, leaving everything else in `commands`.
+fn take_external_stream_commands(
+    commands: &mut Vec<WFCommand>,
+) -> Result<ExternalStreamCommands, WFMachinesError> {
+    let mut taken = ExternalStreamCommands::default();
+    let mut remaining = Vec::with_capacity(commands.len());
+    for command in commands.drain(..) {
+        match command.variant {
+            WFCommandVariant::ExternalStreamQuiescent(q) => {
+                let idle_timeout = q
+                    .idle_timeout
+                    .map(|d| d.try_into().unwrap_or(Duration::ZERO))
+                    .unwrap_or(Duration::ZERO);
+                if idle_timeout.is_zero() {
+                    // Rejected rather than coerced: a zero or absent timeout would either park
+                    // instantly or hold the task until it timed out, and neither is something a
+                    // caller can have meant.
+                    return Err(WFMachinesError::Fatal(
+                        "WorkflowStreamQuiescent carried a non-positive idle timeout".to_string(),
+                    ));
+                }
+                taken.quiescence = Some(QuiescenceRequest {
+                    waits: q
+                        .waits
+                        .into_iter()
+                        .map(|w| {
+                            ExternalWaitState::new(w.wait_id, w.generation, w.immediately_parkable)
+                        })
+                        .collect(),
+                    idle_timeout,
+                });
+            }
+            WFCommandVariant::ExternalStreamProgress(p) => taken.progress.push(p),
+            WFCommandVariant::ExternalStreamParkResult(p) => taken.park_result = Some(p),
+            WFCommandVariant::ExternalStreamFinalized(f) => taken.finalized = Some(f),
+            _ => remaining.push(command),
+        }
+    }
+    *commands = remaining;
+    Ok(taken)
+}
+
+/// Keeps the idle deadline strictly inside the rollover deadline.
+///
+/// Rollover is authoritative: a retained task is bounded by the server's workflow task timeout
+/// whatever the idle timeout says, so an idle timer allowed to outlast it would simply never fire.
+fn clamp_idle_below_rollover(idle: Duration, wft_timeout: Option<Duration>) -> Duration {
+    match wft_timeout {
+        // The same fraction the rollover deadline uses, pulled in far enough that the idle timer
+        // still gets a chance to fire first when it was configured to.
+        Some(wft) => idle.min(wft.mul_f32(WFT_HEARTBEAT_TIMEOUT_FRACTION * 0.9)),
+        None => idle,
+    }
+}
+
 /// Tracks the heartbeat while a workflow task has outstanding local activities.
 struct LocalActivityHeartbeatState {
     wft_timeout: Duration,
@@ -1570,6 +1748,11 @@ struct WaitingOnLocalWork {
     wft_rollover_timer: Option<AbortHandle>,
     /// Set when that deadline expired. Flows into `force_new_wft` on the next completion.
     rollover_pending: bool,
+    /// Cancels the *global* quiescence timer for the external wait set.
+    ///
+    /// One timer for the whole set. Readiness for any member cancels it, which is what makes an
+    /// idle stream unable to park a workflow task another stream is still driving.
+    idle_timer: Option<AbortHandle>,
 }
 
 impl WaitingOnLocalWork {
