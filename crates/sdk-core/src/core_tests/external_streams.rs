@@ -22,7 +22,11 @@ use std::{
 };
 use temporalio_common::{
     protos::coresdk::{
-        workflow_commands::{ExternalStreamWait, WorkflowStreamQuiescent, workflow_command},
+        workflow_activation::workflow_activation_job,
+        workflow_commands::{
+            CompleteWorkflowExecution, ExternalStreamWait, WorkflowStreamProgress,
+            WorkflowStreamQuiescent, workflow_command,
+        },
         workflow_completion::WorkflowActivationCompletion,
     },
     worker::WorkerTaskTypes,
@@ -464,7 +468,22 @@ async fn quiescence_holds_the_workflow_task_open() {
         ExternalStreamReadyResult::Accepted
     );
 
+    consume_resolve_activation(&worker, &run_id).await;
     worker.drain_pollers_and_shutdown().await;
+}
+
+/// Polls the resolve activation readiness produced and completes it, leaving no task open.
+async fn consume_resolve_activation(worker: &crate::Worker, run_id: &str) -> Vec<u32> {
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let hints = resolve_hints(&activation);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.to_string(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    hints
 }
 
 #[tokio::test]
@@ -493,6 +512,7 @@ async fn the_idle_timer_fires_and_moves_the_set_to_parking() {
         ExternalStreamReadyResult::Accepted
     );
 
+    consume_resolve_activation(&worker, &run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
 
@@ -523,6 +543,9 @@ async fn readiness_does_not_cancel_a_timer_for_a_superseded_snapshot() {
         "a stale idle timeout must leave the wait set alone"
     );
 
+    // Release the retained task so shutdown can finish.
+    worker.notify_external_stream_ready(&run_id, 1, 0).await;
+    consume_resolve_activation(&worker, &run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
 
@@ -598,5 +621,561 @@ async fn a_completion_with_server_bound_commands_does_not_retain() {
         "a completion carrying a server-bound command must be reported, not retained"
     );
 
+    worker.drain_pollers_and_shutdown().await;
+}
+
+// --- readiness resolves the wait set (C7) ------------------------------------
+
+#[tokio::test]
+async fn simultaneous_readiness_ships_as_one_coalesced_activation() {
+    // One activation, not one per wait: there is never more than one outstanding activation per
+    // Run, and lang probes every active wait on receipt anyway -- the hints are hints.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1, 2, 3], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+
+    // The first notification has nothing to coalesce with and ships on its own.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 3, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&first), vec![3]);
+
+    // Everything arriving while that activation is outstanding accumulates -- including a repeat
+    // for a wait already known ready, which must not ship twice.
+    for wait_id in [1, 2, 1] {
+        assert_eq!(
+            worker
+                .notify_external_stream_ready(&run_id, wait_id, 0)
+                .await,
+            ExternalStreamReadyResult::Accepted
+        );
+    }
+    assert_eq!(
+        completions.load(Ordering::Relaxed),
+        0,
+        "readiness must not complete the retained Workflow Task"
+    );
+
+    // Completing that activation ships everything accumulated as *one* more activation.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(2, &[1, 2, 3], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+
+    let hints = consume_resolve_activation(&worker, &run_id).await;
+    assert_eq!(
+        hints,
+        vec![1, 2],
+        "three notifications across two waits must coalesce into one activation"
+    );
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+/// The wait ids named by any resolve job in an activation.
+fn resolve_hints(
+    activation: &temporalio_common::protos::coresdk::workflow_activation::WorkflowActivation,
+) -> Vec<u32> {
+    let mut ids: Vec<u32> = activation
+        .jobs
+        .iter()
+        .filter_map(|j| match &j.variant {
+            Some(workflow_activation_job::Variant::ResolveExternalStreamWaits(r)) => {
+                Some(r.ready_hints.iter().map(|w| w.wait_id).collect::<Vec<_>>())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn readiness_arriving_during_an_outstanding_activation_is_accumulated() {
+    // Readiness that lands while lang is still working cannot ship immediately, and dropping it
+    // would leave a buffered record with nothing to deliver it.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1, 2], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+
+    // First readiness produces an activation.
+    worker.notify_external_stream_ready(&run_id, 1, 0).await;
+    let outstanding = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        outstanding.jobs.iter().any(|j| matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::ResolveExternalStreamWaits(_))
+        )),
+        "expected a resolve activation, got {:?}",
+        outstanding.jobs
+    );
+
+    // Second readiness arrives while that one is still outstanding.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 2, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+
+    // Completing the outstanding activation with a fresh quiescent snapshot must surface the
+    // accumulated readiness rather than losing it.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(2, &[1, 2], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+    worker.notify_external_stream_ready(&run_id, 2, 0).await;
+
+    let hints = consume_resolve_activation(&worker, &run_id).await;
+    assert_eq!(hints, vec![2]);
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn readiness_before_the_idle_timer_expires_cancels_it() {
+    // If the timer survived readiness it would fire against the *next* quiescent snapshot and
+    // park a set that had just been told a record was waiting.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_millis(60)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+    consume_resolve_activation(&worker, &run_id).await;
+
+    // Well past when the cancelled timer would have fired.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Nothing parked: readiness ended that snapshot, and the timer measuring it went with it.
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::Parked,
+        "a cancelled idle timer must not park a set readiness already resolved"
+    );
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stale_generation_produces_no_activation() {
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 42).await,
+        ExternalStreamReadyResult::Stale
+    );
+
+    // Still retained, with no activation to poll -- the notification was for a block that had
+    // already been resolved, so manufacturing an activation for it would run user code for
+    // nothing.
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen
+    );
+    assert_eq!(completions.load(Ordering::Relaxed), 0);
+
+    worker.notify_external_stream_ready(&run_id, 1, 0).await;
+    consume_resolve_activation(&worker, &run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+// --- observation deltas accumulate (C14a) ------------------------------------
+
+fn progress_command(delta: &[u8], request_rollover: bool) -> workflow_command::Variant {
+    workflow_command::Variant::WorkflowStreamProgress(WorkflowStreamProgress {
+        observation_delta: delta.to_vec(),
+        request_rollover,
+    })
+}
+
+#[tokio::test]
+async fn deltas_accumulate_across_a_retained_task() {
+    // Core is annotation-blind: it appends bytes and hands them back. What this asserts is that
+    // the concatenation is exactly what lang emitted, in order -- which is the whole reason lang
+    // can build the marker's annotation by concatenating its own deltas.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"first", false).into(),
+                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(worker.external_stream_annotation(&run_id).await, b"first");
+
+    worker.notify_external_stream_ready(&run_id, 1, 0).await;
+    let _ = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"second", false).into(),
+                quiescent_command(2, &[1], Duration::from_secs(30)).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"firstsecond",
+        "successive deltas for one Workflow Task must concatenate in order"
+    );
+    assert_eq!(
+        completions.load(Ordering::Relaxed),
+        0,
+        "accumulating a delta must not complete the retained task"
+    );
+
+    worker.notify_external_stream_ready(&run_id, 1, 0).await;
+    consume_resolve_activation(&worker, &run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn an_empty_delta_accumulates_like_any_other() {
+    // An activation that observed nothing still observed: it recorded a drain that replay must
+    // reproduce, and on a subscription's first observation it carries the header without which
+    // replay has no starting point at all.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker = worker_recording_completions(completions.clone());
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"", false).into(),
+                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    // Accepted without complaint, and it did not disturb what was already there.
+    assert_eq!(worker.external_stream_annotation(&run_id).await, b"");
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen
+    );
+
+    worker.notify_external_stream_ready(&run_id, 1, 0).await;
+    consume_resolve_activation(&worker, &run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_delta_without_retention_still_accumulates() {
+    // Progress never implies retention. A completion that consumed records and then produced a
+    // server-bound command must still commit that consumption, or replay re-delivers the records
+    // while the command they produced is already durable.
+    //
+    // Two task batches, so the run is still cached when the annotation is read -- with one, the
+    // worker runs out of work and evicts before the assertion.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let counter = completions.clone();
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 2], mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        for _ in 0..2 {
+            let counter = counter.clone();
+            asserts.then(move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"consumed", false).into(),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    // The next task proves the run is still cached rather than evicted out from under us.
+    let next = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(next.run_id, run_id);
+
+    assert_eq!(
+        completions.load(Ordering::Relaxed),
+        1,
+        "a completion with a server-bound command is reported, not retained"
+    );
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"consumed",
+        "the delta must be committed even though nothing was retained"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_progress_command_after_another_command_is_malformed() {
+    // Ordering is normative. On replay, a record's integrity must be validated before the command
+    // derived from it is matched -- the other way round, a damaged stream is discovered only after
+    // its consequences have been accepted as durable.
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    mock_cfg.num_expected_fails = 1_usize.into();
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                start_timer_cmd(1, Duration::from_secs(10)),
+                progress_command(b"too late", false).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        worker.external_stream_annotation(&run_id).await.is_empty(),
+        "a misordered delta must be rejected, not accumulated"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+// --- rollover transport (C12a) -----------------------------------------------
+
+#[tokio::test]
+async fn a_retained_task_rolls_over_with_its_wait_set_intact() {
+    // The half that can exist without markers: the task is replaced, and every subscription,
+    // cursor, and readiness generation survives onto the replacement. No annotation is written,
+    // because in this configuration there is none to write.
+    let saw_force_new_wft = Arc::new(AtomicBool::new(false));
+    let recorder = saw_force_new_wft.clone();
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 1], mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            recorder.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+        });
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        // Exactly the worker ADR-017 is about: no local activities, so no request sink.
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"before-rollover", false).into(),
+                quiescent_command(1, &[1, 2], Duration::from_secs(30)).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen
+    );
+
+    worker
+        .start_wft_rollover_timer(&run_id, Duration::from_millis(50))
+        .await;
+
+    // The rollover's autocompletion is produced inside the poll loop, so a poll must be in
+    // flight for it to happen at all -- as is always the case on a running worker. This one
+    // times out on purpose: the replacement task is retained too, so there is nothing to hand
+    // back until readiness resolves it.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(600),
+            worker.poll_workflow_activation()
+        )
+        .await
+        .is_err(),
+        "the replacement task must be retained too, or the rollover undoes itself"
+    );
+
+    assert!(
+        saw_force_new_wft.load(Ordering::Relaxed),
+        "a rollover deadline that expires on a retained task must request a replacement"
+    );
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "the wait set retains the replacement task exactly as it retained its predecessor"
+    );
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"before-rollover",
+        "rollover transport writes no marker, so the accumulated annotation is untouched"
+    );
+
+    // The readiness generation still matches: a notification issued before the rollover is not
+    // turned stale by it.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 2, 0).await,
+        ExternalStreamReadyResult::Accepted,
+        "wait 2 must still be registered at generation 0 across the rollover"
+    );
+
+    // That readiness releases the retained replacement, so shutdown can finish.
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&resolved), vec![2]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_budget_rollover_forces_a_replacement_without_a_deadline() {
+    // Lang decided this boundary, so it needs no finalization round trip -- the very command
+    // carrying the request already carried the terminal.
+    let saw_force_new_wft = Arc::new(AtomicBool::new(false));
+    let recorder = saw_force_new_wft.clone();
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 2], mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            recorder.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+        });
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"at-the-budget", true).into(),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let next = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(next.run_id, run_id);
+
+    assert!(
+        saw_force_new_wft.load(Ordering::Relaxed),
+        "request_rollover must force a replacement task"
+    );
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"at-the-budget",
+        "a budget rollover writes no marker here, so the annotation is still accumulating"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
     worker.drain_pollers_and_shutdown().await;
 }

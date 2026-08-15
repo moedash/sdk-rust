@@ -485,6 +485,14 @@ impl WorkflowMachines {
         }
     }
 
+    /// Queue a Core-generated job for lang.
+    ///
+    /// Used by the external stream paths, whose activations originate in Core rather than from a
+    /// history event, so they have no state machine to be driven by.
+    pub(crate) fn send_core_generated_job(&mut self, variant: workflow_activation_job::Variant) {
+        self.drive_me.send_job(variant.into());
+    }
+
     pub(crate) fn has_pending_jobs(&self) -> bool {
         !self.drive_me.peek_pending_jobs().is_empty()
     }
