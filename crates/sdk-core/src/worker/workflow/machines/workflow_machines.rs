@@ -1601,6 +1601,20 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
+                // External stream commands are consumed above the machine level -- progress
+                // accumulates into the wait set (C14a) and the other three are answers to
+                // runtime-internal activations that `ManagedRun` resolves (C6, C8, C15a). None of
+                // them should reach the machines, and reaching them silently would drop a
+                // replay-visible observation delta on the floor.
+                leaked @ (WFCommandVariant::ExternalStreamProgress(_)
+                | WFCommandVariant::ExternalStreamQuiescent(_)
+                | WFCommandVariant::ExternalStreamParkResult(_)
+                | WFCommandVariant::ExternalStreamFinalized(_)) => {
+                    return Err(fatal!(
+                        "External stream command {leaked} reached the state machines; it should \
+                         have been consumed by the run's external wait set"
+                    ));
+                }
                 WFCommandVariant::NoCommandsFromLang => (),
             }
         }

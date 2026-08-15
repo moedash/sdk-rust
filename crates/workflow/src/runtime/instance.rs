@@ -1124,6 +1124,23 @@ where
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
+                // External Workflow Streams are a Python-SDK feature; this runtime never asks
+                // Core to retain a Workflow Task for a stream wait, so it can only ever see one
+                // of these by mistake. Failing loudly beats a wildcard that would silently drop
+                // a job carrying replay-visible state.
+                Some(
+                    job @ (ActivationVariant::ResolveExternalStreamWaits(_)
+                    | ActivationVariant::PrepareExternalStreamPark(_)
+                    | ActivationVariant::ReplayExternalStreams(_)
+                    | ActivationVariant::FinalizeExternalStreams(_)),
+                ) => {
+                    return Err(Box::new(Failure {
+                        message: format!(
+                            "External stream activation job {job} is not supported by this SDK"
+                        ),
+                        ..Default::default()
+                    }));
+                }
                 None => {
                     return Err(Box::new(Failure {
                         message: "Activation job missing variant".to_string(),

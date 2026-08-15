@@ -54,6 +54,10 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        WorkflowStreamProgress workflow_stream_progress = 23;
+        WorkflowStreamQuiescent workflow_stream_quiescent = 24;
+        ExternalStreamParkResult external_stream_park_result = 25;
+        ExternalStreamFinalized external_stream_finalized = 26;
         // 23 to 28 are taken by the external stream commands, which are developed
         // alongside these and share this message. The two numbers below are fixed
         // with that family and must not be reused.
@@ -80,6 +84,78 @@ message SubscribeNotificationChannel {
 message UnsubscribeNotificationChannel {
     // Name of the channel, scoped to the namespace.
     string channel = 1;
+}
+
+// Commits an observation delta for external streams.
+//
+// Emitted on *every* completion path where replay-visible stream state changed -- which includes
+// an activation that observed no records at all -- and independent of whether the Workflow Task
+// is retained. Consuming a record and committing that consumption are separate steps, and the
+// second is not conditional on why the Workflow Task ended.
+//
+// Ordering is normative: this command precedes every command whose value could depend on the
+// consumed data. On replay that guarantees integrity validation for a record runs before the
+// command derived from it is matched.
+message WorkflowStreamProgress {
+    // The segments produced since the previous progress report for this Workflow Task. Opaque to
+    // Core, which appends it to the accumulated annotation and never parses it.
+    bytes observation_delta = 1;
+    // Set when the encoder is approaching the annotation byte budget and the runtime wants the
+    // Workflow Task rolled over rather than the marker grown further. Core takes the rollover
+    // path minus the finalization round trip, because this command already carries the terminal.
+    bool request_rollover = 2;
+}
+
+// Asks Core to retain the open Workflow Task. Carries no annotation data -- retention and
+// progress are separate questions, and a completion may carry either command, both, or neither.
+message WorkflowStreamQuiescent {
+    // Identifies this complete blocked snapshot.
+    uint64 quiescence_generation = 1;
+    // The *complete* set of waits the Workflow is blocked on. A partial set would let one idle
+    // stream park a Workflow Task another stream is still driving.
+    repeated ExternalStreamWait waits = 2;
+    // Already reduced by `min` over the quiescent set in wait_id order. Core rejects a
+    // non-positive value as a malformed completion rather than coercing it.
+    google.protobuf.Duration idle_timeout = 3;
+}
+
+// One external stream wait. Shared by the commands above and by the activation jobs, so it takes
+// no command tag of its own.
+message ExternalStreamWait {
+    uint32 wait_id = 1;
+    // Increments each time this subscription re-enters the blocked state. Never leaves the
+    // Core/lang boundary.
+    uint64 generation = 2;
+    // Normally set after a write fence. A single fenced stream does not park the Workflow Task;
+    // Core bypasses the idle delay only when *every* active wait in the snapshot is set.
+    bool immediately_parkable = 3;
+}
+
+// Lang's answer to PrepareExternalStreamPark.
+message ExternalStreamParkResult {
+    uint64 quiescence_generation = 1;
+    oneof outcome {
+        ParkSetConfirmed confirmed = 2;
+        StreamSetBecameReady became_ready = 3;
+    }
+    // Terminal observation delta for the marker Core is about to write. Present on `confirmed`:
+    // only lang can encode the boundary, and Core must not write a marker whose annotation has
+    // no terminal.
+    bytes final_observation_delta = 4;
+}
+
+// Every stream was still empty after intents were installed and every stream was rechecked.
+message ParkSetConfirmed {}
+
+// A recheck found records, so this parking generation is aborted and Core issues a normal
+// resolve activation rather than running user code from inside the park path.
+message StreamSetBecameReady {}
+
+// Lang's answer to FinalizeExternalStreams, for the paths where Core decides the boundary and no
+// park handshake runs.
+message ExternalStreamFinalized {
+    uint64 quiescence_generation = 1;
+    bytes final_observation_delta = 2;
 }
 
 message StartTimer {

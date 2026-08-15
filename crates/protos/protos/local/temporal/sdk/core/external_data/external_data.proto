@@ -36,3 +36,48 @@ message PatchedMarkerData {
   // Whether or not the patch is marked deprecated.
   bool deprecated = 2;
 }
+
+// Why a Workflow Task holding external stream waits ended. Core knows the reason on every
+// completion path -- it either decided the boundary itself or was told -- which is why this
+// lives here, in the Core-readable marker envelope, and is deliberately *not* duplicated inside
+// the opaque replay annotation where a second copy could disagree with this one.
+enum ParkReason {
+  PARK_REASON_UNSPECIFIED = 0;
+  // The global quiescence timer expired with no record on any active wait.
+  PARK_REASON_IDLE = 1;
+  // Every active wait in the quiescent snapshot reached a write fence with no later record
+  // immediately available, so the idle delay was bypassed.
+  PARK_REASON_ALL_WRITE_FENCED = 2;
+  // The Worker is shutting down or the Run is being evicted while a Workflow Task is open.
+  PARK_REASON_SHUTDOWN = 3;
+  // The Workflow Task rollover deadline expired. Core decided this one, so the terminal came
+  // back through FinalizeExternalStreams.
+  PARK_REASON_ROLLOVER = 4;
+  // The annotation reached its byte budget high-water mark and lang asked for a rollover. Unlike
+  // PARK_REASON_ROLLOVER this needs no finalization round trip: the triggering
+  // WorkflowStreamProgress already carried the terminal.
+  PARK_REASON_BUDGET_ROLLOVER = 5;
+  // The completion carried server-bound commands (timer, activity, child workflow, signal), so
+  // the Workflow Task completed normally with subscriptions left active and unparked.
+  PARK_REASON_COMMANDS_PRODUCED = 6;
+  // The completion carried a terminal command -- complete, fail, cancel, or continue-as-new.
+  PARK_REASON_WORKFLOW_COMPLETED = 7;
+}
+
+// What Core writes into a marker for a Workflow Task that consumed external streams. Exactly one
+// of these is written per Workflow Task, however many progress reports that task carried.
+message ExternalStreamMarkerData {
+  uint32 schema_version = 1;
+  // Identifies the complete blocked snapshot this marker closes.
+  uint64 quiescence_generation = 2;
+  repeated ExternalWaitMarker waits = 3;
+  // The accumulated replay annotation, opaque to Core. Core appends each observation delta to
+  // this and never parses any of it.
+  bytes replay_annotation = 4;
+  ParkReason terminal_boundary = 5;
+}
+
+message ExternalWaitMarker {
+  uint32 wait_id = 1;
+  uint64 generation = 2;
+}
