@@ -1,3 +1,4 @@
+use super::external_streams::{ExternalStreamReadyResult, ExternalStreamRunStatus};
 use crate::{
     MetricsContext,
     abstractions::dbg_panic,
@@ -67,6 +68,7 @@ impl WFStream {
         wft_stream: impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static,
         local_rx: impl Stream<Item = LocalInput> + Send + 'static,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        run_timers: RunTimerSink,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let all_inputs = stream::select_with_strategy(
             local_rx.map(Into::into),
@@ -78,13 +80,14 @@ impl WFStream {
             // Priority always goes to the local stream
             |_: &mut ()| PollNext::Left,
         );
-        Self::build_internal(all_inputs, basics, local_activity_request_sink)
+        Self::build_internal(all_inputs, basics, local_activity_request_sink, run_timers)
     }
 
     fn build_internal(
         all_inputs: impl Stream<Item = WFStreamInput>,
         basics: WorkflowBasics,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        run_timers: RunTimerSink,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
             buffered_polls_need_cache_slot: Default::default(),
@@ -93,6 +96,7 @@ impl WFStream {
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
                 basics.server_capabilities,
                 local_activity_request_sink,
+                run_timers,
                 basics.metrics.clone(),
             ),
             shutdown_token: basics.shutdown_token,
@@ -140,6 +144,9 @@ impl WFStream {
                             LocalInputs::HeartbeatTimeout(hbt) => {
                                 state.process_heartbeat_timeout(hbt)
                             }
+                            LocalInputs::WftRolloverDeadline(run_id) => {
+                                state.process_wft_rollover_deadline(run_id)
+                            }
                             LocalInputs::RequestEviction(evict) => {
                                 state.request_eviction(evict).into_run_update_resp()
                             }
@@ -148,6 +155,46 @@ impl WFStream {
                                     cached_workflows: state.runs.len(),
                                     outstanding_wft: state.outstanding_wfts(),
                                 });
+                                None
+                            }
+                            LocalInputs::ExternalStreamReady(msg) => {
+                                state.external_stream_ready(msg)
+                            }
+                            LocalInputs::ExternalStreamIdleTimeout(msg) => {
+                                state.external_stream_idle_timeout(msg)
+                            }
+                            LocalInputs::ExternalStreamParkResult(msg) => {
+                                state.external_stream_park_result(msg)
+                            }
+                            LocalInputs::ExternalStreamRunStatus(msg) => {
+                                // Answered on this lane precisely so its answer is as
+                                // authoritative as a readiness acknowledgement -- and through
+                                // `peek`, which leaves even the cache's LRU order untouched.
+                                let status = state
+                                    .runs
+                                    .peek(&msg.run_id)
+                                    .map(|rh| rh.external_stream_run_status())
+                                    .unwrap_or(ExternalStreamRunStatus::RunNotFound);
+                                let _ = msg.response_tx.send(status);
+                                None
+                            }
+                            #[cfg(test)]
+                            LocalInputs::StartRolloverTimer(msg) => {
+                                if let Some(rh) = state.runs.get_mut(&msg.run_id) {
+                                    rh.start_wft_rollover_timer(
+                                        std::time::Instant::now(),
+                                        msg.wft_timeout,
+                                    );
+                                }
+                                let _ = msg.response_tx.send(());
+                                None
+                            }
+                            #[cfg(test)]
+                            LocalInputs::ExternalStreamSeedWaits(msg) => {
+                                if let Some(rh) = state.runs.get_mut(&msg.run_id) {
+                                    rh.seed_external_wait_set(&msg);
+                                }
+                                let _ = msg.response_tx.send(());
                                 None
                             }
                             LocalInputs::BumpStream => {
@@ -478,6 +525,49 @@ impl WFStream {
         }
     }
 
+    fn process_wft_rollover_deadline(&mut self, run_id: String) -> RunUpdateAct {
+        if let Some(rh) = self.runs.get_mut(&run_id) {
+            rh.wft_rollover_deadline()
+        } else {
+            None
+        }
+    }
+
+    /// A watcher reports that a record is buffered for one external stream wait.
+    ///
+    /// The acknowledgement is sent from here rather than from the caller because only this lane
+    /// knows whether the run is cached at all, and `RunNotFound` is a different instruction to the
+    /// watcher than any of the states a cached run can be in.
+    fn external_stream_ready(&mut self, msg: ExternalStreamReadyMsg) -> RunUpdateAct {
+        let Some(rh) = self.runs.get_mut(&msg.run_id) else {
+            let _ = msg.response_tx.send(ExternalStreamReadyResult::RunNotFound);
+            return None;
+        };
+        let (result, act) = rh.external_stream_ready(msg.wait_id, msg.wait_generation);
+        let _ = msg.response_tx.send(result);
+        act
+    }
+
+    fn external_stream_idle_timeout(&mut self, msg: ExternalStreamIdleTimeoutMsg) -> RunUpdateAct {
+        if let Some(rh) = self.runs.get_mut(&msg.run_id) {
+            rh.external_stream_idle_timeout(msg.quiescence_generation)
+        } else {
+            // The run went away while its idle timer was pending. Nothing is retained, so there
+            // is nothing to park.
+            debug!(run_id = %msg.run_id, "External stream idle timeout for an untracked run");
+            None
+        }
+    }
+
+    fn external_stream_park_result(&mut self, msg: ExternalStreamParkResultMsg) -> RunUpdateAct {
+        if let Some(rh) = self.runs.get_mut(&msg.run_id) {
+            rh.external_stream_park_result(msg.quiescence_generation, msg.confirmed)
+        } else {
+            debug!(run_id = %msg.run_id, "External stream park result for an untracked run");
+            None
+        }
+    }
+
     /// Request a workflow eviction. This will (eventually, after replay is done) queue up an
     /// activation to evict the workflow from the lang side. Workflow will not *actually* be evicted
     /// until lang replies to that activation
@@ -679,6 +769,25 @@ pub(super) enum LocalInputs {
     RequestEviction(RequestEvictMsg),
     HeartbeatTimeout(String),
     GetStateInfo(GetStateInfoMsg),
+    // External Workflow Stream inputs. These ride the same prioritized local-input lane as
+    // local-activity completions, which is what makes stream readiness serialize with every other
+    // input to a run rather than racing them.
+    ExternalStreamReady(ExternalStreamReadyMsg),
+    ExternalStreamIdleTimeout(ExternalStreamIdleTimeoutMsg),
+    ExternalStreamParkResult(ExternalStreamParkResultMsg),
+    ExternalStreamRunStatus(ExternalStreamRunStatusMsg),
+    /// The run-level workflow task rollover deadline expired.
+    ///
+    /// Deliberately a separate input from `HeartbeatTimeout` rather than a reuse of it: the
+    /// heartbeat is meaningful only while local activities are outstanding, and folding the two
+    /// together would change what a late heartbeat does to a run whose local activities have
+    /// already finished.
+    #[from(ignore)]
+    WftRolloverDeadline(String),
+    #[cfg(test)]
+    ExternalStreamSeedWaits(ExternalStreamSeedWaitsMsg),
+    #[cfg(test)]
+    StartRolloverTimer(StartRolloverTimerMsg),
     BumpStream,
 }
 impl LocalInputs {
@@ -690,6 +799,15 @@ impl LocalInputs {
             LocalInputs::PostActivation(pa) => &pa.run_id,
             LocalInputs::RequestEviction(re) => &re.run_id,
             LocalInputs::HeartbeatTimeout(hb) => hb,
+            LocalInputs::ExternalStreamReady(r) => &r.run_id,
+            LocalInputs::ExternalStreamIdleTimeout(t) => &t.run_id,
+            LocalInputs::ExternalStreamParkResult(p) => &p.run_id,
+            LocalInputs::ExternalStreamRunStatus(s) => &s.run_id,
+            LocalInputs::WftRolloverDeadline(run_id) => run_id,
+            #[cfg(test)]
+            LocalInputs::ExternalStreamSeedWaits(sw) => &sw.run_id,
+            #[cfg(test)]
+            LocalInputs::StartRolloverTimer(sr) => &sr.run_id,
             LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
         })
     }

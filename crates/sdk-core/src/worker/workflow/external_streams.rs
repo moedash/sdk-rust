@@ -16,9 +16,9 @@
 //! `park_generation` is not a fourth counter: it takes the value of the `quiescence_generation`
 //! that was parked.
 
-// These types land before the code that drives them: C3 routes the local inputs, C4 exposes the
-// readiness and status calls, and C6 gives `ManagedRun` a wait set to hold. Until then only the
-// unit tests below construct them.
+// Some of this lands before the code that drives it: the annotation buffer and its invariant wait
+// on C14a/C14b, the all-fenced park trigger on C8, and the wake-generation check on C11. Until
+// then only the unit tests below reach them.
 #![allow(dead_code)]
 
 use std::{
@@ -114,6 +114,75 @@ pub(crate) enum RunStreamStatus {
     Parked,
     /// Waits are registered but no Workflow Task is open.
     NoOpenWorkflowTask,
+}
+
+/// The acknowledgement [`crate::Worker::notify_external_stream_ready`] returns.
+///
+/// Five values, not two, because lang's watcher does something different with each and an
+/// operator should conclude something different from each:
+///
+/// | Result                | Watcher action                          | Metric                   |
+/// |-----------------------|-----------------------------------------|--------------------------|
+/// | `Accepted`            | Nothing; Core will activate             | local wakeup             |
+/// | `Stale`               | Re-probe; do **not** signal             | stale notification       |
+/// | `Parked`              | Send the reserved wake Signal           | signal wakeup, parked    |
+/// | `NoOpenWorkflowTask`  | Send the wake Signal; **keep** the watcher | signal wakeup, unparked |
+/// | `RunNotFound`         | Send the wake Signal, then tear down    | signal wakeup, evicted   |
+///
+/// `NoOpenWorkflowTask` and `RunNotFound` are separate on purpose. A Run cached between Workflow
+/// Tasks is the healthy post-completion state; reporting it as a missing Run would both corrupt
+/// the metric and tell the watcher to tear itself down while it is still needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalStreamReadyResult {
+    /// Readiness was serialized while the Workflow Task was still open.
+    Accepted,
+    /// The wait exists but its `wait_generation` moved on.
+    Stale,
+    /// A confirmed park generation exists for this wait.
+    Parked,
+    /// The Run is cached and its waits are registered, but no Workflow Task is open.
+    NoOpenWorkflowTask,
+    /// The Run is absent from this Core worker's cache.
+    RunNotFound,
+}
+
+impl From<ReadinessOutcome> for ExternalStreamReadyResult {
+    fn from(outcome: ReadinessOutcome) -> Self {
+        match outcome {
+            ReadinessOutcome::Accepted => ExternalStreamReadyResult::Accepted,
+            ReadinessOutcome::Stale => ExternalStreamReadyResult::Stale,
+            ReadinessOutcome::Parked => ExternalStreamReadyResult::Parked,
+            ReadinessOutcome::NoOpenWorkflowTask => ExternalStreamReadyResult::NoOpenWorkflowTask,
+        }
+    }
+}
+
+/// The answer [`crate::Worker::external_stream_run_status`] returns.
+///
+/// Read-only: asking must leave the Run exactly as it was. This exists so lang's shutdown sweep
+/// can ask what state a Run is in without claiming a record is buffered, which is what
+/// `notify_external_stream_ready` means and which would manufacture a spurious activation on the
+/// way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalStreamRunStatus {
+    /// A Workflow Task is open, retained by the wait set.
+    WftOpen,
+    /// The complete wait set is parked.
+    Parked,
+    /// The Run is cached with active waits, but no Workflow Task is open.
+    NoOpenWorkflowTask,
+    /// The Run is absent from this Core worker's cache.
+    RunNotFound,
+}
+
+impl From<RunStreamStatus> for ExternalStreamRunStatus {
+    fn from(status: RunStreamStatus) -> Self {
+        match status {
+            RunStreamStatus::WftOpen => ExternalStreamRunStatus::WftOpen,
+            RunStreamStatus::Parked => ExternalStreamRunStatus::Parked,
+            RunStreamStatus::NoOpenWorkflowTask => ExternalStreamRunStatus::NoOpenWorkflowTask,
+        }
+    }
 }
 
 /// Why a set of waits is being parked.

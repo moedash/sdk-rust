@@ -3,6 +3,7 @@ use crate::{
     telemetry::metrics::workflow_type,
     worker::workflow::{
         HistoryUpdate, LocalActivityRequestSink, PermittedWFT, RequestEvictMsg, RunBasics,
+        RunTimerSink,
         managed_run::{ManagedRun, RunUpdateAct},
     },
 };
@@ -20,6 +21,7 @@ pub(super) struct RunCache {
     /// Run id -> Data
     runs: LruCache<String, ManagedRun>,
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+    run_timers: RunTimerSink,
 
     metrics: MetricsContext,
 }
@@ -30,6 +32,7 @@ impl RunCache {
         sdk_name_and_version: (String, String),
         server_capabilities: get_system_info_response::Capabilities,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        run_timers: RunTimerSink,
         metrics: MetricsContext,
     ) -> Self {
         // The cache needs room for at least one run, otherwise we couldn't do anything. In
@@ -48,6 +51,7 @@ impl RunCache {
             ),
             local_activity_request_sink: local_activity_request_sink
                 .map(|s| Rc::new(s) as Rc<dyn LocalActivityRequestSink>),
+            run_timers,
             metrics,
         }
     }
@@ -81,6 +85,7 @@ impl RunCache {
             },
             pwft,
             self.local_activity_request_sink.clone(),
+            self.run_timers.clone(),
         );
         if self.runs.push(run_id, mrh).is_some() {
             panic!("Overflowed run cache! Cache owner is expected to avoid this!");
