@@ -1,0 +1,101 @@
+# Reserved wake Signal
+
+The server-visible wakeup used whenever no open Workflow Task can accept local readiness. It never
+carries stream payloads.
+
+Owned by C1 (envelope proto), C11 (interception), P14 (producer send path), P20 (shutdown sweep).
+
+## Where it is used
+
+```text
+new record
+    ├─ open WFT  → Python readiness call → Core activation
+    └─ otherwise → Temporal Signal → server creates WFT
+```
+
+"Otherwise" is three states, not one — parked, cached with no open Workflow Task, and evicted. All
+three send this Signal; they differ in what the watcher does afterwards. See
+`core-lang-protocol.md`.
+
+## Signal name
+
+`__temporal_external_stream_wake`. Fixed, versioned by the envelope rather than by the name, and
+distinct from every `__temporal_workflow_stream_*` name already reserved by
+`temporalio.contrib.workflow_streams` (ADR-001).
+
+## Envelope
+
+Core must read this Signal's fields, and Core has no access to the user's `DataConverter` or codec.
+The envelope is therefore defined at the protocol level and is deliberately **not** a user payload.
+
+A single argument whose `Payload` uses metadata `encoding = "binary/protobuf"` and
+`messageType = "coresdk.external_stream.WakeSignal"`, carrying:
+
+```protobuf
+message WakeSignal {
+  uint32 envelope_version = 1;      // starts at 1; Core rejects unknown versions harmlessly
+  string stream_name = 2;
+  uint32 wait_id = 3;
+  // 0 is reserved and means "no park generation" -- an unparked wake. Park
+  // generations are quiescence generations, which start at 1.
+  uint64 park_generation = 4;
+  string first_execution_run_id = 5; // chain identity, not the current run
+  string producer_session_id = 6;    // diagnostics only
+}
+```
+
+## Parked and unparked wakes use the same envelope
+
+`park_generation = 0` means the sender knows of no confirmed park for this wait and is asking for a
+Workflow Task anyway (ADR-023). Core validates chain identity for an unparked wake and otherwise
+accepts it as a recheck request: the runtime rechecks every active subscription on wakeup
+regardless, so an unnecessary unparked wake costs at most one empty Workflow Task.
+
+A **non-zero** generation that the current Run does not recognize is still ignored as stale, because
+there the sender is making a claim that turned out to be wrong.
+
+## Three properties that make this work
+
+- **Codec bypass.** The producer sends this Signal through a raw Workflow Service
+  `SignalWorkflowExecution` request built with the protocol's own serialization, *not* through the
+  user's `DataConverter` (ADR-025). A user codec that encrypts payloads would otherwise make the
+  envelope unreadable to Core, which is the component that must read it. The Signal carries no user
+  data, so bypassing the codec leaks nothing.
+- **Stable request ID.** The Temporal `request_id` on the signal request is derived deterministically
+  from `(namespace, workflow_id, first_execution_run_id, stream_name, wait_id, park_generation)`, so
+  a producer retrying after an ambiguous failure produces the identical request and the server
+  deduplicates it. Generating a fresh UUID per attempt — which the public Python Signal path does —
+  would defeat this, which is another reason the wake path does not reuse it.
+
+  For an **unparked** wake the generation is 0 and therefore carries no attempt identity of its own,
+  so the derivation additionally includes the sender's identity and a per-sender monotonic wake
+  counter, both held fixed across retries of that one attempt. Without that, two Workers shutting
+  down at different times would derive the same request ID and the server would deduplicate the
+  second wake away — turning a correct retry mechanism into silent loss.
+- **Chain identity.** `first_execution_run_id` lets Core classify a Signal that arrives after
+  Continue-As-New: same chain and a live wait means wake, same chain and an unknown generation means
+  ignore harmlessly, different chain means reject. The Signal is addressed to the Workflow ID without
+  a Run ID, so it always lands on the current Run of the chain.
+
+## Interception
+
+Core intercepts the Signal before user Signal dispatch, decodes the envelope without a
+`DataConverter`, validates chain identity and generation, and issues `ResolveExternalStreamWaits`.
+The first valid Signal creates or accompanies the new Workflow Task; duplicate wake Signals are
+harmless. Python rechecks **every** active stream rather than only the stream named by the Signal.
+
+**Core suppresses the Signal from user handlers whether or not it validates**, so an unknown envelope
+version or a stale generation can never reach Workflow code as an unhandled Signal.
+
+## Producer send sequence
+
+1. Append the record.
+2. Observe or lease-claim the current park generation.
+3. Send the Signal idempotently.
+
+Only successfully appended records may trigger wakeup. Claims are leased and renewable so a producer
+crashing between claim and Signal does not strand the generation — see `backend-contract.md`.
+
+Wake signaling is independently retryable and idempotent. Retrying the wake step is a producer
+obligation, not an automatic property; `publish()`'s acknowledged-wake contract (P6b) is what turns
+it into one.
