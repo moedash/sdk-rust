@@ -1000,6 +1000,48 @@ pub mod coresdk {
     }
     pub mod external_data {
         tonic::include_proto!("coresdk.external_data");
+        pub use self::stream_marker_helpers::*;
+        mod stream_marker_helpers {
+            use super::ExternalStreamMarkerData;
+            use crate::protos::temporal::api::common::v1::{Payload, Payloads};
+            use prost::Message;
+            use std::collections::HashMap;
+
+            /// The key the marker's details map stores the envelope under.
+            const DETAILS_KEY: &str = "external_stream";
+
+            /// Packs the marker envelope into a `RecordMarker` details map.
+            ///
+            /// Encoded as proto binary rather than JSON: the replay annotation inside is opaque
+            /// bytes of arbitrary size, and JSON-encoding it would inflate every marker for the
+            /// sake of a UI rendering nobody can read anyway.
+            pub fn build_external_stream_marker_details(
+                data: &ExternalStreamMarkerData,
+            ) -> HashMap<String, Payloads> {
+                let payload = Payload {
+                    metadata: HashMap::from([(
+                        "encoding".to_string(),
+                        b"binary/protobuf".to_vec(),
+                    )]),
+                    data: data.encode_to_vec(),
+                    ..Default::default()
+                };
+                HashMap::from([(
+                    DETAILS_KEY.to_string(),
+                    Payloads {
+                        payloads: vec![payload],
+                    },
+                )])
+            }
+
+            /// Reads the envelope back out, or `None` if this is not one of ours.
+            pub fn extract_external_stream_marker_data(
+                details: &HashMap<String, Payloads>,
+            ) -> Option<ExternalStreamMarkerData> {
+                let payload = details.get(DETAILS_KEY)?.payloads.first()?;
+                ExternalStreamMarkerData::decode(payload.data.as_slice()).ok()
+            }
+        }
         mod sdk_helpers {
             use prost_types::{Duration, Timestamp};
             use serde::{Deserialize, Deserializer, Serialize, Serializer};

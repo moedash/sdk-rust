@@ -179,6 +179,16 @@ impl WFStream {
                                 None
                             }
                             #[cfg(test)]
+                            LocalInputs::EmitTerminalLessMarker(msg) => {
+                                let refused = state
+                                    .runs
+                                    .get_mut(&msg.run_id)
+                                    .map(|rh| rh.emit_terminal_less_marker())
+                                    .unwrap_or(false);
+                                let _ = msg.response_tx.send(refused);
+                                None
+                            }
+                            #[cfg(test)]
                             LocalInputs::ExternalStreamAnnotation(msg) => {
                                 let annotation = state
                                     .runs
@@ -800,6 +810,8 @@ pub(super) enum LocalInputs {
     StartRolloverTimer(StartRolloverTimerMsg),
     #[cfg(test)]
     ExternalStreamAnnotation(ExternalStreamAnnotationMsg),
+    #[cfg(test)]
+    EmitTerminalLessMarker(EmitTerminalLessMarkerMsg),
     BumpStream,
 }
 impl LocalInputs {
@@ -822,6 +834,8 @@ impl LocalInputs {
             LocalInputs::StartRolloverTimer(sr) => &sr.run_id,
             #[cfg(test)]
             LocalInputs::ExternalStreamAnnotation(a) => &a.run_id,
+            #[cfg(test)]
+            LocalInputs::EmitTerminalLessMarker(m) => &m.run_id,
             LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
         })
     }

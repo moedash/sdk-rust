@@ -11,8 +11,9 @@ use crate::{
     test_help::{
         MockPollCfg, WorkerExt, build_fake_worker, build_mock_pollers, mock_worker, start_timer_cmd,
     },
-    worker::client::mocks::mock_worker_client,
+    worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
 };
+use parking_lot::Mutex;
 use prost::Message as _;
 use std::{
     collections::HashMap,
@@ -24,6 +25,7 @@ use std::{
 };
 use temporalio_common::{
     protos::coresdk::{
+        external_data::{ParkReason, extract_external_stream_marker_data},
         external_stream::{self, WakeSignal},
         workflow_activation::workflow_activation_job,
         workflow_commands::{
@@ -32,7 +34,14 @@ use temporalio_common::{
         },
         workflow_completion::WorkflowActivationCompletion,
     },
-    protos::temporal::api::{common::v1::Payload, enums::v1::EventType},
+    protos::{
+        constants::EXTERNAL_STREAM_MARKER_NAME,
+        temporal::api::{
+            command::v1::command,
+            common::v1::Payload,
+            enums::v1::{CommandType, EventType},
+        },
+    },
     worker::WorkerTaskTypes,
 };
 
@@ -936,13 +945,16 @@ async fn a_delta_without_retention_still_accumulates() {
     // worker runs out of work and evicts before the assertion.
     let completions = Arc::new(AtomicUsize::new(0));
     let counter = completions.clone();
-    let t = canned_histories::single_timer("1");
+    let t = marker_then_timer_history(0, ParkReason::CommandsProduced, b"consumed");
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
     let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 2], mock_worker_client());
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
         for _ in 0..2 {
             let counter = counter.clone();
-            asserts.then(move |_| {
+            let collected = markers.clone();
+            asserts.then(move |wft| {
                 counter.fetch_add(1, Ordering::Relaxed);
+                collected.lock().extend(stream_markers(wft));
             });
         }
     });
@@ -977,9 +989,13 @@ async fn a_delta_without_retention_still_accumulates() {
         "a completion with a server-bound command is reported, not retained"
     );
     assert_eq!(
-        worker.external_stream_annotation(&run_id).await,
-        b"consumed",
+        *markers.lock(),
+        vec![(0, ParkReason::CommandsProduced, b"consumed".to_vec())],
         "the delta must be committed even though nothing was retained"
+    );
+    assert!(
+        worker.external_stream_annotation(&run_id).await.is_empty(),
+        "the annotation is cleared once its marker is written"
     );
 
     worker
@@ -1040,10 +1056,13 @@ async fn a_retained_task_rolls_over_with_its_wait_set_intact() {
     let saw_force_new_wft = Arc::new(AtomicBool::new(false));
     let recorder = saw_force_new_wft.clone();
     let t = canned_histories::single_timer("1");
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
     let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 1], mock_worker_client());
+    let collected = markers.clone();
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
         asserts.then(move |wft| {
             recorder.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+            collected.lock().extend(stream_markers(wft));
         });
     });
     let mut mock = build_mock_pollers(mock_cfg);
@@ -1104,6 +1123,11 @@ async fn a_retained_task_rolls_over_with_its_wait_set_intact() {
         b"before-rollover",
         "rollover transport writes no marker, so the accumulated annotation is untouched"
     );
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "the marker half of rollover is C12b's; transport alone writes nothing"
+    );
 
     // The readiness generation still matches: a notification issued before the rollover is not
     // turned stale by it.
@@ -1133,11 +1157,14 @@ async fn a_budget_rollover_forces_a_replacement_without_a_deadline() {
     // carrying the request already carried the terminal.
     let saw_force_new_wft = Arc::new(AtomicBool::new(false));
     let recorder = saw_force_new_wft.clone();
-    let t = canned_histories::single_timer("1");
+    let t = marker_then_timer_history(0, ParkReason::BudgetRollover, b"at-the-budget");
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
     let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 2], mock_worker_client());
+    let collected = markers.clone();
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
         asserts.then(move |wft| {
             recorder.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+            collected.lock().extend(stream_markers(wft));
         });
     });
     let mut mock = build_mock_pollers(mock_cfg);
@@ -1169,9 +1196,10 @@ async fn a_budget_rollover_forces_a_replacement_without_a_deadline() {
         "request_rollover must force a replacement task"
     );
     assert_eq!(
-        worker.external_stream_annotation(&run_id).await,
-        b"at-the-budget",
-        "a budget rollover writes no marker here, so the annotation is still accumulating"
+        *markers.lock(),
+        vec![(0, ParkReason::BudgetRollover, b"at-the-budget".to_vec())],
+        "a budget rollover writes its marker without a finalization round trip -- the command \
+         that asked for it already carried the terminal"
     );
 
     worker
@@ -1215,6 +1243,31 @@ fn wake(park_generation: u64, first_execution_run_id: &str) -> WakeSignal {
         first_execution_run_id: first_execution_run_id.to_string(),
         producer_session_id: "producer-a".to_string(),
     }
+}
+
+/// The external stream markers a completion recorded, with their terminal boundaries.
+///
+/// Reading the envelope back out of the command is what makes "exactly one marker per Workflow
+/// Task" and "never without a terminal" checkable rather than assumed.
+fn stream_markers(wft: &WorkflowTaskCompletion) -> Vec<(u64, ParkReason, Vec<u8>)> {
+    wft.commands
+        .iter()
+        .filter_map(|c| match &c.attributes {
+            Some(command::Attributes::RecordMarkerCommandAttributes(m))
+                if m.marker_name == EXTERNAL_STREAM_MARKER_NAME =>
+            {
+                extract_external_stream_marker_data(&m.details)
+            }
+            _ => None,
+        })
+        .map(|d| {
+            (
+                d.quiescence_generation,
+                d.terminal_boundary(),
+                d.replay_annotation,
+            )
+        })
+        .collect()
 }
 
 /// A worker whose second Workflow Task carries one Signal.
@@ -1425,6 +1478,270 @@ async fn an_ordinary_signal_still_reaches_its_handler() {
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             second.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+// --- marker emission (C9, C14b) ----------------------------------------------
+
+/// A history for a Workflow Task that records a marker and then starts a timer.
+///
+/// Commands are matched to history events in order, so the marker event has to be there and has
+/// to come first -- a history missing it hands the marker machine whatever event is next.
+fn marker_then_timer_history(
+    quiescence_generation: u64,
+    terminal: ParkReason,
+    annotation: &[u8],
+) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_external_stream_marker(quiescence_generation, terminal, annotation);
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// A worker that records the markers on every completion.
+fn worker_recording_markers(
+    markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>>,
+    batches: [usize; 2],
+    history: TestHistoryBuilder,
+) -> crate::Worker {
+    let t = history;
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, batches, mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        for _ in 0..4 {
+            let collected = markers.clone();
+            asserts.then(move |wft| {
+                collected.lock().extend(stream_markers(wft));
+            });
+        }
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+#[tokio::test]
+async fn several_progress_reports_collapse_into_one_marker() {
+    // The claim the design's History cost rests on: a retained Workflow Task may span many
+    // activations, and it writes **one** marker however many of them reported progress.
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let worker = worker_recording_markers(
+        markers.clone(),
+        [1, 2],
+        // Generation 3: the task became quiescent three times before it ended, and the marker
+        // closes the last of those snapshots.
+        marker_then_timer_history(3, ParkReason::CommandsProduced, b"onetwothreefour"),
+    );
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    // Three activations under one Workflow Task, each reporting progress.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"one", false).into(),
+                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    for delta in [b"two".as_slice(), b"three".as_slice()] {
+        worker.notify_external_stream_ready(&run_id, 1, 0).await;
+        let _ = worker.poll_workflow_activation().await.unwrap();
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                run_id.clone(),
+                vec![
+                    progress_command(delta, false).into(),
+                    quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "a retained task writes nothing"
+    );
+
+    // Now the task ends.
+    worker.notify_external_stream_ready(&run_id, 1, 0).await;
+    let _ = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"four", false).into(),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let _ = worker.poll_workflow_activation().await.unwrap();
+
+    let written = markers.lock().clone();
+    assert_eq!(written.len(), 1, "exactly one marker per Workflow Task");
+    let (_, terminal, annotation) = &written[0];
+    assert_eq!(*terminal, ParkReason::CommandsProduced);
+    assert_eq!(
+        annotation, b"onetwothreefour",
+        "the marker carries every delta the task accumulated, concatenated in order"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_terminal_command_writes_its_marker_ordered_before_it() {
+    // Command ordering is normative: on replay this guarantees a record's integrity is validated
+    // before the command derived from it is matched.
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let ordering: Arc<Mutex<Vec<i32>>> = Default::default();
+    let recorded = ordering.clone();
+
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    let collected = markers.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            collected.lock().extend(stream_markers(wft));
+            recorded
+                .lock()
+                .extend(wft.commands.iter().map(|c| c.command_type));
+        });
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id,
+            vec![
+                progress_command(b"consumed", false).into(),
+                CompleteWorkflowExecution::default().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let written = markers.lock().clone();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].1, ParkReason::WorkflowCompleted);
+
+    let commands = ordering.lock().clone();
+    let marker_at = commands
+        .iter()
+        .position(|c| *c == CommandType::RecordMarker as i32)
+        .expect("the marker must be in the completion");
+    let terminal_at = commands
+        .iter()
+        .position(|c| *c == CommandType::CompleteWorkflowExecution as i32)
+        .expect("the terminal command must be in the completion");
+    assert!(
+        marker_at < terminal_at,
+        "the marker must precede the terminal command, got {commands:?}"
+    );
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_workflow_task_that_observed_nothing_writes_no_marker() {
+    // Not an error: a Workflow Task that touched no stream is the ordinary case, and writing an
+    // empty marker for it would put a History event on every task in the Workflow.
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let worker =
+        worker_recording_markers(markers.clone(), [1, 2], canned_histories::single_timer("1"));
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    let _ = worker.poll_workflow_activation().await.unwrap();
+
+    assert_eq!(*markers.lock(), Vec::new());
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn an_annotation_with_no_terminal_is_refused_rather_than_written() {
+    // The refusal belongs to emission itself and needs no finalization job to state it: an
+    // annotation without its terminal is durable and wrong, while an abandoned Workflow Task
+    // commits no cursor and loses no record. So there is no best-effort path.
+    //
+    // Driven directly at the emission primitive, because no completion path can produce this --
+    // which is the point: the guard exists for a future path that forgets.
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let worker =
+        worker_recording_markers(markers.clone(), [1, 2], canned_histories::single_timer("1"));
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    assert!(
+        worker
+            .emit_terminal_less_external_stream_marker(&run_id)
+            .await,
+        "emitting an annotation with no terminal boundary must be refused"
+    );
+
+    // And nothing was written: the completion that follows carries no marker at all.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    let _ = worker.poll_workflow_activation().await.unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "a refused emission must write nothing rather than writing a truncated annotation"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
             vec![CompleteWorkflowExecution::default().into()],
         ))
         .await
