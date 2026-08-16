@@ -152,6 +152,12 @@ pub(crate) struct Workflows {
 pub(crate) struct WorkflowBasics {
     pub(crate) worker_config: Arc<WorkerConfig>,
     pub(crate) shutdown_token: CancellationToken,
+    /// The Worker's *own* shutdown token, of which `shutdown_token` is a child.
+    ///
+    /// Cancelled only when shutdown was actually requested, whereas the child is also cancelled
+    /// by the workflow stream itself when the workflow task poller dies. Both mean "stop", but
+    /// only this one means "the Worker is going away", which is the boundary C15b closes.
+    pub(crate) worker_shutdown_token: CancellationToken,
     pub(crate) metrics: MetricsContext,
     pub(crate) server_capabilities: get_system_info_response::Capabilities,
     pub(crate) namespace_capabilities: Arc<NamespaceCapabilities>,

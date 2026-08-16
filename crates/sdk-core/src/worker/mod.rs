@@ -1095,6 +1095,7 @@ impl Worker {
                         WorkflowBasics {
                             worker_config: Arc::new(config.clone()),
                             shutdown_token: shutdown_token.child_token(),
+                            worker_shutdown_token: shutdown_token.clone(),
                             metrics,
                             server_capabilities: client.capabilities().unwrap_or_default(),
                             namespace_capabilities: capabilities.clone(),

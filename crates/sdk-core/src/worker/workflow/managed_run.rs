@@ -417,14 +417,38 @@ impl ManagedRun {
         }
 
         if self.wft.is_none() {
-            // It doesn't make sense to do workflow work unless we have a WFT
+            // It doesn't make sense to do workflow work unless we have a WFT.
+            //
+            // This is also the whole of C15b's second transition, and it is a no-op by
+            // construction: with no Workflow Task there is nothing accumulated, so no marker is
+            // written and none is missing, and there is no task token to set `force_new_wft` on
+            // either. The server-visible replacement is lang's wake sweep, which Core must not
+            // duplicate (ADR-009).
             return Ok(None);
+        }
+
+        // An eviction tears this Run down, so it closes the stream boundary for exactly the same
+        // reason Worker shutdown does. Recording the intent *here* rather than in
+        // `request_eviction` is what orders finalization ahead of eviction: the eviction
+        // activation is produced in this function's final branch, so a `FinalizeExternalStreams`
+        // job queued now is always issued -- and answered -- before `RemoveFromCache` is.
+        if self.trying_to_evict.is_some() {
+            self.begin_external_stream_teardown();
         }
 
         // Ready waits become a job here rather than at the notification, so readiness that
         // arrived while an activation was outstanding is picked up the moment that activation
         // completes -- with no separate path to keep in step.
         self.maybe_issue_external_stream_resolve();
+
+        // The Run is going away while it still holds a Workflow Task. Anything accumulated needs
+        // lang's terminal before a marker may be written, which is what the finalization job asks
+        // for; `false` means nothing was accumulated, and the task must then be completed anyway
+        // rather than abandoned open, because completing is the only way to request the
+        // replacement task that offers this Run back to the task queue.
+        let teardown_needs_completion = self.waiting_on_local_work.shutdown_pending
+            && !self.am_broken
+            && !self.begin_external_stream_finalization(ParkReason::Shutdown);
 
         if self.wfm.machines.has_pending_jobs() && !self.am_broken {
             Ok(Some(ActivationOrAuto::LangActivation(
@@ -440,6 +464,10 @@ impl ManagedRun {
                 .expect("local work was just checked to be present")
                 .hb_timeout_handle
                 .abort();
+            Ok(Some(ActivationOrAuto::Autocomplete {
+                run_id: self.run_id().to_string(),
+            }))
+        } else if teardown_needs_completion {
             Ok(Some(ActivationOrAuto::Autocomplete {
                 run_id: self.run_id().to_string(),
             }))
@@ -955,6 +983,13 @@ impl ManagedRun {
         }
         let completing_budget_rollover =
             mem::take(&mut self.waiting_on_local_work.budget_rollover_pending);
+        // This Run is being torn down -- Worker shutdown, or an eviction -- while it still holds
+        // the Workflow Task (C15b). Like the rollover deadline it is a boundary *Core* decided, so
+        // the terminal is owed by a finalization round trip; and like the rollover intent it has
+        // to ride across that round trip, because the completion that *asked* consumed the flag.
+        let shutdown_was_pending = mem::take(&mut self.waiting_on_local_work.shutdown_pending);
+        let completing_shutdown =
+            shutdown_was_pending || finalized_boundary == Some(ParkReason::Shutdown);
         // A finalization response carries the rollover intent across its round trip: the deadline
         // flag was consumed by the completion that *asked*, so without this the completion that
         // finally writes the marker would forget to request a replacement task.
@@ -969,11 +1004,16 @@ impl ManagedRun {
         // knowing the deadline had already expired, and honouring that would restart the deadline
         // and hold the task past the timeout it exists to stay inside -- rollover is
         // authoritative, so it wins.
+        //
+        // A teardown overrides it for a harder reason still: lang asked to be held open on a
+        // Worker that is going away, and honouring that would leave a Workflow Task retained with
+        // nothing left to release it and no replacement task ever coming.
         let will_retain = (stream_commands.quiescence.is_some() || park_retains)
             && !has_server_bound_commands
             && !data.activation_was_eviction
             && data.query_responses.is_empty()
             && !completing_rollover
+            && !completing_shutdown
             && finalized_boundary.is_none();
 
         // `WorkflowStreamProgress` precedes every command whose value could depend on the
@@ -996,7 +1036,7 @@ impl ManagedRun {
             Some(ParkReason::WorkflowCompleted)
         } else if has_server_bound_commands {
             Some(ParkReason::CommandsProduced)
-        } else if completing_deadline_rollover {
+        } else if completing_deadline_rollover || completing_shutdown {
             // Core decided this boundary and lang was never asked for a terminal. Nothing may be
             // written until the finalization round trip below supplies one.
             None
@@ -1004,13 +1044,19 @@ impl ManagedRun {
             Some(ParkReason::TaskCompleted)
         };
 
-        // The deadline rollover is the one boundary that reaches here still owing a terminal.
-        // `false` means there was no annotation to finalize, so the task simply completes with a
-        // replacement requested and no marker -- nothing is owed and nothing is missing.
+        // The rollover deadline and a teardown are the two boundaries that reach here still owing
+        // a terminal. `false` means there was no annotation to finalize, so the task simply
+        // completes with a replacement requested and no marker -- nothing is owed and nothing is
+        // missing. Teardown outranks the deadline when both are pending: the replacement task the
+        // deadline wanted is the same one the teardown asks for, and one boundary gets one marker.
         let awaiting_finalization = terminal.is_none()
             && !will_retain
-            && completing_deadline_rollover
-            && self.begin_external_stream_finalization(ParkReason::Rollover);
+            && (completing_deadline_rollover || completing_shutdown)
+            && self.begin_external_stream_finalization(if completing_shutdown {
+                ParkReason::Shutdown
+            } else {
+                ParkReason::Rollover
+            });
 
         if let Some(terminal) = terminal
             && let Err(source) = self.emit_external_stream_marker(terminal)
@@ -1102,7 +1148,7 @@ impl ManagedRun {
                 Ok(Some(self.prepare_complete_resp(
                     completion.resp_chan,
                     data,
-                    completing_heartbeat_autocomplete || completing_rollover,
+                    completing_heartbeat_autocomplete || completing_rollover || completing_shutdown,
                 )))
             }
             Ok(Some((start_t, wft_timeout))) => {
@@ -1155,6 +1201,12 @@ impl ManagedRun {
                         completing_deadline_rollover && !awaiting_finalization;
                     self.waiting_on_local_work.budget_rollover_pending |=
                         completing_budget_rollover;
+                    // Same for the teardown intent, and for the same reason: the task is still
+                    // open, so nothing has been handed back to the task queue yet. Only the raw
+                    // flag is restored -- a boundary already carried by a finalization in flight
+                    // would otherwise be asked for twice.
+                    self.waiting_on_local_work.shutdown_pending |=
+                        shutdown_was_pending && !awaiting_finalization;
                     Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -1275,6 +1327,46 @@ impl ManagedRun {
                 reason: reason as i32,
             }),
         );
+        true
+    }
+
+    /// The Worker is shutting down while this Run may still be holding a Workflow Task (C15b).
+    ///
+    /// Nothing else will close that boundary: the pollers are stopped so no replacement task is
+    /// coming, lang is not being activated, and `shutdown_done` counts an open Workflow Task as
+    /// pending work -- so a Run retained by an external stream wait set would keep the whole
+    /// Worker from finishing.
+    ///
+    /// Runs with no open Workflow Task are left untouched, deliberately. That is not an omission:
+    /// nothing is accumulated there, so no marker is missing, and `force_new_wft` needs a task
+    /// token the Run does not have. Lang's wake sweep is the server-visible replacement, and Core
+    /// reimplementing it here would send a Signal for a Run that is about to be finalized anyway.
+    pub(super) fn external_stream_shutdown(&mut self) -> RunUpdateAct {
+        if !self.begin_external_stream_teardown() {
+            return None;
+        }
+        let res = self._check_more_activations();
+        self.update_to_acts(res.map(Into::into))
+    }
+
+    /// Records that this Run's open Workflow Task must be closed because the Run is going away.
+    ///
+    /// Returns whether this Run is in the state ADR-009's first row is about. The classification
+    /// is the same one lang's shutdown sweep gets from `external_stream_run_status`, on purpose:
+    /// the two halves must agree about which Run is in which state, or a Run would be swept by
+    /// both mechanisms or by neither.
+    fn begin_external_stream_teardown(&mut self) -> bool {
+        // `wft` is Core's own record of holding the task; the probe additionally distinguishes a
+        // parked set, which holds no task open even though the Run may still be cached.
+        if self.wft.is_none()
+            || !matches!(
+                self.external_stream_run_status(),
+                ExternalStreamRunStatus::WftOpen
+            )
+        {
+            return false;
+        }
+        self.waiting_on_local_work.shutdown_pending = true;
         true
     }
 
@@ -2399,6 +2491,14 @@ struct WaitingOnLocalWork {
     /// back, and the marker must say which one it actually was. Its presence is also what stops a
     /// second handshake being started for a set already in one.
     pending_park: Option<PendingPark>,
+    /// Set when the Run is being torn down -- Worker shutdown or an eviction -- while it still
+    /// holds a Workflow Task.
+    ///
+    /// Like the rollover deadline this forces a replacement task, and for a related reason: the
+    /// completion is an *offer* of this Run back to the task queue, so that any eligible Worker
+    /// can pick it up and reconstruct the subscriptions from the marker. Unlike the deadline, the
+    /// Run does not expect to serve that replacement itself.
+    shutdown_pending: bool,
 }
 
 impl Drop for WaitingOnLocalWork {
