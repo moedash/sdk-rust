@@ -539,6 +539,21 @@ impl ExternalWaitSet {
         out.sort_unstable();
         out
     }
+
+    /// Every registered wait, for a runtime-internal job that covers the complete active set.
+    ///
+    /// Sorted by wait id so the job lang receives is reproducible: a set iterated in hash order
+    /// would hand lang a different list each run for the same state, which is exactly the kind of
+    /// difference replay cannot tolerate.
+    pub(crate) fn wait_snapshot(&self) -> Vec<(u32, u64, bool)> {
+        let mut out: Vec<_> = self
+            .waits
+            .values()
+            .map(|w| (w.wait_id, w.wait_generation, w.immediately_parkable))
+            .collect();
+        out.sort_unstable();
+        out
+    }
 }
 
 #[cfg(test)]
@@ -883,6 +898,26 @@ mod tests {
         set.accumulate_annotation(b"delta");
         set.set_wft_open(false);
 
+        let err = set.take_annotation().expect_err(
+            "a non-empty annotation with no Workflow Task open is a bug in a completion path",
+        );
+        assert!(err.to_string().contains("no Workflow Task open"));
+    }
+
+    #[test]
+    fn a_refused_take_leaves_the_annotation_where_it_was() {
+        // The invariant is a guard, not a discard. If it fired and cleared anyway, the very data
+        // the check exists to protect would be gone by the time anyone read the error -- and the
+        // Workflow Task retry that follows would replay from a cursor that never got committed.
+        let mut set = quiescent_set(&[1]);
+        set.accumulate_annotation(b"delta");
+        set.set_wft_open(false);
+
         assert!(set.take_annotation().is_err());
+        assert_eq!(set.replay_annotation(), b"delta");
+
+        // And once a task is open again the same annotation is takeable, unchanged.
+        set.set_wft_open(true);
+        assert_eq!(set.take_annotation().unwrap(), b"delta".to_vec());
     }
 }
