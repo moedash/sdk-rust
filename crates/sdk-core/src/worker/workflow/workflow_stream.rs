@@ -163,9 +163,6 @@ impl WFStream {
                             LocalInputs::ExternalStreamIdleTimeout(msg) => {
                                 state.external_stream_idle_timeout(msg)
                             }
-                            LocalInputs::ExternalStreamParkResult(msg) => {
-                                state.external_stream_park_result(msg)
-                            }
                             LocalInputs::ExternalStreamRunStatus(msg) => {
                                 // Answered on this lane precisely so its answer is as
                                 // authoritative as a readiness acknowledgement -- and through
@@ -579,15 +576,6 @@ impl WFStream {
         }
     }
 
-    fn external_stream_park_result(&mut self, msg: ExternalStreamParkResultMsg) -> RunUpdateAct {
-        if let Some(rh) = self.runs.get_mut(&msg.run_id) {
-            rh.external_stream_park_result(msg.quiescence_generation, msg.confirmed)
-        } else {
-            debug!(run_id = %msg.run_id, "External stream park result for an untracked run");
-            None
-        }
-    }
-
     /// Request a workflow eviction. This will (eventually, after replay is done) queue up an
     /// activation to evict the workflow from the lang side. Workflow will not *actually* be evicted
     /// until lang replies to that activation
@@ -794,7 +782,6 @@ pub(super) enum LocalInputs {
     // input to a run rather than racing them.
     ExternalStreamReady(ExternalStreamReadyMsg),
     ExternalStreamIdleTimeout(ExternalStreamIdleTimeoutMsg),
-    ExternalStreamParkResult(ExternalStreamParkResultMsg),
     ExternalStreamRunStatus(ExternalStreamRunStatusMsg),
     /// The run-level workflow task rollover deadline expired.
     ///
@@ -825,7 +812,6 @@ impl LocalInputs {
             LocalInputs::HeartbeatTimeout(hb) => hb,
             LocalInputs::ExternalStreamReady(r) => &r.run_id,
             LocalInputs::ExternalStreamIdleTimeout(t) => &t.run_id,
-            LocalInputs::ExternalStreamParkResult(p) => &p.run_id,
             LocalInputs::ExternalStreamRunStatus(s) => &s.run_id,
             LocalInputs::WftRolloverDeadline(run_id) => run_id,
             #[cfg(test)]

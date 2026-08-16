@@ -32,9 +32,10 @@ use crate::{
             WFMachinesError, WorkflowStartedInfo, fatal,
             history_update::NextWFT,
             machines::{
-                HistEventData, activity_state_machine::ActivityMachine,
+                HistEventData,
+                activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
-                external_stream_state_machine::ExternalStreamMachine,
+                external_stream_state_machine::{ExternalStreamMachine, extract_stream_marker},
                 modify_workflow_properties_state_machine::modify_workflow_properties,
                 nexus_operation_state_machine::NexusOperationMachine,
                 update_state_machine::UpdateMachine,
@@ -65,10 +66,10 @@ use temporalio_common::{
             external_data::{ExternalStreamMarkerData, ParkReason},
             external_stream,
             workflow_activation::{
-                self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, WorkflowActivationJob,
-                workflow_activation_job,
+                self, NotifyHasPatch, ReplayExternalStreams, UpdateRandomSeed, WorkflowActivation,
+                WorkflowActivationJob, workflow_activation_job,
             },
-            workflow_commands::ContinueAsNewWorkflowExecution,
+            workflow_commands::{ContinueAsNewWorkflowExecution, ExternalStreamWait},
         },
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
@@ -104,6 +105,15 @@ pub(crate) struct WorkflowMachines {
     /// Reserved external stream wake Signals seen in history, decoded and suppressed from user
     /// dispatch, waiting to be classified against the run's wait set.
     pending_external_stream_wakes: Vec<external_stream::WakeSignal>,
+    /// External stream marker machines whose `MarkerRecorded` event has not been reached yet, in
+    /// the order the markers appear in History.
+    ///
+    /// Matched positionally rather than by id: an external stream marker carries no lang-issued
+    /// sequence number, and its `quiescence_generation` is not unique either -- a Workflow Task
+    /// that never became quiescent writes generation 0, and two of those in a row would collide.
+    /// Markers are written one per Workflow Task and read in History order, so first-in-first-out
+    /// is exactly the pairing.
+    external_stream_marker_machines: VecDeque<MachineKey>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
     /// The event id of the next workflow task started event that the machines need to process.
@@ -305,6 +315,7 @@ impl WorkflowMachines {
             current_wf_time: None,
             observed_internal_flags: Rc::new(RefCell::new(observed_internal_flags)),
             pending_external_stream_wakes: vec![],
+            external_stream_marker_machines: Default::default(),
             history_size_bytes: 0,
             continue_as_new_suggested: false,
             suggest_continue_as_new_reasons: Default::default(),
@@ -510,16 +521,60 @@ impl WorkflowMachines {
                 data.quiescence_generation
             ));
         }
-        let replaying = self.replaying;
-        self.add_cmd_to_wf_task(
-            ExternalStreamMachine::new(data, replaying),
+        if self.replaying {
+            // The marker for this Workflow Task is already in History and C10's lookahead has
+            // already handed it back to lang. Issuing a command for it now would be matched
+            // against the very event it was read from and fail as a command mismatch.
+            debug!(
+                quiescence_generation = data.quiescence_generation,
+                "Not re-writing an external stream marker while replaying"
+            );
+            return Ok(());
+        }
+        let key = self.add_cmd_to_wf_task(
+            ExternalStreamMachine::record_marker(data),
             Default::default(),
             CommandIdKind::CoreInternal,
         );
+        self.external_stream_marker_machines.push_back(key);
         // Core generates this command *after* lang's own iteration has already prepared its
         // commands, so it has to prepare its own. Without this the marker sits in the current
         // task's queue and never reaches the server -- silently, since nothing else looks there.
         self.prepare_commands()
+    }
+
+    /// Hands lang a marker the replay lookahead found, and creates the machine that settles it.
+    ///
+    /// Exactly one `ReplayExternalStreams` job per marker. Core is annotation-blind, so it copies
+    /// the annotation through untouched and supplies only what it can read itself: the quiescent
+    /// snapshot the marker closed, the waits it covered, and the terminal boundary. Everything the
+    /// live run needed the backend for -- offsets, integrity, delivery order -- is inside the
+    /// annotation and is lang's to interpret.
+    fn replay_external_stream_marker(&mut self, data: ExternalStreamMarkerData) {
+        let waits = data
+            .waits
+            .iter()
+            .map(|w| ExternalStreamWait {
+                wait_id: w.wait_id,
+                generation: w.generation,
+                // Never set on replay. `immediately_parkable` is a live observation about a write
+                // fence, and replay reproduces the boundary the marker recorded rather than
+                // re-deciding it -- the terminal boundary already says how the task ended.
+                immediately_parkable: false,
+            })
+            .collect();
+        self.drive_me.send_job(
+            workflow_activation_job::Variant::ReplayExternalStreams(ReplayExternalStreams {
+                quiescence_generation: data.quiescence_generation,
+                waits,
+                replay_annotation: data.replay_annotation.clone(),
+                terminal_boundary: data.terminal_boundary,
+            })
+            .into(),
+        );
+        let machine = ExternalStreamMachine::resolved_from_marker_lookahead(data);
+        let key = self.all_machines.insert(machine.into());
+        self.external_stream_marker_machines.push_back(key);
     }
 
     /// Takes any jobs queued since the last activation was built.
@@ -824,6 +879,7 @@ impl WorkflowMachines {
         #[allow(clippy::large_enum_variant)]
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
+            ExternalStreamMarker(Box<ExternalStreamMarkerData>),
             ProtocolMessage(IncomingProtocolMessage),
         }
         let mut delayed_actions = vec![];
@@ -860,6 +916,12 @@ impl WorkflowMachines {
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
+            } else if let Some(stream_dat) = extract_stream_marker(e) {
+                // The marker for a Workflow Task is written by that task's *completion*, so it
+                // lands in the sequence after it. Finding it here is what lets lang be handed the
+                // recorded observations in the same activation that consumed them live -- and
+                // therefore before the wait set they close is resolved.
+                delayed_actions.push(DelayedAction::ExternalStreamMarker(Box::new(stream_dat)));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -892,6 +954,9 @@ impl WorkflowMachines {
                         self.local_activity_data.insert_peeked_marker(*la_dat);
                         self.apply_local_activity_peeked_resolutions()?;
                     }
+                }
+                DelayedAction::ExternalStreamMarker(stream_dat) => {
+                    self.replay_external_stream_marker(*stream_dat);
                 }
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
@@ -1021,6 +1086,39 @@ impl WorkflowMachines {
                     "Encountered local activity marker but the associated machine was of the \
                      wrong type! {event:?}"
                 ));
+            }
+        }
+
+        if extract_stream_marker(event).is_some() {
+            // Same shape as the local activity marker above, and for the same reason: a marker the
+            // lookahead resolved has no command in the outgoing queue to be matched against,
+            // because replay issues none. A marker no machine is expecting at all is the case
+            // local activities report as nondeterminism, and it is nondeterminism here too --
+            // Core writes exactly one of these per Workflow Task, so an unexpected one means
+            // history and the machines disagree about what this run did.
+            let mkey = self
+                .external_stream_marker_machines
+                .front()
+                .copied()
+                .ok_or_else(|| {
+                    nondeterminism!(
+                        "Encountered an external stream marker with no state machine expecting \
+                         it: {event:?}"
+                    )
+                })?;
+            let handle_directly = match self.machine(mkey) {
+                Machines::ExternalStreamMachine(m) => m.marker_should_get_special_handling()?,
+                _ => {
+                    return Err(fatal!(
+                        "Encountered external stream marker but the associated machine was of \
+                         the wrong type! {event:?}"
+                    ));
+                }
+            };
+            self.external_stream_marker_machines.pop_front();
+            if handle_directly {
+                self.submachine_handle_event(mkey, event_dat)?;
+                return Ok(EventHandlingOutcome::Normal);
             }
         }
 

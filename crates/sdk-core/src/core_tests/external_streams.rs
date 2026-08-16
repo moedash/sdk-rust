@@ -27,10 +27,11 @@ use temporalio_common::{
     protos::coresdk::{
         external_data::{ParkReason, extract_external_stream_marker_data},
         external_stream::{self, WakeSignal},
-        workflow_activation::workflow_activation_job,
+        workflow_activation::{WorkflowActivation, workflow_activation_job},
         workflow_commands::{
-            CompleteWorkflowExecution, ExternalStreamFinalized, ExternalStreamWait,
-            WorkflowStreamProgress, WorkflowStreamQuiescent, workflow_command,
+            CompleteWorkflowExecution, ExternalStreamFinalized, ExternalStreamParkResult,
+            ExternalStreamWait, ParkSetConfirmed, StreamSetBecameReady, WorkflowStreamProgress,
+            WorkflowStreamQuiescent, external_stream_park_result, workflow_command,
         },
         workflow_completion::WorkflowActivationCompletion,
     },
@@ -44,6 +45,11 @@ use temporalio_common::{
     },
     worker::WorkerTaskTypes,
 };
+
+/// One recorded external stream marker: the snapshot it closed, its terminal, its annotation.
+type StreamMarker = (u64, ParkReason, Vec<u8>);
+/// Markers collected across a test's completions, in the order they were reported.
+type StreamMarkers = Arc<Mutex<Vec<StreamMarker>>>;
 
 /// A worker holding one run in its cache, with the first activation left outstanding.
 ///
@@ -232,73 +238,7 @@ async fn the_status_probe_leaves_the_run_untouched() {
     finish(worker, &run_id).await;
 }
 
-// --- idle timeout and park result routing (C3) -------------------------------
-
-#[tokio::test]
-async fn an_idle_timeout_for_the_current_generation_reaches_the_run() {
-    let (worker, run_id) = worker_with_a_cached_run().await;
-    worker
-        .seed_external_stream_waits(&run_id, vec![1, 2], None, true)
-        .await;
-
-    worker.notify_external_stream_idle_timeout(&run_id, 1);
-
-    // Every wait moved to `Parking`, so readiness is still accepted -- and accepting it is what
-    // aborts the parking attempt.
-    assert_eq!(
-        worker.notify_external_stream_ready(&run_id, 1, 0).await,
-        ExternalStreamReadyResult::Accepted
-    );
-    finish(worker, &run_id).await;
-}
-
-#[tokio::test]
-async fn a_confirmed_park_result_parks_the_set() {
-    let (worker, run_id) = worker_with_a_cached_run().await;
-    worker
-        .seed_external_stream_waits(&run_id, vec![1], None, true)
-        .await;
-
-    worker.notify_external_stream_idle_timeout(&run_id, 1);
-    worker.notify_external_stream_park_result(&run_id, 1, true);
-
-    assert_eq!(
-        worker.external_stream_run_status(&run_id).await,
-        ExternalStreamRunStatus::Parked
-    );
-    assert_eq!(
-        worker.notify_external_stream_ready(&run_id, 1, 0).await,
-        ExternalStreamReadyResult::Parked
-    );
-    finish(worker, &run_id).await;
-}
-
-#[tokio::test]
-async fn an_aborted_park_result_returns_the_set_to_blocked() {
-    let (worker, run_id) = worker_with_a_cached_run().await;
-    worker
-        .seed_external_stream_waits(&run_id, vec![1], None, true)
-        .await;
-
-    worker.notify_external_stream_idle_timeout(&run_id, 1);
-    worker.notify_external_stream_park_result(&run_id, 1, false);
-
-    assert_eq!(
-        worker.external_stream_run_status(&run_id).await,
-        ExternalStreamRunStatus::WftOpen
-    );
-    // The abort bumped the wait generation, which is what makes a readiness notification issued
-    // for the abandoned attempt stale rather than resolving against the new block.
-    assert_eq!(
-        worker.notify_external_stream_ready(&run_id, 1, 0).await,
-        ExternalStreamReadyResult::Stale
-    );
-    assert_eq!(
-        worker.notify_external_stream_ready(&run_id, 1, 1).await,
-        ExternalStreamReadyResult::Accepted
-    );
-    finish(worker, &run_id).await;
-}
+// --- idle timeout routing (C3) -----------------------------------------------
 
 #[tokio::test]
 async fn an_idle_timeout_for_an_unknown_run_is_harmless() {
@@ -500,7 +440,7 @@ async fn consume_resolve_activation(worker: &crate::Worker, run_id: &str) -> Vec
 }
 
 #[tokio::test]
-async fn the_idle_timer_fires_and_moves_the_set_to_parking() {
+async fn the_idle_timer_fires_and_starts_the_park_handshake() {
     let completions = Arc::new(AtomicUsize::new(0));
     let worker = worker_recording_completions(completions.clone());
 
@@ -515,16 +455,26 @@ async fn the_idle_timer_fires_and_moves_the_set_to_parking() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // The timer fired and the set entered `Parking`. Readiness is still accepted there, and
-    // accepting it is what aborts the parking attempt -- the handshake that would confirm it is
-    // C8's.
+    // The timer fires and the set enters `Parking`, which Core expresses by asking lang to run
+    // the handshake. Nothing was reported to the server: parking is what *ends* the task, and it
+    // has not been confirmed yet.
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(park_jobs(&park), vec![(1, ParkReason::Idle, vec![1])]);
     assert_eq!(
-        worker.notify_external_stream_ready(&run_id, 1, 0).await,
-        ExternalStreamReadyResult::Accepted
+        completions.load(Ordering::Relaxed),
+        0,
+        "asking lang to park must not complete the Workflow Task"
     );
 
+    // Answering `became_ready` releases the set, which is enough to let this test end without
+    // parking; the handshake's own outcomes are C8's tests.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            park_became_ready_command(1),
+        ))
+        .await
+        .unwrap();
     consume_resolve_activation(&worker, &run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
@@ -569,7 +519,7 @@ async fn a_quiescent_command_with_a_non_positive_idle_timeout_is_malformed() {
     // `num_expected_fails` is what asserts the failure actually reached the server.
     let t = canned_histories::single_timer("1");
     let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
-    mock_cfg.num_expected_fails = 1_usize.into();
+    mock_cfg.num_expected_fails = 1;
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
         w.task_types = WorkerTaskTypes::workflow_only();
@@ -621,7 +571,7 @@ async fn a_completion_with_server_bound_commands_does_not_retain() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+                quiescent_command(1, &[1], Duration::from_secs(30)),
                 start_timer_cmd(1, Duration::from_secs(10)),
             ],
         ))
@@ -700,9 +650,7 @@ async fn simultaneous_readiness_ships_as_one_coalesced_activation() {
 }
 
 /// The wait ids named by any resolve job in an activation.
-fn resolve_hints(
-    activation: &temporalio_common::protos::coresdk::workflow_activation::WorkflowActivation,
-) -> Vec<u32> {
+fn resolve_hints(activation: &WorkflowActivation) -> Vec<u32> {
     let mut ids: Vec<u32> = activation
         .jobs
         .iter()
@@ -864,8 +812,8 @@ async fn deltas_accumulate_across_a_retained_task() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"first", false).into(),
-                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+                progress_command(b"first", false),
+                quiescent_command(1, &[1], Duration::from_secs(30)),
             ],
         ))
         .await
@@ -878,8 +826,8 @@ async fn deltas_accumulate_across_a_retained_task() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"second", false).into(),
-                quiescent_command(2, &[1], Duration::from_secs(30)).into(),
+                progress_command(b"second", false),
+                quiescent_command(2, &[1], Duration::from_secs(30)),
             ],
         ))
         .await
@@ -916,8 +864,8 @@ async fn an_empty_delta_accumulates_like_any_other() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"", false).into(),
-                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+                progress_command(b"", false),
+                quiescent_command(1, &[1], Duration::from_secs(30)),
             ],
         ))
         .await
@@ -946,7 +894,7 @@ async fn a_delta_without_retention_still_accumulates() {
     let completions = Arc::new(AtomicUsize::new(0));
     let counter = completions.clone();
     let t = marker_then_timer_history(0, ParkReason::CommandsProduced, b"consumed");
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let markers: StreamMarkers = Default::default();
     let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 2], mock_worker_client());
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
         for _ in 0..2 {
@@ -972,7 +920,7 @@ async fn a_delta_without_retention_still_accumulates() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"consumed", false).into(),
+                progress_command(b"consumed", false),
                 start_timer_cmd(1, Duration::from_secs(10)),
             ],
         ))
@@ -1015,7 +963,7 @@ async fn a_progress_command_after_another_command_is_malformed() {
     // its consequences have been accepted as durable.
     let t = canned_histories::single_timer("1");
     let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
-    mock_cfg.num_expected_fails = 1_usize.into();
+    mock_cfg.num_expected_fails = 1;
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
         w.task_types = WorkerTaskTypes::workflow_only();
@@ -1031,7 +979,7 @@ async fn a_progress_command_after_another_command_is_malformed() {
             run_id.clone(),
             vec![
                 start_timer_cmd(1, Duration::from_secs(10)),
-                progress_command(b"too late", false).into(),
+                progress_command(b"too late", false),
             ],
         ))
         .await
@@ -1067,9 +1015,7 @@ fn marker_then_replacement_history(
 }
 
 /// The `FinalizeExternalStreams` jobs in an activation, as (generation, reason, wait ids).
-fn finalization_jobs(
-    activation: &temporalio_common::protos::coresdk::workflow_activation::WorkflowActivation,
-) -> Vec<(u64, ParkReason, Vec<u32>)> {
+fn finalization_jobs(activation: &WorkflowActivation) -> Vec<(u64, ParkReason, Vec<u32>)> {
     activation
         .jobs
         .iter()
@@ -1094,7 +1040,7 @@ fn finalized_command(quiescence_generation: u64, delta: &[u8]) -> workflow_comma
 
 /// A workflow-only worker recording both markers and `force_new_wft` per completion.
 fn worker_recording_rollovers(
-    markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>>,
+    markers: StreamMarkers,
     forced: Arc<Mutex<Vec<bool>>>,
     history: TestHistoryBuilder,
     batches: Vec<usize>,
@@ -1133,8 +1079,8 @@ async fn retain_then_fire_the_rollover_deadline(
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(annotation, false).into(),
-                quiescent_command(1, &[1, 2], Duration::from_secs(30)).into(),
+                progress_command(annotation, false),
+                quiescent_command(1, &[1, 2], Duration::from_secs(30)),
             ],
         ))
         .await
@@ -1154,7 +1100,7 @@ async fn a_core_decided_boundary_asks_for_a_terminal_before_writing_anything() {
     // The C15a protocol, end to end. Core decided this boundary from a timer, so it has no
     // terminal for it -- only lang can encode the blocked cursor snapshot. Core must therefore
     // ask, and must write nothing at all until the answer arrives.
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let markers: StreamMarkers = Default::default();
     let forced: Arc<Mutex<Vec<bool>>> = Default::default();
     let worker = worker_recording_rollovers(
         markers.clone(),
@@ -1262,7 +1208,7 @@ async fn a_finalization_answered_without_a_terminal_writes_no_marker() {
         [1],
         mock_worker_client(),
     );
-    mock_cfg.num_expected_fails = 1_usize.into();
+    mock_cfg.num_expected_fails = 1;
     mock_cfg.num_expected_completions = Some(0.into());
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
@@ -1306,7 +1252,7 @@ async fn a_finalized_command_with_no_job_outstanding_is_refused() {
         [1],
         mock_worker_client(),
     );
-    mock_cfg.num_expected_fails = 1_usize.into();
+    mock_cfg.num_expected_fails = 1;
     mock_cfg.num_expected_completions = Some(0.into());
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
@@ -1321,8 +1267,8 @@ async fn a_finalized_command_with_no_job_outstanding_is_refused() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"unprompted", false).into(),
-                finalized_command(1, b"-terminal").into(),
+                progress_command(b"unprompted", false),
+                finalized_command(1, b"-terminal"),
             ],
         ))
         .await
@@ -1343,7 +1289,7 @@ async fn a_rollover_with_nothing_accumulated_asks_for_no_terminal() {
     // C12a's half, still true: with no annotation there is no marker to write, so there is
     // nothing to finalize either. The task is still replaced -- rollover is about the deadline,
     // not about the stream having produced anything.
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let markers: StreamMarkers = Default::default();
     let forced: Arc<Mutex<Vec<bool>>> = Default::default();
     let worker = worker_recording_rollovers(
         markers.clone(),
@@ -1409,7 +1355,7 @@ async fn a_budget_rollover_forces_a_replacement_without_a_deadline() {
     let saw_force_new_wft = Arc::new(AtomicBool::new(false));
     let recorder = saw_force_new_wft.clone();
     let t = marker_then_timer_history(0, ParkReason::BudgetRollover, b"at-the-budget");
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let markers: StreamMarkers = Default::default();
     let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 2], mock_worker_client());
     let collected = markers.clone();
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
@@ -1432,7 +1378,7 @@ async fn a_budget_rollover_forces_a_replacement_without_a_deadline() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"at-the-budget", true).into(),
+                progress_command(b"at-the-budget", true),
                 start_timer_cmd(1, Duration::from_secs(10)),
             ],
         ))
@@ -1475,7 +1421,7 @@ async fn two_consecutive_rollovers_produce_two_markers_that_reassemble_in_order(
     // it recoverable is that each marker carries its own task's deltas and the two concatenate in
     // task order. A marker that repeated or dropped a stretch would leave replay unable to say
     // what the original run actually saw.
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let markers: StreamMarkers = Default::default();
     let forced: Arc<Mutex<Vec<bool>>> = Default::default();
 
     let mut t = TestHistoryBuilder::default();
@@ -1496,8 +1442,8 @@ async fn two_consecutive_rollovers_produce_two_markers_that_reassemble_in_order(
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"first-half", false).into(),
-                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+                progress_command(b"first-half", false),
+                quiescent_command(1, &[1], Duration::from_secs(30)),
             ],
         ))
         .await
@@ -1537,8 +1483,8 @@ async fn two_consecutive_rollovers_produce_two_markers_that_reassemble_in_order(
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"second-half", false).into(),
-                quiescent_command(2, &[1], Duration::from_secs(30)).into(),
+                progress_command(b"second-half", false),
+                quiescent_command(2, &[1], Duration::from_secs(30)),
             ],
         ))
         .await
@@ -1628,7 +1574,7 @@ fn wake(park_generation: u64, first_execution_run_id: &str) -> WakeSignal {
 ///
 /// Reading the envelope back out of the command is what makes "exactly one marker per Workflow
 /// Task" and "never without a terminal" checkable rather than assumed.
-fn stream_markers(wft: &WorkflowTaskCompletion) -> Vec<(u64, ParkReason, Vec<u8>)> {
+fn stream_markers(wft: &WorkflowTaskCompletion) -> Vec<StreamMarker> {
     wft.commands
         .iter()
         .filter_map(|c| match &c.attributes {
@@ -1650,9 +1596,14 @@ fn stream_markers(wft: &WorkflowTaskCompletion) -> Vec<(u64, ParkReason, Vec<u8>
 }
 
 /// A worker whose second Workflow Task carries one Signal.
+///
+/// The Workflow Task timeout is long on purpose: a wake that fails validation leaves the seeded
+/// wait set retaining the replacement task, which re-arms the idle deadline. With the default
+/// five-second timeout that deadline expires inside the test and parks the set, which is correct
+/// behaviour but not what these tests are about.
 fn worker_with_a_signal(signal_name: &str, payloads: Vec<Payload>) -> crate::Worker {
     let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
     t.add_full_wf_task();
     t.add_we_signaled(signal_name, payloads);
     t.add_full_wf_task();
@@ -1710,6 +1661,29 @@ async fn assert_the_wake_changed_nothing(worker: &crate::Worker, run_id: &str) {
             .unwrap();
     }
     let _ = run_id;
+}
+
+/// Drives a run whose wait set is still retaining its Workflow Task to completion.
+///
+/// A wake that failed validation leaves the set blocked and the task retained -- correctly, since
+/// nothing resolved it. Left that way the run would hold its idle deadline until the Worker shut
+/// down, so the test resolves the set for real and lets the Workflow finish.
+async fn release_a_retained_run(worker: &crate::Worker, run_id: &str) {
+    if worker.external_stream_run_status(run_id).await != ExternalStreamRunStatus::WftOpen {
+        return;
+    }
+    assert_eq!(
+        worker.notify_external_stream_ready(run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            resolved.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
 }
 
 /// Completes the first (initialize) task and seeds the wait set for the second.
@@ -1801,6 +1775,7 @@ async fn a_stale_generation_neither_resumes_nor_reaches_a_handler() {
     let run_id = advance_to_the_signal_task(&worker, vec![1], Some(7)).await;
 
     assert_the_wake_changed_nothing(&worker, &run_id).await;
+    release_a_retained_run(&worker, &run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
 
@@ -1816,6 +1791,7 @@ async fn an_unknown_envelope_version_is_ignored_harmlessly() {
     let run_id = advance_to_the_signal_task(&worker, vec![1], None).await;
 
     assert_the_wake_changed_nothing(&worker, &run_id).await;
+    release_a_retained_run(&worker, &run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
 
@@ -1830,6 +1806,7 @@ async fn a_foreign_chain_neither_resumes_nor_reaches_a_handler() {
     let run_id = advance_to_the_signal_task(&worker, vec![1], None).await;
 
     assert_the_wake_changed_nothing(&worker, &run_id).await;
+    release_a_retained_run(&worker, &run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
 
@@ -1887,8 +1864,8 @@ fn marker_then_timer_history(
 
 /// A worker that records the markers on every completion.
 fn worker_recording_markers(
-    markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>>,
-    batches: [usize; 2],
+    markers: StreamMarkers,
+    batches: Vec<usize>,
     history: TestHistoryBuilder,
 ) -> crate::Worker {
     let t = history;
@@ -1913,10 +1890,10 @@ fn worker_recording_markers(
 async fn several_progress_reports_collapse_into_one_marker() {
     // The claim the design's History cost rests on: a retained Workflow Task may span many
     // activations, and it writes **one** marker however many of them reported progress.
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let markers: StreamMarkers = Default::default();
     let worker = worker_recording_markers(
         markers.clone(),
-        [1, 2],
+        vec![1, 2],
         // Generation 3: the task became quiescent three times before it ended, and the marker
         // closes the last of those snapshots.
         marker_then_timer_history(3, ParkReason::CommandsProduced, b"onetwothreefour"),
@@ -1930,8 +1907,8 @@ async fn several_progress_reports_collapse_into_one_marker() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"one", false).into(),
-                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+                progress_command(b"one", false),
+                quiescent_command(1, &[1], Duration::from_secs(30)),
             ],
         ))
         .await
@@ -1943,8 +1920,8 @@ async fn several_progress_reports_collapse_into_one_marker() {
             .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
                 run_id.clone(),
                 vec![
-                    progress_command(delta, false).into(),
-                    quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+                    progress_command(delta, false),
+                    quiescent_command(1, &[1], Duration::from_secs(30)),
                 ],
             ))
             .await
@@ -1963,7 +1940,7 @@ async fn several_progress_reports_collapse_into_one_marker() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"four", false).into(),
+                progress_command(b"four", false),
                 start_timer_cmd(1, Duration::from_secs(10)),
             ],
         ))
@@ -1994,7 +1971,7 @@ async fn several_progress_reports_collapse_into_one_marker() {
 async fn a_terminal_command_writes_its_marker_ordered_before_it() {
     // Command ordering is normative: on replay this guarantees a record's integrity is validated
     // before the command derived from it is matched.
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let markers: StreamMarkers = Default::default();
     let ordering: Arc<Mutex<Vec<i32>>> = Default::default();
     let recorded = ordering.clone();
 
@@ -2021,7 +1998,7 @@ async fn a_terminal_command_writes_its_marker_ordered_before_it() {
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             activation.run_id,
             vec![
-                progress_command(b"consumed", false).into(),
+                progress_command(b"consumed", false),
                 CompleteWorkflowExecution::default().into(),
             ],
         ))
@@ -2053,9 +2030,12 @@ async fn a_terminal_command_writes_its_marker_ordered_before_it() {
 async fn a_workflow_task_that_observed_nothing_writes_no_marker() {
     // Not an error: a Workflow Task that touched no stream is the ordinary case, and writing an
     // empty marker for it would put a History event on every task in the Workflow.
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
-    let worker =
-        worker_recording_markers(markers.clone(), [1, 2], canned_histories::single_timer("1"));
+    let markers: StreamMarkers = Default::default();
+    let worker = worker_recording_markers(
+        markers.clone(),
+        vec![1, 2],
+        canned_histories::single_timer("1"),
+    );
 
     let activation = worker.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id.clone();
@@ -2088,9 +2068,12 @@ async fn an_annotation_with_no_terminal_is_refused_rather_than_written() {
     //
     // Driven directly at the emission primitive, because no completion path can produce this --
     // which is the point: the guard exists for a future path that forgets.
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
-    let worker =
-        worker_recording_markers(markers.clone(), [1, 2], canned_histories::single_timer("1"));
+    let markers: StreamMarkers = Default::default();
+    let worker = worker_recording_markers(
+        markers.clone(),
+        vec![1, 2],
+        canned_histories::single_timer("1"),
+    );
 
     let activation = worker.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id.clone();
@@ -2126,4 +2109,824 @@ async fn an_annotation_with_no_terminal_is_refused_rather_than_written() {
         .await
         .unwrap();
     worker.drain_pollers_and_shutdown().await;
+}
+
+// --- the complete-set park handshake (C8) ------------------------------------
+
+/// The `PrepareExternalStreamPark` jobs in an activation, as (generation, reason, wait ids).
+///
+/// Reading the reason back out is what separates the two triggers: an idle expiry and an
+/// all-fenced snapshot produce the same shape of job and the same shape of marker, and only this
+/// field says which of them actually happened.
+fn park_jobs(activation: &WorkflowActivation) -> Vec<(u64, ParkReason, Vec<u32>)> {
+    activation
+        .jobs
+        .iter()
+        .filter_map(|j| match &j.variant {
+            Some(workflow_activation_job::Variant::PrepareExternalStreamPark(p)) => Some((
+                p.quiescence_generation,
+                p.reason(),
+                p.waits.iter().map(|w| w.wait_id).collect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Lang's `ParkSetConfirmed`: every stream was still empty after the intents went in.
+fn park_confirmed_command(
+    quiescence_generation: u64,
+    terminal: &[u8],
+) -> workflow_command::Variant {
+    workflow_command::Variant::ExternalStreamParkResult(ExternalStreamParkResult {
+        quiescence_generation,
+        outcome: Some(external_stream_park_result::Outcome::Confirmed(
+            ParkSetConfirmed {},
+        )),
+        final_observation_delta: terminal.to_vec(),
+    })
+}
+
+/// Lang's `StreamSetBecameReady`: the final recheck found records, so this generation is abandoned.
+fn park_became_ready_command(quiescence_generation: u64) -> workflow_command::Variant {
+    workflow_command::Variant::ExternalStreamParkResult(ExternalStreamParkResult {
+        quiescence_generation,
+        outcome: Some(external_stream_park_result::Outcome::BecameReady(
+            StreamSetBecameReady {},
+        )),
+        // Deliberately empty: an abandoned park reached no boundary, so there is no terminal to
+        // carry and nothing for Core to write.
+        final_observation_delta: vec![],
+    })
+}
+
+/// A quiescent snapshot whose waits carry individual write-fence states.
+fn fenced_quiescent_command(
+    quiescence_generation: u64,
+    waits: &[(u32, bool)],
+    idle_timeout: Duration,
+) -> workflow_command::Variant {
+    workflow_command::Variant::WorkflowStreamQuiescent(WorkflowStreamQuiescent {
+        quiescence_generation,
+        waits: waits
+            .iter()
+            .map(|(wait_id, immediately_parkable)| ExternalStreamWait {
+                wait_id: *wait_id,
+                generation: 0,
+                immediately_parkable: *immediately_parkable,
+            })
+            .collect(),
+        idle_timeout: Some(idle_timeout.try_into().unwrap()),
+    })
+}
+
+/// Reports `annotation` and the given quiescent snapshot, leaving the task retained.
+///
+/// This is the state every park begins from: lang has reported what it observed and asked to be
+/// held open, Core is holding the task, and no activation is outstanding.
+async fn retain_a_quiescent_task(
+    worker: &crate::Worker,
+    annotation: &[u8],
+    quiescence: workflow_command::Variant,
+) -> String {
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![progress_command(annotation, false), quiescence],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "the quiescent snapshot must have been accepted, or this test proves nothing"
+    );
+    run_id
+}
+
+/// A history whose first Workflow Task records a marker and whose second carries a Signal.
+///
+/// The marker event has to be present and first, because commands are matched to events in order.
+/// The Signal is there only to give the replacement task an activation -- a run with nothing left
+/// to do is evicted, and a test cannot ask an evicted run whether it parked.
+fn marker_then_signal_history(quiescence_generation: u64) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    // Long enough that no rollover deadline or clamped idle deadline can fire inside the test.
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
+    t.add_full_wf_task();
+    t.add_external_stream_marker(quiescence_generation, ParkReason::Idle, b"recorded");
+    t.add_we_signaled("keep-the-run-cached", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// A workflow-only worker recording every completion's markers and `force_new_wft`.
+fn worker_for_a_park(
+    markers: StreamMarkers,
+    forced: Arc<Mutex<Vec<bool>>>,
+    history: TestHistoryBuilder,
+    batches: Vec<usize>,
+) -> crate::Worker {
+    worker_recording_rollovers(markers, forced, history, batches)
+}
+
+#[tokio::test]
+async fn a_confirmed_idle_park_writes_one_marker_and_completes_the_task() {
+    // The confirmation is the only place Core can obtain this boundary's terminal: park issues no
+    // finalization job, so if the result's `final_observation_delta` were dropped the marker would
+    // be a truncated annotation -- durable and wrong.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_for_a_park(
+        markers.clone(),
+        forced.clone(),
+        marker_then_signal_history(1),
+        vec![1, 2],
+    );
+
+    let run_id = retain_a_quiescent_task(
+        &worker,
+        b"observed",
+        quiescent_command(1, &[1, 2], Duration::from_millis(30)),
+    )
+    .await;
+
+    // The idle timer expired and Core asked for the complete set, not just the wait that went
+    // quiet: parking is all-or-nothing.
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        park_jobs(&park),
+        vec![(1, ParkReason::Idle, vec![1, 2])],
+        "an idle expiry must ask lang to park the complete set, got {:?}",
+        park.jobs
+    );
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "nothing may be written before the terminal exists"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            park_confirmed_command(1, b"-parked"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        vec![(1, ParkReason::Idle, b"observed-parked".to_vec())],
+        "the park's marker carries the accumulated annotation with the confirmation's terminal"
+    );
+    assert_eq!(
+        *forced.lock(),
+        vec![false],
+        "parking is the opposite of asking for a replacement task"
+    );
+
+    // The set is parked: readiness can no longer be delivered locally, and a producer now has a
+    // generation to name in its wake Signal.
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::Parked
+    );
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Parked
+    );
+
+    let replacement = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replacement.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn an_all_fenced_snapshot_parks_without_waiting_out_the_idle_timeout() {
+    // The fence says no later record is coming, so waiting out the idle delay could only ever end
+    // the same way. The idle timeout here is five minutes: if the park were coming from the timer
+    // rather than from the fences, this test would hang rather than fail.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_for_a_park(
+        markers.clone(),
+        forced.clone(),
+        marker_then_signal_history(2),
+        vec![1, 2],
+    );
+
+    // One fenced stream out of two does not qualify. The set is retained and nothing is asked.
+    let run_id = retain_a_quiescent_task(
+        &worker,
+        b"half",
+        fenced_quiescent_command(1, &[(1, true), (2, false)], Duration::from_secs(300)),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            worker.poll_workflow_activation()
+        )
+        .await
+        .is_err(),
+        "one fenced stream must not park a set another stream is still driving"
+    );
+
+    // Now the second stream fences too, and the set parks immediately.
+    worker.notify_external_stream_ready(&run_id, 2, 0).await;
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&resolved), vec![2]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"-rest", false),
+                fenced_quiescent_command(2, &[(1, true), (2, true)], Duration::from_secs(300)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        park_jobs(&park),
+        vec![(2, ParkReason::AllWriteFenced, vec![1, 2])],
+        "an all-fenced snapshot must park on its own, got {:?}",
+        park.jobs
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            park_confirmed_command(2, b"-fenced"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        vec![(2, ParkReason::AllWriteFenced, b"half-rest-fenced".to_vec())],
+        "the marker must say which trigger actually parked the set"
+    );
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::Parked
+    );
+
+    let replacement = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replacement.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn readiness_accepted_before_the_confirmation_wins_and_no_marker_is_written() {
+    // The first ordering of the race. A record arrived while the handshake was in flight, so the
+    // confirmation that follows is closing a boundary that was never reached. Writing its marker
+    // would commit a cursor past a record the Workflow has not seen.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_for_a_park(
+        markers.clone(),
+        forced.clone(),
+        canned_histories::single_timer("1"),
+        vec![1],
+    );
+
+    let run_id = retain_a_quiescent_task(
+        &worker,
+        b"observed",
+        quiescent_command(1, &[1], Duration::from_millis(30)),
+    )
+    .await;
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(park_jobs(&park).len(), 1);
+
+    // Readiness lands while lang is still installing its intents.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted,
+        "readiness during the handshake must still be accepted -- accepting it is the abort"
+    );
+
+    // Lang's recheck saw nothing and confirms anyway. Core knows better.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            park_confirmed_command(1, b"-parked"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "a confirmation readiness already beat must write no marker"
+    );
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::Parked,
+        "the set must not be parked with a record buffered for it"
+    );
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "the task stays open so the resolve Core owes lang has somewhere to arrive"
+    );
+    // And the annotation is still held, unwritten, for whatever boundary does eventually close it.
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"observed"
+    );
+
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&resolved), vec![1]);
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_recheck_that_became_ready_resolves_the_waits_rather_than_running_user_code() {
+    // The other way the handshake can end. `PrepareExternalStreamPark` runs no user Workflow
+    // code, so a recheck that found records cannot deliver them from inside the park path: it
+    // abandons the generation and Core issues an ordinary resolve, which is the job that does run
+    // user code.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_for_a_park(
+        markers.clone(),
+        forced.clone(),
+        canned_histories::single_timer("1"),
+        vec![1],
+    );
+
+    let run_id = retain_a_quiescent_task(
+        &worker,
+        b"observed",
+        quiescent_command(1, &[1, 2], Duration::from_millis(30)),
+    )
+    .await;
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(park_jobs(&park).len(), 1);
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            park_became_ready_command(1),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "an aborted park reached no boundary, so it writes no marker"
+    );
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen
+    );
+
+    // A normal resolve activation naming *every* wait: the recheck covered all of them, so any of
+    // them may now have data.
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&resolved), vec![1, 2]);
+    assert_eq!(
+        park_jobs(&resolved),
+        Vec::new(),
+        "the abort must not start a second handshake"
+    );
+
+    // The abort bumped every wait generation, which is what makes a readiness notification issued
+    // against the abandoned block stale rather than resolving against the new one.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Stale
+    );
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 1).await,
+        ExternalStreamReadyResult::Accepted
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_confirmation_naming_a_generation_that_is_not_parking_is_discarded() {
+    // A stale confirmation is neither a park nor an abort. Without the generation check it would
+    // park a set whose snapshot has moved on, stranding whatever the current one is holding.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_for_a_park(
+        markers.clone(),
+        forced.clone(),
+        canned_histories::single_timer("1"),
+        vec![1],
+    );
+
+    let run_id = retain_a_quiescent_task(
+        &worker,
+        b"observed",
+        quiescent_command(1, &[1], Duration::from_millis(30)),
+    )
+    .await;
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(park_jobs(&park), vec![(1, ParkReason::Idle, vec![1])]);
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            park_confirmed_command(99, b"-parked"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(*markers.lock(), Vec::new());
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::Parked,
+        "a confirmation for a generation that is not parking must park nothing"
+    );
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"observed"
+    );
+
+    // Still retained, so the wait is still deliverable locally -- the discarded confirmation
+    // changed nothing at all.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+    consume_resolve_activation(&worker, &run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_park_job_answered_without_a_result_writes_no_marker() {
+    // The paired negative of the confirmed case. Core asked for a terminal and did not get one,
+    // and there is no best-effort path from there: an abandoned Workflow Task commits no cursor
+    // and loses no record, while a truncated annotation is durable and wrong.
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.num_expected_completions = Some(0.into());
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let run_id = retain_a_quiescent_task(
+        &worker,
+        b"observed",
+        quiescent_command(1, &[1], Duration::from_millis(30)),
+    )
+    .await;
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(park_jobs(&park).len(), 1);
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "a park answered without a result must fail the Workflow Task"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unprompted_park_result_is_refused() {
+    // Without this the "answered correctly" case above would pass either way: accepting an
+    // unrequested result would let lang append a terminal to an annotation Core never asked it to
+    // close, and park a set Core never asked it to park.
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.num_expected_completions = Some(0.into());
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"unprompted", false),
+                park_confirmed_command(1, b"-parked"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "an unprompted park result must fail the Workflow Task rather than be accepted"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+// --- replay marker lookahead (C10) -------------------------------------------
+
+/// The `ReplayExternalStreams` jobs in an activation, as (generation, terminal, waits, annotation).
+///
+/// Everything a replayed Workflow Task needs to reproduce what the live one saw. Reading it back
+/// whole is what makes "the recorded observations reach lang unchanged" checkable rather than
+/// assumed -- Core is annotation-blind, so a copy that mangled the bytes would look like success.
+#[allow(clippy::type_complexity)]
+fn replay_jobs(
+    activation: &WorkflowActivation,
+) -> Vec<(u64, ParkReason, Vec<(u32, u64)>, Vec<u8>)> {
+    activation
+        .jobs
+        .iter()
+        .filter_map(|j| match &j.variant {
+            Some(workflow_activation_job::Variant::ReplayExternalStreams(r)) => Some((
+                r.quiescence_generation,
+                r.terminal_boundary(),
+                r.waits.iter().map(|w| (w.wait_id, w.generation)).collect(),
+                r.replay_annotation.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A history whose first Workflow Task parked on a marker and whose second fires a timer.
+fn replayable_marker_history() -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_external_stream_marker_covering(
+        2,
+        ParkReason::Idle,
+        b"header.segment.terminal",
+        &[(1, 3), (2, 0)],
+    );
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+#[tokio::test]
+async fn a_replayed_marker_resolves_the_wait_set_with_no_readiness_path() {
+    // The whole point of the marker. On replay the backend is not consulted for *what* was seen --
+    // no watcher fires, no readiness is accepted, no idle timer runs and no park is proposed --
+    // and yet lang is handed the observations, in the same activation that consumed them live.
+    let markers: StreamMarkers = Default::default();
+    // One batch containing the whole history, so the first Workflow Task is replayed rather than
+    // executed. That is what puts the marker in the *next* sequence, where lookahead finds it.
+    let worker = worker_recording_markers(markers.clone(), vec![2], replayable_marker_history());
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    let run_id = replayed.run_id.clone();
+    assert!(
+        replayed.is_replaying,
+        "this test is only meaningful while replaying, got {replayed:?}"
+    );
+    assert_eq!(
+        replay_jobs(&replayed),
+        vec![(
+            2,
+            ParkReason::Idle,
+            vec![(1, 3), (2, 0)],
+            b"header.segment.terminal".to_vec()
+        )],
+        "the recorded snapshot, waits, terminal and annotation must all reach lang, got {:?}",
+        replayed.jobs
+    );
+    // Not a live resolve and not a park: replay reproduces the recorded boundary rather than
+    // re-deciding it, so neither of the paths that need a backend is entered.
+    assert_eq!(resolve_hints(&replayed), Vec::<u32>::new());
+    assert_eq!(park_jobs(&replayed), Vec::new());
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::NoOpenWorkflowTask,
+        "replay must register no wait set, so no idle or rollover deadline can be running"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+
+    // The marker in history settled the machine lookahead created for it, and nothing was written
+    // back: re-issuing the command would be matched against the very event it was read from.
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        fired.jobs.iter().any(|j| matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::FireTimer(_))
+        )),
+        "history after the marker must keep matching, got {:?}",
+        fired.jobs
+    );
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "a replayed marker must not be written a second time"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_completion_while_replaying_writes_no_second_marker() {
+    // The paired negative for the assertion above. If lang reports progress on a replayed
+    // activation -- a bug, but a plausible one -- Core must not turn it into a command: the marker
+    // for that Workflow Task is already durable, and a second one would be matched against the
+    // event the first produced.
+    let markers: StreamMarkers = Default::default();
+    let worker = worker_recording_markers(markers.clone(), vec![2], replayable_marker_history());
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    let run_id = replayed.run_id.clone();
+    assert_eq!(replay_jobs(&replayed).len(), 1);
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"re-observed", false),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        fired.jobs.iter().any(|j| matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::FireTimer(_))
+        )),
+        "a replayed progress report must not disturb command matching, got {:?}",
+        fired.jobs
+    );
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "replay writes nothing: the marker it would write is the one it just read"
+    );
+    assert!(
+        worker.external_stream_annotation(&run_id).await.is_empty(),
+        "and the delta is not left accumulated to leak into the next task's marker"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_marker_no_machine_expects_is_reported_as_nondeterminism() {
+    // Handled the way local activities handle the same case: history and the machines disagree
+    // about what this run did, and that is nondeterminism, not something to skip past. Core writes
+    // exactly one external stream marker per Workflow Task, so a marker that neither a command nor
+    // a lookahead accounts for cannot be reconciled with anything.
+    //
+    // Delivered in two batches so the first task is *executed* rather than replayed: with only the
+    // first task's events in hand, lookahead has nothing to find, and the marker then arrives on
+    // the next task with no machine expecting it.
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_external_stream_marker(1, ParkReason::Idle, b"written-by-nobody");
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 2], mock_worker_client());
+    mock_cfg.num_expected_fails = 1;
+    // Asserting the *reason* the task failed, not merely that it did: without this the test would
+    // pass on any failure at all, including the generic "no command scheduled for event" a marker
+    // would hit if Core simply had no idea what an external stream marker was.
+    let saw_the_right_failure = Arc::new(AtomicBool::new(false));
+    let recorder = saw_the_right_failure.clone();
+    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
+        let message = failure
+            .as_ref()
+            .map(|f| f.message.clone())
+            .unwrap_or_default();
+        recorder.store(
+            message.contains("no state machine expecting it")
+                && matches!(
+                    cause,
+                    temporalio_common::protos::temporal::api::enums::v1::WorkflowTaskFailedCause::NonDeterministicError
+                ),
+            Ordering::Relaxed,
+        );
+        true
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    assert_eq!(
+        replay_jobs(&activation),
+        Vec::new(),
+        "lookahead cannot have found the marker, or this test proves nothing"
+    );
+
+    // Lang produces nothing, so no marker command exists for the event that follows.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
+        .await
+        .unwrap();
+
+    // The next task carries the unexplained marker and fails. `num_expected_fails` is what asserts
+    // the failure actually reached the server.
+    let next = tokio::time::timeout(
+        Duration::from_millis(500),
+        worker.poll_workflow_activation(),
+    )
+    .await;
+    if let Ok(Ok(act)) = next {
+        assert!(
+            act.is_only_eviction(),
+            "the unexplained marker must fail the task rather than activate lang, got {:?}",
+            act.jobs
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        saw_the_right_failure.load(Ordering::Relaxed),
+        "the marker must fail the task as nondeterminism naming the missing machine"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
 }

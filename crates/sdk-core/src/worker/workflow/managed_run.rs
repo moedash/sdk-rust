@@ -16,7 +16,7 @@ use crate::{
             WorkflowTaskInfo,
             external_streams::{
                 ExternalStreamReadyResult, ExternalStreamRunStatus, ExternalWaitSet,
-                ExternalWaitState, ParkTrigger, ReadinessOutcome,
+                ExternalWaitState, ParkResolution, ParkStartOutcome, ParkTrigger, ReadinessOutcome,
             },
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
@@ -39,13 +39,14 @@ use temporalio_common::protos::{
         common::ExternalStorageMetrics,
         external_data::{ExternalStreamMarkerData, ExternalWaitMarker, ParkReason},
         workflow_activation::{
-            FinalizeExternalStreams, ResolveExternalStreamWaits, WorkflowActivation,
-            create_evict_activation, query_to_job, remove_from_cache::EvictionReason,
-            workflow_activation_job,
+            FinalizeExternalStreams, PrepareExternalStreamPark, ResolveExternalStreamWaits,
+            WorkflowActivation, create_evict_activation, query_to_job,
+            remove_from_cache::EvictionReason, workflow_activation_job,
         },
         workflow_commands::{
             ExternalStreamFinalized, ExternalStreamParkResult, ExternalStreamWait,
             FailWorkflowExecution, QueryResult, WorkflowStreamProgress,
+            external_stream_park_result,
         },
         workflow_completion,
     },
@@ -242,10 +243,11 @@ impl ManagedRun {
         self.waiting_on_local_work
             .external_wait_set
             .set_wft_open(true);
-        // A finalization still outstanding here belongs to a task that failed rather than
-        // answering. That boundary is gone with the task, and leaving the expectation set would
-        // make the next ordinary completion look like a lang protocol violation.
+        // A finalization or park handshake still outstanding here belongs to a task that failed
+        // rather than answering. That boundary is gone with the task, and leaving the expectation
+        // set would make the next ordinary completion look like a lang protocol violation.
         self.waiting_on_local_work.pending_finalization = None;
+        self.waiting_on_local_work.pending_park = None;
         self.wft = Some(OutstandingTask {
             info: wft_info,
             pending_queries,
@@ -855,14 +857,50 @@ impl ManagedRun {
             }
         };
         let has_server_bound_commands = !lang_commands.is_empty();
-        if stream_commands.park_result.is_some() {
-            return Err(RunUpdateErr {
-                source: WFMachinesError::Fatal(
-                    "external stream park results are not handled yet".to_string(),
-                ),
-                complete_resp_chan: completion.resp_chan,
-            });
-        }
+
+        // Lang answered `PrepareExternalStreamPark`. Paired against the *issued* job for the same
+        // reason finalization is: a park job answered without a result would leave Core holding a
+        // boundary it decided with no terminal to write, and an unprompted result would let lang
+        // close an annotation Core never asked it to close.
+        let park_outcome = match (
+            self.waiting_on_local_work.pending_park,
+            stream_commands.park_result,
+        ) {
+            (Some(PendingPark::Issued(reason)), Some(result)) => {
+                self.waiting_on_local_work.pending_park = None;
+                Some(self.apply_park_result(reason, result))
+            }
+            (Some(PendingPark::Issued(reason)), None) => {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(format!(
+                        "Lang answered PrepareExternalStreamPark({reason:?}) without an \
+                         ExternalStreamParkResult. Core never manufactures a terminal, so no \
+                         marker is written and the Workflow Task is retried."
+                    )),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            (_, Some(_)) => {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "Lang sent ExternalStreamParkResult with no park handshake outstanding"
+                            .to_string(),
+                    ),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            (Some(PendingPark::Queued(_)) | None, None) => None,
+        };
+        // A handshake in flight retains the Workflow Task in every state but one. Queued or
+        // issued, the set is in `Parking` and the job still has to be delivered and answered;
+        // aborted or stale, the resolve activation Core owes lang needs a task to arrive on.
+        // Only a *confirmed* park ends the task, and it ends it by writing the marker whose
+        // terminal the confirmation just supplied.
+        let park_retains = self.waiting_on_local_work.pending_park.is_some()
+            || matches!(
+                park_outcome,
+                Some(ParkApplication::Aborted | ParkApplication::Stale)
+            );
 
         // A `FinalizeExternalStreams` job's only legal responses are `ExternalStreamFinalized` or
         // an activation failure. Anything else means Core asked for a terminal and did not get
@@ -931,7 +969,7 @@ impl ManagedRun {
         // knowing the deadline had already expired, and honouring that would restart the deadline
         // and hold the task past the timeout it exists to stay inside -- rollover is
         // authoritative, so it wins.
-        let will_retain = stream_commands.quiescence.is_some()
+        let will_retain = (stream_commands.quiescence.is_some() || park_retains)
             && !has_server_bound_commands
             && !data.activation_was_eviction
             && data.query_responses.is_empty()
@@ -944,6 +982,11 @@ impl ManagedRun {
         // command would then be matched before the record it came from was validated.
         let terminal = if will_retain {
             None
+        } else if let Some(ParkApplication::Confirmed(reason)) = park_outcome {
+            // Park owns its own marker path. The terminal arrived on the park result itself, so
+            // there is no finalization round trip to wait for and nothing is owed -- which is why
+            // idle park is C8's and not the finalization protocol's.
+            Some(reason)
         } else if let Some(reason) = finalized_boundary {
             // Core decided this boundary and lang has now supplied its terminal.
             Some(reason)
@@ -1035,10 +1078,13 @@ impl ManagedRun {
                 // also produced a timer, activity, child workflow, or signal must be reported so
                 // the server can act on it; the subscriptions stay registered and are woken by
                 // the wake Signal instead.
-                if let Some(request) = stream_commands.quiescence
-                    && will_retain
-                {
-                    self.begin_external_stream_quiescence(request);
+                if will_retain {
+                    // An abandoned park retains without a new snapshot: the quiescent generation
+                    // it failed to close is still the current one, so re-recording it would bump
+                    // the generation and strand any readiness already accepted against the old.
+                    if let Some(request) = stream_commands.quiescence {
+                        self.begin_external_stream_quiescence(request);
+                    }
                     return Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -1232,6 +1278,97 @@ impl ManagedRun {
         true
     }
 
+    /// Moves the complete set into `Parking` and asks lang to run the backend handshake (C8).
+    ///
+    /// Runtime-internal: no user Workflow code runs for this job. Lang installs one park intent
+    /// per subscription, rechecks every stream, and answers `ExternalStreamParkResult` --
+    /// `ParkSetConfirmed` carrying the terminal only Core cannot encode, or `StreamSetBecameReady`
+    /// abandoning this parking generation.
+    ///
+    /// Returns `true` when a job was issued. `false` means the set refused to park: the generation
+    /// named is no longer current, or readiness Core already accepted is sitting in it, and
+    /// parking a set with a ready wait in it would strand that wait's record until a producer
+    /// happened to signal.
+    fn begin_external_stream_park(
+        &mut self,
+        quiescence_generation: u64,
+        trigger: ParkTrigger,
+    ) -> bool {
+        if self.waiting_on_local_work.pending_park.is_some() {
+            // One handshake at a time. A second job for one set would put two runtime-internal
+            // activations in flight, and there is never more than one outstanding per run.
+            return false;
+        }
+        let set = &mut self.waiting_on_local_work.external_wait_set;
+        let reason = match set.start_parking(quiescence_generation, trigger) {
+            ParkStartOutcome::Started(ParkTrigger::IdleTimeout) => ParkReason::Idle,
+            ParkStartOutcome::Started(ParkTrigger::AllWriteFenced) => ParkReason::AllWriteFenced,
+            ParkStartOutcome::StaleGeneration | ParkStartOutcome::AlreadyReady => return false,
+        };
+        let waits = set
+            .wait_snapshot()
+            .into_iter()
+            .map(
+                |(wait_id, generation, immediately_parkable)| ExternalStreamWait {
+                    wait_id,
+                    generation,
+                    immediately_parkable,
+                },
+            )
+            .collect();
+
+        // The quiescent snapshot this park closes is over. Its idle timer must not survive the
+        // handshake: firing again would start a second park for a set already in one.
+        self.cancel_external_stream_idle_timer();
+        self.waiting_on_local_work.pending_park = Some(PendingPark::Queued(reason));
+        self.wfm.machines.send_core_generated_job(
+            workflow_activation_job::Variant::PrepareExternalStreamPark(
+                PrepareExternalStreamPark {
+                    quiescence_generation,
+                    waits,
+                    reason: reason as i32,
+                },
+            ),
+        );
+        true
+    }
+
+    /// Applies lang's answer to `PrepareExternalStreamPark`.
+    ///
+    /// Both orderings of the readiness/park race resolve here, through the one pure function that
+    /// decides them: readiness accepted while the handshake was in flight has already moved a wait
+    /// out of `Parking`, and that is exactly what makes the confirmation which follows stale.
+    fn apply_park_result(
+        &mut self,
+        reason: ParkReason,
+        result: ExternalStreamParkResult,
+    ) -> ParkApplication {
+        let confirmed = matches!(
+            result.outcome,
+            Some(external_stream_park_result::Outcome::Confirmed(_))
+        );
+        let set = &mut self.waiting_on_local_work.external_wait_set;
+        match set.resolve_park(result.quiescence_generation, confirmed) {
+            ParkResolution::Confirmed => {
+                // The terminal arrives *here*, on the park result -- park issues no finalization
+                // job, so this is the only chance Core gets to obtain it before writing.
+                set.accumulate_annotation(&result.final_observation_delta);
+                ParkApplication::Confirmed(reason)
+            }
+            ParkResolution::Aborted => {
+                // The recheck found records. No boundary was reached, so nothing is written; lang
+                // is resumed by a *normal* resolve activation rather than by user code running
+                // from inside the park path.
+                set.mark_all_ready_after_aborted_park();
+                ParkApplication::Aborted
+            }
+            // Readiness beat the confirmation, or a later snapshot replaced the one being parked.
+            // Discarded with no effect and, above all, no marker: the boundary it claims to close
+            // was never reached.
+            ParkResolution::StaleGeneration => ParkApplication::Stale,
+        }
+    }
+
     /// Records a quiescent snapshot and starts the timers that bound it.
     ///
     /// **One** idle timer for the whole wait set, not one per subscription: the timeout measures
@@ -1253,6 +1390,21 @@ impl ManagedRun {
             .become_quiescent(request.waits, idle_timeout);
 
         self.cancel_external_stream_idle_timer();
+
+        // Every wait reached a write fence with no later record immediately available, so there is
+        // nothing left for the idle delay to wait *for*: park now instead of holding the task open
+        // for a timeout that can only expire. One fenced stream does not qualify -- parking is
+        // all-or-nothing across the set -- and a set holding accepted readiness refuses, which is
+        // what leaves the resolve below reachable.
+        if self
+            .waiting_on_local_work
+            .external_wait_set
+            .all_immediately_parkable()
+            && self.begin_external_stream_park(generation, ParkTrigger::AllWriteFenced)
+        {
+            return;
+        }
+
         self.waiting_on_local_work.idle_timer = Some(self.run_timers.start(
             Instant::now().add(idle_timeout),
             LocalInputs::ExternalStreamIdleTimeout(ExternalStreamIdleTimeoutMsg {
@@ -1546,31 +1698,20 @@ impl ManagedRun {
     }
 
     /// The global quiescence timer for `quiescence_generation` expired.
+    ///
+    /// Nothing was delivered on any active wait for the whole timeout, so the complete set is
+    /// asked to park. A timer for a snapshot the Workflow has already run past changes nothing.
     pub(super) fn external_stream_idle_timeout(
         &mut self,
         quiescence_generation: u64,
     ) -> RunUpdateAct {
-        let _ = self
-            .waiting_on_local_work
-            .external_wait_set
-            .start_parking(quiescence_generation, ParkTrigger::IdleTimeout);
-        // Issuing `PrepareExternalStreamPark` is C8's.
-        None
-    }
-
-    /// Lang answered `PrepareExternalStreamPark`.
-    pub(super) fn external_stream_park_result(
-        &mut self,
-        quiescence_generation: u64,
-        confirmed: bool,
-    ) -> RunUpdateAct {
-        let _ = self
-            .waiting_on_local_work
-            .external_wait_set
-            .resolve_park(quiescence_generation, confirmed);
-        // Writing the marker and completing the Workflow Task on `Confirmed`, and issuing a
-        // resolve activation on `Aborted`, are C8's.
-        None
+        // The handle is spent: this *is* its expiry.
+        self.waiting_on_local_work.idle_timer = None;
+        if !self.begin_external_stream_park(quiescence_generation, ParkTrigger::IdleTimeout) {
+            return None;
+        }
+        let res = self._check_more_activations();
+        self.update_to_acts(res.map(Into::into))
     }
 
     pub(super) fn heartbeat_timeout(&mut self) -> RunUpdateAct {
@@ -1837,6 +1978,15 @@ impl ManagedRun {
                  one outstanding: {old_act:?}"
             );
         }
+        // A normal activation drains every queued job, so a park handshake that was waiting for
+        // one is now in lang's hands -- and the completion answering *this* activation is the one
+        // that owes Core the park result. An eviction or autocomplete drains nothing, so a job
+        // queued behind it is still only queued.
+        if matches!(act_type, OutstandingActivation::Normal)
+            && let Some(PendingPark::Queued(reason)) = self.waiting_on_local_work.pending_park
+        {
+            self.waiting_on_local_work.pending_park = Some(PendingPark::Issued(reason));
+        }
         self.activation = Some(act_type);
     }
 
@@ -2072,6 +2222,36 @@ fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
 /// Leads the marker envelope so a marker written by an older SDK stays readable.
 const EXTERNAL_STREAM_MARKER_SCHEMA_VERSION: u32 = 1;
 
+/// Where a park handshake is between Core deciding to park and lang answering.
+///
+/// The two states are not decoration: the completion that must carry an `ExternalStreamParkResult`
+/// is the one that answers the activation *carrying* the job, and an activation can already be
+/// outstanding when the set begins parking -- the all-fenced trigger fires from inside a
+/// completion, and a timer can expire while lang is still working. Enforcing the pairing against
+/// `Queued` would fail a completion for a job lang has not been handed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPark {
+    /// The job is queued; lang has not been activated with it.
+    Queued(ParkReason),
+    /// Lang holds the job. The completion that answers it must carry the result.
+    Issued(ParkReason),
+}
+
+/// What lang's `ExternalStreamParkResult` did to the wait set.
+///
+/// Three outcomes, not two, because a confirmation that lost the race with readiness is neither a
+/// park nor an abort: nothing was parked and nothing was rechecked, so the completion must leave
+/// the task exactly as it found it -- above all writing no marker for a boundary never reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkApplication {
+    /// The set is parked. Carries the reason, which becomes the marker's terminal boundary.
+    Confirmed(ParkReason),
+    /// The final recheck found records; every wait is ready again.
+    Aborted,
+    /// The result named a generation that is no longer parking. Discarded.
+    Stale,
+}
+
 /// Lang's `WorkflowStreamQuiescent`, validated.
 struct QuiescenceRequest {
     waits: Vec<ExternalWaitState>,
@@ -2211,6 +2391,33 @@ struct WaitingOnLocalWork {
     /// be written** -- a truncated annotation is durable and wrong, while an abandoned Workflow
     /// Task commits no cursor and loses no record.
     pending_finalization: Option<ParkReason>,
+    /// The trigger a `PrepareExternalStreamPark` job is outstanding for, as the terminal boundary
+    /// it will become.
+    ///
+    /// Held rather than recomputed, because the reason belongs to the moment parking *started*: an
+    /// idle expiry and an all-fenced snapshot are indistinguishable by the time the answer comes
+    /// back, and the marker must say which one it actually was. Its presence is also what stops a
+    /// second handshake being started for a set already in one.
+    pending_park: Option<PendingPark>,
+}
+
+impl Drop for WaitingOnLocalWork {
+    /// A run's external stream deadlines do not outlive the run.
+    ///
+    /// Each timer task holds a clone of the local-input sender, so one left running keeps the
+    /// workflow stream alive for its whole duration -- a Worker shutting down with a retained wait
+    /// set would sit out the full idle deadline before it could finish, and would then deliver a
+    /// park handshake to a run that no longer exists. The local-activity heartbeat handle is
+    /// deliberately *not* aborted here: its callers abort it explicitly and have always relied on
+    /// dropping the handle being a no-op.
+    fn drop(&mut self) {
+        if let Some(handle) = self.idle_timer.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.wft_rollover_timer.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl WaitingOnLocalWork {

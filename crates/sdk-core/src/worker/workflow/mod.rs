@@ -764,24 +764,6 @@ impl Workflows {
         });
     }
 
-    /// Deliver lang's answer to `PrepareExternalStreamPark`.
-    ///
-    /// The completion path that extracts this from lang's commands is C8's; until then only
-    /// tests drive it.
-    #[allow(dead_code, reason = "driven by the park handshake in C8")]
-    pub(super) fn notify_external_stream_park_result(
-        &self,
-        run_id: impl Into<String>,
-        quiescence_generation: u64,
-        confirmed: bool,
-    ) {
-        self.send_local(ExternalStreamParkResultMsg {
-            run_id: run_id.into(),
-            quiescence_generation,
-            confirmed,
-        });
-    }
-
     /// Test scaffolding -- see [`EmitTerminalLessMarkerMsg`].
     #[cfg(test)]
     pub(super) fn emit_terminal_less_external_stream_marker(
@@ -841,7 +823,10 @@ impl Workflows {
         self.send_local(ExternalStreamSeedWaitsMsg {
             run_id: run_id.into(),
             wait_ids,
-            idle_timeout: Duration::from_secs(1),
+            // Long enough that no seeded set parks itself out from under a test. Seeding starts no
+            // timer, but a wait set carried onto a replacement Workflow Task re-arms one from this
+            // value, and a set that parked mid-test would be answering a question nobody asked.
+            idle_timeout: Duration::from_secs(300),
             parked_at,
             wft_open,
             response_tx: tx,
@@ -1499,15 +1484,6 @@ pub(crate) struct ExternalStreamIdleTimeoutMsg {
     /// The snapshot the timer was started for. A timer that fires for a superseded snapshot is
     /// discarded rather than parking a set the Workflow has since run past.
     pub(crate) quiescence_generation: u64,
-}
-
-/// Lang's answer to `PrepareExternalStreamPark`, routed onto the run's serialized lane.
-#[derive(Debug)]
-pub(crate) struct ExternalStreamParkResultMsg {
-    pub(crate) run_id: String,
-    pub(crate) quiescence_generation: u64,
-    /// `true` for `ParkSetConfirmed`, `false` for `StreamSetBecameReady`.
-    pub(crate) confirmed: bool,
 }
 
 /// The read-only status probe lang's shutdown sweep uses.
