@@ -39,8 +39,9 @@ use temporalio_common::protos::{
         common::ExternalStorageMetrics,
         external_data::{ExternalStreamMarkerData, ExternalWaitMarker, ParkReason},
         workflow_activation::{
-            ResolveExternalStreamWaits, WorkflowActivation, create_evict_activation, query_to_job,
-            remove_from_cache::EvictionReason, workflow_activation_job,
+            FinalizeExternalStreams, ResolveExternalStreamWaits, WorkflowActivation,
+            create_evict_activation, query_to_job, remove_from_cache::EvictionReason,
+            workflow_activation_job,
         },
         workflow_commands::{
             ExternalStreamFinalized, ExternalStreamParkResult, ExternalStreamWait,
@@ -241,6 +242,10 @@ impl ManagedRun {
         self.waiting_on_local_work
             .external_wait_set
             .set_wft_open(true);
+        // A finalization still outstanding here belongs to a task that failed rather than
+        // answering. That boundary is gone with the task, and leaving the expectation set would
+        // make the next ordinary completion look like a lang protocol violation.
+        self.waiting_on_local_work.pending_finalization = None;
         self.wft = Some(OutstandingTask {
             info: wft_info,
             pending_queries,
@@ -850,15 +855,51 @@ impl ManagedRun {
             }
         };
         let has_server_bound_commands = !lang_commands.is_empty();
-        if stream_commands.park_result.is_some() || stream_commands.finalized.is_some() {
+        if stream_commands.park_result.is_some() {
             return Err(RunUpdateErr {
                 source: WFMachinesError::Fatal(
-                    "external stream park and finalization commands are not handled yet"
-                        .to_string(),
+                    "external stream park results are not handled yet".to_string(),
                 ),
                 complete_resp_chan: completion.resp_chan,
             });
         }
+
+        // A `FinalizeExternalStreams` job's only legal responses are `ExternalStreamFinalized` or
+        // an activation failure. Anything else means Core asked for a terminal and did not get
+        // one, and there is no best-effort path from there: writing a marker anyway would commit
+        // a truncated annotation, which is durable and wrong, so the Workflow Task is failed and
+        // retried instead. An abandoned task commits no cursor and loses no record.
+        let finalized_boundary = match (
+            self.waiting_on_local_work.pending_finalization.take(),
+            &stream_commands.finalized,
+        ) {
+            (Some(reason), Some(finalized)) => {
+                self.waiting_on_local_work
+                    .external_wait_set
+                    .accumulate_annotation(&finalized.final_observation_delta);
+                Some(reason)
+            }
+            (Some(reason), None) => {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(format!(
+                        "Lang answered FinalizeExternalStreams({reason:?}) without an \
+                         ExternalStreamFinalized command. Core never manufactures a terminal, so \
+                         no marker is written and the Workflow Task is retried."
+                    )),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            (None, Some(_)) => {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "Lang sent ExternalStreamFinalized with no finalization job outstanding"
+                            .to_string(),
+                    ),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            (None, None) => None,
+        };
 
         // Accumulate on *every* completion path, retained or not: consuming a record and
         // committing that consumption are separate steps, and the second is not conditional on
@@ -876,43 +917,65 @@ impl ManagedRun {
         }
         let completing_budget_rollover =
             mem::take(&mut self.waiting_on_local_work.budget_rollover_pending);
-        let completing_rollover = completing_deadline_rollover || completing_budget_rollover;
+        // A finalization response carries the rollover intent across its round trip: the deadline
+        // flag was consumed by the completion that *asked*, so without this the completion that
+        // finally writes the marker would forget to request a replacement task.
+        let completing_rollover = completing_deadline_rollover
+            || completing_budget_rollover
+            || finalized_boundary == Some(ParkReason::Rollover);
 
         // Whether this completion retains the task, decided before anything is pushed into the
         // machines so the marker can be ordered ahead of lang's own commands.
+        //
+        // A pending rollover overrides a retention request. Lang asked to be held open without
+        // knowing the deadline had already expired, and honouring that would restart the deadline
+        // and hold the task past the timeout it exists to stay inside -- rollover is
+        // authoritative, so it wins.
         let will_retain = stream_commands.quiescence.is_some()
             && !has_server_bound_commands
             && !data.activation_was_eviction
-            && data.query_responses.is_empty();
+            && data.query_responses.is_empty()
+            && !completing_rollover
+            && finalized_boundary.is_none();
 
         // `WorkflowStreamProgress` precedes every command whose value could depend on the
         // consumed data, and so must the marker recording it. Emitting after lang's commands were
         // pushed would put the marker *after* the terminal command in History, and on replay the
         // command would then be matched before the record it came from was validated.
-        if !will_retain {
-            let terminal = if completing_budget_rollover {
-                Some(ParkReason::BudgetRollover)
-            } else if lang_commands.iter().any(|c| c.variant.is_terminal()) {
-                Some(ParkReason::WorkflowCompleted)
-            } else if has_server_bound_commands {
-                Some(ParkReason::CommandsProduced)
-            } else if completing_deadline_rollover {
-                // Core decided this boundary and lang was never asked for a terminal, so there is
-                // nothing to write. Obtaining one is the finalization round trip's job (C15a) and
-                // integrating it is C12b's; until then the annotation stays accumulated and the
-                // replacement task carries it forward.
-                None
-            } else {
-                Some(ParkReason::TaskCompleted)
-            };
-            if let Some(terminal) = terminal
-                && let Err(source) = self.emit_external_stream_marker(terminal)
-            {
-                return Err(RunUpdateErr {
-                    source,
-                    complete_resp_chan: completion.resp_chan,
-                });
-            }
+        let terminal = if will_retain {
+            None
+        } else if let Some(reason) = finalized_boundary {
+            // Core decided this boundary and lang has now supplied its terminal.
+            Some(reason)
+        } else if completing_budget_rollover {
+            Some(ParkReason::BudgetRollover)
+        } else if lang_commands.iter().any(|c| c.variant.is_terminal()) {
+            Some(ParkReason::WorkflowCompleted)
+        } else if has_server_bound_commands {
+            Some(ParkReason::CommandsProduced)
+        } else if completing_deadline_rollover {
+            // Core decided this boundary and lang was never asked for a terminal. Nothing may be
+            // written until the finalization round trip below supplies one.
+            None
+        } else {
+            Some(ParkReason::TaskCompleted)
+        };
+
+        // The deadline rollover is the one boundary that reaches here still owing a terminal.
+        // `false` means there was no annotation to finalize, so the task simply completes with a
+        // replacement requested and no marker -- nothing is owed and nothing is missing.
+        let awaiting_finalization = terminal.is_none()
+            && !will_retain
+            && completing_deadline_rollover
+            && self.begin_external_stream_finalization(ParkReason::Rollover);
+
+        if let Some(terminal) = terminal
+            && let Err(source) = self.emit_external_stream_marker(terminal)
+        {
+            return Err(RunUpdateErr {
+                source,
+                complete_resp_chan: completion.resp_chan,
+            });
         }
 
         let outcome = (|| {
@@ -952,6 +1015,20 @@ impl ManagedRun {
             Ok(None) => {
                 if let Some(waiting) = self.waiting_on_local_work.local_activities.take() {
                     waiting.hb_timeout_handle.abort();
+                }
+
+                // The finalization job is queued but not yet shipped. Reporting the task now would
+                // complete it before its terminal exists, so the task stays open until lang
+                // answers -- which is the whole point of Core never writing a marker for a
+                // boundary it decided without one.
+                if awaiting_finalization {
+                    return Ok(Some(FulfillableActivationComplete {
+                        result: ActivationCompleteResult {
+                            outcome: ActivationCompleteOutcome::DoNothing,
+                            replaying: self.wfm.machines.replaying,
+                        },
+                        resp_chan: completion.resp_chan,
+                    }));
                 }
 
                 // Retention applies only when nothing server-bound rides along. A completion that
@@ -1025,9 +1102,11 @@ impl ManagedRun {
                     // Retaining the task reports nothing to the server, so a rollover that was
                     // pending has not been acted on and must stay pending -- otherwise the
                     // deadline would be silently swallowed by the very completion that keeps the
-                    // task open past it.
+                    // task open past it. Unless a finalization is already in flight for it, in
+                    // which case that round trip carries the intent and re-arming here would ask
+                    // for the same boundary twice.
                     self.waiting_on_local_work.deadline_rollover_pending |=
-                        completing_deadline_rollover;
+                        completing_deadline_rollover && !awaiting_finalization;
                     self.waiting_on_local_work.budget_rollover_pending |=
                         completing_budget_rollover;
                     Ok(Some(FulfillableActivationComplete {
@@ -1107,6 +1186,50 @@ impl ManagedRun {
                 replay_annotation,
                 terminal_boundary: terminal_boundary as i32,
             })
+    }
+
+    /// Asks lang for the terminal of a boundary **Core** decided (C15a).
+    ///
+    /// The annotation ends with a blocked cursor snapshot and only lang can encode it, so Core
+    /// cannot close a boundary it decided without asking. This is the protocol primitive, and it
+    /// is deliberately independent of which boundary triggered it -- rollover and shutdown both
+    /// come through here. Park does **not**: it obtains its terminal from
+    /// `ExternalStreamParkResult`, which is a different round trip.
+    ///
+    /// Returns `true` when a job was issued. `false` means there is nothing to finalize, because
+    /// nothing was accumulated -- so no marker is owed and none is missing.
+    fn begin_external_stream_finalization(&mut self, reason: ParkReason) -> bool {
+        if self.waiting_on_local_work.pending_finalization.is_some() {
+            // Already asked. A second job for one boundary would put two runtime-internal
+            // activations in flight, and there is never more than one outstanding per run.
+            return true;
+        }
+        let set = &self.waiting_on_local_work.external_wait_set;
+        if set.replay_annotation().is_empty() {
+            return false;
+        }
+        let quiescence_generation = set.quiescence_generation();
+        let waits = set
+            .wait_snapshot()
+            .into_iter()
+            .map(
+                |(wait_id, generation, immediately_parkable)| ExternalStreamWait {
+                    wait_id,
+                    generation,
+                    immediately_parkable,
+                },
+            )
+            .collect();
+
+        self.waiting_on_local_work.pending_finalization = Some(reason);
+        self.wfm.machines.send_core_generated_job(
+            workflow_activation_job::Variant::FinalizeExternalStreams(FinalizeExternalStreams {
+                quiescence_generation,
+                waits,
+                reason: reason as i32,
+            }),
+        );
+        true
     }
 
     /// Records a quiescent snapshot and starts the timers that bound it.
@@ -2081,6 +2204,13 @@ struct WaitingOnLocalWork {
     /// One timer for the whole set. Readiness for any member cancels it, which is what makes an
     /// idle stream unable to park a workflow task another stream is still driving.
     idle_timer: Option<AbortHandle>,
+    /// The boundary a `FinalizeExternalStreams` job is outstanding for.
+    ///
+    /// Core is annotation-blind, so it cannot manufacture a terminal. Between issuing the job and
+    /// receiving `ExternalStreamFinalized` the accumulated annotation is held and **no marker may
+    /// be written** -- a truncated annotation is durable and wrong, while an abandoned Workflow
+    /// Task commits no cursor and loses no record.
+    pending_finalization: Option<ParkReason>,
 }
 
 impl WaitingOnLocalWork {

@@ -29,8 +29,8 @@ use temporalio_common::{
         external_stream::{self, WakeSignal},
         workflow_activation::workflow_activation_job,
         workflow_commands::{
-            CompleteWorkflowExecution, ExternalStreamWait, WorkflowStreamProgress,
-            WorkflowStreamQuiescent, workflow_command,
+            CompleteWorkflowExecution, ExternalStreamFinalized, ExternalStreamWait,
+            WorkflowStreamProgress, WorkflowStreamQuiescent, workflow_command,
         },
         workflow_completion::WorkflowActivationCompletion,
     },
@@ -1048,22 +1048,68 @@ async fn a_progress_command_after_another_command_is_malformed() {
 
 // --- rollover transport (C12a) -----------------------------------------------
 
-#[tokio::test]
-async fn a_retained_task_rolls_over_with_its_wait_set_intact() {
-    // The half that can exist without markers: the task is replaced, and every subscription,
-    // cursor, and readiness generation survives onto the replacement. No annotation is written,
-    // because in this configuration there is none to write.
-    let saw_force_new_wft = Arc::new(AtomicBool::new(false));
-    let recorder = saw_force_new_wft.clone();
-    let t = canned_histories::single_timer("1");
-    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
-    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 1], mock_worker_client());
-    let collected = markers.clone();
+/// A history whose first Workflow Task records a marker and is then replaced.
+///
+/// Commands are matched to history events in order, so a rollover that writes a marker needs the
+/// marker event present and first -- a history missing it hands the marker machine whatever event
+/// happens to be next.
+fn marker_then_replacement_history(
+    quiescence_generation: u64,
+    terminal: ParkReason,
+    annotation: &[u8],
+) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_external_stream_marker(quiescence_generation, terminal, annotation);
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// The `FinalizeExternalStreams` jobs in an activation, as (generation, reason, wait ids).
+fn finalization_jobs(
+    activation: &temporalio_common::protos::coresdk::workflow_activation::WorkflowActivation,
+) -> Vec<(u64, ParkReason, Vec<u32>)> {
+    activation
+        .jobs
+        .iter()
+        .filter_map(|j| match &j.variant {
+            Some(workflow_activation_job::Variant::FinalizeExternalStreams(f)) => Some((
+                f.quiescence_generation,
+                f.reason(),
+                f.waits.iter().map(|w| w.wait_id).collect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Lang's answer to a finalization job: the terminal Core cannot manufacture.
+fn finalized_command(quiescence_generation: u64, delta: &[u8]) -> workflow_command::Variant {
+    workflow_command::Variant::ExternalStreamFinalized(ExternalStreamFinalized {
+        quiescence_generation,
+        final_observation_delta: delta.to_vec(),
+    })
+}
+
+/// A workflow-only worker recording both markers and `force_new_wft` per completion.
+fn worker_recording_rollovers(
+    markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>>,
+    forced: Arc<Mutex<Vec<bool>>>,
+    history: TestHistoryBuilder,
+    batches: Vec<usize>,
+) -> crate::Worker {
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, batches, mock_worker_client());
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
-        asserts.then(move |wft| {
-            recorder.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
-            collected.lock().extend(stream_markers(wft));
-        });
+        for _ in 0..4 {
+            let collected = markers.clone();
+            let forced = forced.clone();
+            asserts.then(move |wft| {
+                collected.lock().extend(stream_markers(wft));
+                forced.lock().push(wft.force_create_new_workflow_task);
+            });
+        }
     });
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
@@ -1071,16 +1117,23 @@ async fn a_retained_task_rolls_over_with_its_wait_set_intact() {
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
-    let worker = mock_worker(mock);
+    mock_worker(mock)
+}
 
+/// Retains a task holding `annotation`, then fires the rollover deadline.
+///
+/// Returns the run id. On return the finalization job has not yet been polled.
+async fn retain_then_fire_the_rollover_deadline(
+    worker: &crate::Worker,
+    annotation: &[u8],
+) -> String {
     let activation = worker.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id.clone();
-
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
             vec![
-                progress_command(b"before-rollover", false).into(),
+                progress_command(annotation, false).into(),
                 quiescent_command(1, &[1, 2], Duration::from_secs(30)).into(),
             ],
         ))
@@ -1090,54 +1143,97 @@ async fn a_retained_task_rolls_over_with_its_wait_set_intact() {
         worker.external_stream_run_status(&run_id).await,
         ExternalStreamRunStatus::WftOpen
     );
-
     worker
         .start_wft_rollover_timer(&run_id, Duration::from_millis(50))
         .await;
+    run_id
+}
 
-    // The rollover's autocompletion is produced inside the poll loop, so a poll must be in
-    // flight for it to happen at all -- as is always the case on a running worker. This one
-    // times out on purpose: the replacement task is retained too, so there is nothing to hand
-    // back until readiness resolves it.
+#[tokio::test]
+async fn a_core_decided_boundary_asks_for_a_terminal_before_writing_anything() {
+    // The C15a protocol, end to end. Core decided this boundary from a timer, so it has no
+    // terminal for it -- only lang can encode the blocked cursor snapshot. Core must therefore
+    // ask, and must write nothing at all until the answer arrives.
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_recording_rollovers(
+        markers.clone(),
+        forced.clone(),
+        marker_then_replacement_history(1, ParkReason::Rollover, b"before-rollover-terminal"),
+        vec![1, 2],
+    );
+
+    let run_id = retain_then_fire_the_rollover_deadline(&worker, b"before-rollover").await;
+
+    // The deadline produced a finalization job covering the *complete* active wait set, not a
+    // completion.
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&finalize),
+        vec![(1, ParkReason::Rollover, vec![1, 2])],
+        "a rollover deadline must ask lang to finalize, got {:?}",
+        finalize.jobs
+    );
+
+    // Nothing has been written and nothing has been reported: the annotation is still held,
+    // because a marker without its terminal is durable and wrong.
+    assert_eq!(*markers.lock(), Vec::new());
+    assert_eq!(
+        *forced.lock(),
+        Vec::<bool>::new(),
+        "the task must stay open until its terminal exists"
+    );
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"before-rollover",
+        "the accumulated annotation is held across the round trip, not discarded"
+    );
+
+    // Lang supplies the terminal, and only now is the marker written.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(1, b"-terminal"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        vec![(
+            1,
+            ParkReason::Rollover,
+            b"before-rollover-terminal".to_vec()
+        )],
+        "the marker carries the accumulated annotation with lang's terminal appended"
+    );
+    assert_eq!(
+        *forced.lock(),
+        vec![true],
+        "the completion carrying the marker is also the one that requests a replacement"
+    );
+    assert!(
+        worker.external_stream_annotation(&run_id).await.is_empty(),
+        "the annotation is cleared once its marker is written"
+    );
+
+    // And the wait set survived onto the replacement task, which is retained exactly as its
+    // predecessor was -- the durable half of rollover does not cost the transport half. This poll
+    // lets the replacement in and hands nothing back, which is itself the retention assertion.
     assert!(
         tokio::time::timeout(
-            Duration::from_millis(600),
+            Duration::from_millis(400),
             worker.poll_workflow_activation()
         )
         .await
         .is_err(),
         "the replacement task must be retained too, or the rollover undoes itself"
     );
-
-    assert!(
-        saw_force_new_wft.load(Ordering::Relaxed),
-        "a rollover deadline that expires on a retained task must request a replacement"
-    );
-    assert_eq!(
-        worker.external_stream_run_status(&run_id).await,
-        ExternalStreamRunStatus::WftOpen,
-        "the wait set retains the replacement task exactly as it retained its predecessor"
-    );
-    assert_eq!(
-        worker.external_stream_annotation(&run_id).await,
-        b"before-rollover",
-        "rollover transport writes no marker, so the accumulated annotation is untouched"
-    );
-    assert_eq!(
-        *markers.lock(),
-        Vec::new(),
-        "the marker half of rollover is C12b's; transport alone writes nothing"
-    );
-
-    // The readiness generation still matches: a notification issued before the rollover is not
-    // turned stale by it.
     assert_eq!(
         worker.notify_external_stream_ready(&run_id, 2, 0).await,
         ExternalStreamReadyResult::Accepted,
         "wait 2 must still be registered at generation 0 across the rollover"
     );
-
-    // That readiness releases the retained replacement, so shutdown can finish.
     let resolved = worker.poll_workflow_activation().await.unwrap();
     assert_eq!(resolve_hints(&resolved), vec![2]);
     worker
@@ -1148,6 +1244,161 @@ async fn a_retained_task_rolls_over_with_its_wait_set_intact() {
         .await
         .unwrap();
 
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_finalization_answered_without_a_terminal_writes_no_marker() {
+    // There is no best-effort path. If the terminal cannot be obtained, Core writes nothing and
+    // the Workflow Task is retried -- an abandoned task commits no cursor and loses no record,
+    // while a truncated annotation is durable and wrong.
+    //
+    // "Writes no marker" is asserted as *zero successful completions*: a failed Workflow Task
+    // reports no commands at all, so a marker could only have escaped through a completion that
+    // must not exist. Both counts are verified by the mock when it drops.
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        marker_then_replacement_history(1, ParkReason::Rollover, b"never-written"),
+        [1],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_fails = 1_usize.into();
+    mock_cfg.num_expected_completions = Some(0.into());
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let run_id = retain_then_fire_the_rollover_deadline(&worker, b"before-rollover").await;
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&finalize).len(),
+        1,
+        "the deadline must have asked for a terminal, or this test proves nothing"
+    );
+
+    // Lang answers the finalization job with anything other than a terminal.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "a finalization that produced no terminal must fail the Workflow Task"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_finalized_command_with_no_job_outstanding_is_refused() {
+    // The paired negative. Without it, accepting `ExternalStreamFinalized` unconditionally would
+    // let lang append a terminal to an annotation Core never asked it to close -- and the
+    // "answered correctly" case above would pass either way.
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_fails = 1_usize.into();
+    mock_cfg.num_expected_completions = Some(0.into());
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"unprompted", false).into(),
+                finalized_command(1, b"-terminal").into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "an unprompted terminal must fail the Workflow Task rather than be accepted"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rollover_with_nothing_accumulated_asks_for_no_terminal() {
+    // C12a's half, still true: with no annotation there is no marker to write, so there is
+    // nothing to finalize either. The task is still replaced -- rollover is about the deadline,
+    // not about the stream having produced anything.
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_recording_rollovers(
+        markers.clone(),
+        forced.clone(),
+        canned_histories::single_timer("1"),
+        vec![1, 1],
+    );
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    // Retention with no progress at all: nothing was ever observed.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+    worker
+        .start_wft_rollover_timer(&run_id, Duration::from_millis(50))
+        .await;
+
+    // No finalization job is issued, so the replacement task is simply retained again and the
+    // poll has nothing to hand back.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(600),
+            worker.poll_workflow_activation()
+        )
+        .await
+        .is_err(),
+        "with nothing to finalize the replacement task is retained, not activated"
+    );
+    assert_eq!(*markers.lock(), Vec::new());
+    assert_eq!(
+        *forced.lock(),
+        vec![true],
+        "the deadline still requests a replacement even with no marker to write"
+    );
+
+    // The wait set survived onto the replacement exactly as C12a requires.
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted,
+        "wait 1 must still be registered at generation 0 across the rollover"
+    );
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&resolved), vec![1]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
     worker.drain_pollers_and_shutdown().await;
 }
 
@@ -1190,6 +1441,12 @@ async fn a_budget_rollover_forces_a_replacement_without_a_deadline() {
 
     let next = worker.poll_workflow_activation().await.unwrap();
     assert_eq!(next.run_id, run_id);
+    assert_eq!(
+        finalization_jobs(&next),
+        Vec::new(),
+        "a budget rollover needs no finalization round trip -- the command that asked for it \
+         already carried the terminal"
+    );
 
     assert!(
         saw_force_new_wft.load(Ordering::Relaxed),
@@ -1209,6 +1466,128 @@ async fn a_budget_rollover_forces_a_replacement_without_a_deadline() {
         ))
         .await
         .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn two_consecutive_rollovers_produce_two_markers_that_reassemble_in_order() {
+    // A batch split across two Workflow Tasks must be recoverable, and the only thing that makes
+    // it recoverable is that each marker carries its own task's deltas and the two concatenate in
+    // task order. A marker that repeated or dropped a stretch would leave replay unable to say
+    // what the original run actually saw.
+    let markers: Arc<Mutex<Vec<(u64, ParkReason, Vec<u8>)>>> = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_external_stream_marker(1, ParkReason::Rollover, b"first-half.terminal-one");
+    t.add_full_wf_task();
+    t.add_external_stream_marker(2, ParkReason::Rollover, b"second-half.terminal-two");
+    t.add_workflow_task_scheduled_and_started();
+
+    let worker = worker_recording_rollovers(markers.clone(), forced.clone(), t, vec![1, 2]);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    // --- rollover one, on the task the run started with ---
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"first-half", false).into(),
+                quiescent_command(1, &[1], Duration::from_secs(30)).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker
+        .start_wft_rollover_timer(&run_id, Duration::from_millis(50))
+        .await;
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(finalization_jobs(&finalize).len(), 1);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(1, b".terminal-one"),
+        ))
+        .await
+        .unwrap();
+
+    // --- rollover two, on the replacement task ---
+    // The replacement is retained the moment it arrives, so this poll hands nothing back; it
+    // exists to let the task in. Readiness is what activates lang on it.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(400),
+            worker.poll_workflow_activation()
+        )
+        .await
+        .is_err(),
+        "the replacement task must be retained, or the rollover undoes itself"
+    );
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+    let resumed = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&resumed), vec![1]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"second-half", false).into(),
+                quiescent_command(2, &[1], Duration::from_secs(30)).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker
+        .start_wft_rollover_timer(&run_id, Duration::from_millis(50))
+        .await;
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(finalization_jobs(&finalize).len(), 1);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(2, b".terminal-two"),
+        ))
+        .await
+        .unwrap();
+
+    let written = markers.lock().clone();
+    assert_eq!(
+        written.len(),
+        2,
+        "one marker per Workflow Task, not one per run"
+    );
+    assert_eq!(
+        written[0],
+        (1, ParkReason::Rollover, b"first-half.terminal-one".to_vec())
+    );
+    assert_eq!(
+        written[1],
+        (
+            2,
+            ParkReason::Rollover,
+            b"second-half.terminal-two".to_vec()
+        )
+    );
+
+    // Reassembled in Workflow Task order the two markers are the whole batch, with nothing
+    // repeated and nothing lost.
+    let reassembled: Vec<u8> = written.iter().flat_map(|(_, _, a)| a.clone()).collect();
+    assert_eq!(
+        reassembled,
+        b"first-half.terminal-onesecond-half.terminal-two"
+    );
+    assert_eq!(
+        *forced.lock(),
+        vec![true, true],
+        "each rollover requests its own replacement task"
+    );
+
     worker.drain_pollers_and_shutdown().await;
 }
 
