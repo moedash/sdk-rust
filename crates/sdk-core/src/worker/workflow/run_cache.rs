@@ -142,6 +142,14 @@ impl RunCache {
         self.runs.iter().map(|(_, v)| v)
     }
 
+    /// Every cached run, mutably, without disturbing the LRU order.
+    ///
+    /// Used by the shutdown sweep, which is about reaching *every* run rather than a particular
+    /// one, and which must not make a run look recently used on the way out.
+    pub(super) fn handles_mut(&mut self) -> impl Iterator<Item = &mut ManagedRun> {
+        self.runs.iter_mut().map(|(_, v)| v)
+    }
+
     pub(super) fn is_full(&self) -> bool {
         self.runs.cap().get() == self.runs.len()
     }

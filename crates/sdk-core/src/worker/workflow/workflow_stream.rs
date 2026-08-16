@@ -36,6 +36,11 @@ pub(super) struct WFStream {
 
     history_fetch_refcounter: Arc<HistfetchRC>,
     shutdown_token: CancellationToken,
+    /// Cancelled only when the Worker was actually asked to shut down. `shutdown_token` is a
+    /// child of this one and is *also* cancelled by this stream when the poller dies, which is
+    /// why the C15b sweep keys off this token instead: a dead poller is not a Worker going away,
+    /// and closing every Run's stream boundary on one would hand Runs back that nothing asked for.
+    worker_shutdown_token: CancellationToken,
     ignore_evicts_on_shutdown: bool,
 
     metrics: MetricsContext,
@@ -100,6 +105,7 @@ impl WFStream {
                 basics.metrics.clone(),
             ),
             shutdown_token: basics.shutdown_token,
+            worker_shutdown_token: basics.worker_shutdown_token,
             ignore_evicts_on_shutdown: basics.worker_config.ignore_evicts_on_shutdown,
             metrics: basics.metrics,
             runs_needing_fetching: Default::default(),
@@ -266,6 +272,14 @@ impl WFStream {
                 };
 
                 activations.extend(maybe_act);
+                // C15b -- a Run holding a Workflow Task open on external stream waits is not
+                // released by anything else: no replacement task is coming once the pollers are
+                // stopped, and `shutdown_done` counts that open task as pending work. Swept on
+                // every input rather than once, because a buffered task can still be applied to a
+                // Run after shutdown began.
+                if state.worker_shutdown_token.is_cancelled() {
+                    activations.extend(state.external_stream_shutdown_sweep());
+                }
                 activations.extend(state.reconcile_buffered());
                 actions.extend(
                     activations
@@ -690,6 +704,21 @@ impl WFStream {
             );
         }
         acts
+    }
+
+    /// Closes the external stream boundary of every Run still holding a Workflow Task (C15b).
+    ///
+    /// Two transitions, and only one of them exists in any given Run state (ADR-009). This is the
+    /// first: with a Workflow Task open, Core asks lang for the terminal, writes the marker, and
+    /// completes requesting a replacement task. The second -- no open Workflow Task -- is
+    /// deliberately *not* here; nothing is accumulated there, so no marker is missing, and the
+    /// server-visible replacement is lang's wake sweep, which needs a Signal rather than a
+    /// completion this Run has no task token for.
+    fn external_stream_shutdown_sweep(&mut self) -> Vec<ActivationOrAuto> {
+        self.runs
+            .handles_mut()
+            .filter_map(|rh| rh.external_stream_shutdown())
+            .collect()
     }
 
     fn shutdown_done(&self) -> bool {

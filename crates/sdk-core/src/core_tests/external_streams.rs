@@ -6,7 +6,7 @@
 //! covered by unit tests next to it.
 
 use crate::{
-    ExternalStreamReadyResult, ExternalStreamRunStatus,
+    ExternalStreamReadyResult, ExternalStreamRunStatus, PollError,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, WorkerExt, build_fake_worker, build_mock_pollers, mock_worker, start_timer_cmd,
@@ -1537,6 +1537,357 @@ async fn two_consecutive_rollovers_produce_two_markers_that_reassemble_in_order(
     worker.drain_pollers_and_shutdown().await;
 }
 
+// --- shutdown and eviction transitions (C15b) --------------------------------
+
+#[tokio::test]
+async fn shutdown_with_a_workflow_task_open_writes_its_marker_and_forces_a_replacement() {
+    // ADR-009's first row. The Run holds a Workflow Task the Worker is about to stop serving, so
+    // Core closes that boundary itself: it asks lang for the terminal it cannot manufacture,
+    // writes the one marker for the task, and completes requesting a replacement task -- which is
+    // what offers the Run back to the task queue for another Worker to pick up.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_recording_rollovers(
+        markers.clone(),
+        forced.clone(),
+        marker_then_replacement_history(1, ParkReason::Shutdown, b"before-shutdown-terminal"),
+        vec![1],
+    );
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"before-shutdown", false),
+                quiescent_command(1, &[1, 2], Duration::from_secs(30)),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen
+    );
+
+    worker.initiate_shutdown();
+    // The probe lang's own shutdown sweep makes of every Run with active subscriptions. `WftOpen`
+    // is what tells lang to leave this Run to Core, and it is the same classification Core's sweep
+    // keys off -- if the two disagreed a Run would be swept twice or not at all.
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen
+    );
+
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&finalize),
+        vec![(1, ParkReason::Shutdown, vec![1, 2])],
+        "shutdown with a Workflow Task open must ask lang to finalize the complete wait set, \
+         got {:?}",
+        finalize.jobs
+    );
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "nothing may be written before the terminal arrives"
+    );
+    assert_eq!(
+        *forced.lock(),
+        Vec::<bool>::new(),
+        "the task must stay open until its terminal exists"
+    );
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"before-shutdown",
+        "the accumulated annotation is held across the round trip, not discarded"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(1, b"-terminal"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        vec![(
+            1,
+            ParkReason::Shutdown,
+            b"before-shutdown-terminal".to_vec()
+        )],
+        "the marker carries the accumulated annotation with lang's terminal appended, and says \
+         which boundary closed it"
+    );
+    assert_eq!(
+        *forced.lock(),
+        vec![true],
+        "the completion carrying the marker is also the one that hands the Run back"
+    );
+
+    // And with the boundary closed the Run owes nothing, so shutdown can finish -- which it could
+    // not while a Workflow Task was still open, since that counts as pending work.
+    assert!(
+        matches!(
+            worker.poll_workflow_activation().await,
+            Err(PollError::ShutDown)
+        ),
+        "the Run must be released once its boundary is closed"
+    );
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_with_no_open_workflow_task_writes_no_marker_and_completes_nothing() {
+    // ADR-009's second row, and the reason the two transitions are separate deliverables. Here
+    // there is no task token to set `force_new_wft` on and nothing accumulated to write, so the
+    // *correct* behaviour is to do nothing at all. The server-visible replacement is lang's wake
+    // sweep; Core reimplementing it here would send Signals for Runs it is not entitled to speak
+    // for.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_recording_rollovers(
+        markers.clone(),
+        forced.clone(),
+        canned_histories::single_timer("1"),
+        vec![1],
+    );
+
+    // The first activation is left outstanding for the whole test, which is what keeps the Run
+    // cached: a Run that goes idle here is dropped when the mock runs out of work, and an evicted
+    // Run is a different state from the one this is about.
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .seed_external_stream_waits(&run_id, vec![1, 2], None, false)
+        .await;
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::NoOpenWorkflowTask,
+        "this test is only meaningful with subscriptions active and no Workflow Task"
+    );
+
+    worker.initiate_shutdown();
+    // The same probe as above, and this time its answer is what keeps Core's sweep off the Run.
+    // Answering it also drives the stream, so the sweep really did get its chance to run.
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::NoOpenWorkflowTask
+    );
+
+    // Core asked lang for nothing: the only activation in flight is still the original one, which
+    // lang now answers on its own terms.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "nothing was accumulated, so no marker is written and none is missing"
+    );
+    assert_eq!(
+        *forced.lock(),
+        vec![false],
+        "lang's own completion must not be turned into a hand-back: with no Workflow Task of its \
+         own to close, this transition asks the server for nothing"
+    );
+    assert!(
+        matches!(
+            worker.poll_workflow_activation().await,
+            Err(PollError::ShutDown)
+        ),
+        "a Run with no open Workflow Task must produce no activation on the way out"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn evicting_a_run_with_no_open_workflow_task_writes_no_marker() {
+    // Eviction reaches the same two states as shutdown and must make the same choice. With no
+    // Workflow Task there is nothing to finalize, so the eviction activation goes out directly.
+    //
+    // "Writes no marker" is asserted as *zero completions*, the same way C15a's negative case is:
+    // a marker reaches History only on a completion, so a mock that refuses every completion
+    // proves no marker escaped by any route at all. The count is verified when the mock drops.
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_completions = Some(0.into());
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    // Retaining keeps the Run cached with its task unreported, which is what lets the wait set be
+    // put into -- and observed in -- the state under test.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+    worker
+        .seed_external_stream_waits(&run_id, vec![1], None, false)
+        .await;
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::NoOpenWorkflowTask,
+        "this test is only meaningful with subscriptions active and no Workflow Task"
+    );
+
+    worker.request_workflow_eviction(&run_id);
+
+    let evict = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        evict.is_only_eviction(),
+        "with no Workflow Task open the eviction goes out directly -- nothing may be asked of \
+         lang first, got {:?}",
+        evict.jobs
+    );
+    assert_eq!(
+        finalization_jobs(&evict),
+        Vec::new(),
+        "there is no boundary to finalize, so no terminal may be requested"
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::RunNotFound,
+        "the Run really was evicted, so the assertions above are about the state under test"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn evicting_a_run_holding_a_workflow_task_finalizes_before_the_eviction_activation() {
+    // The sequencing the whole transition rests on. The marker rides the *finalization*
+    // completion, never the eviction completion -- an eviction completion reports nothing and may
+    // carry no commands, so a marker attached there would be dropped without a trace. Issuing the
+    // finalization first is what guarantees it is answered before `RemoveFromCache` goes out.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        marker_then_replacement_history(1, ParkReason::Shutdown, b"before-eviction-terminal"),
+        [1],
+        mock_worker_client(),
+    );
+    let collected = markers.clone();
+    let recorder = forced.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        for _ in 0..4 {
+            let collected = collected.clone();
+            let recorder = recorder.clone();
+            asserts.then(move |wft| {
+                collected.lock().extend(stream_markers(wft));
+                recorder.lock().push(wft.force_create_new_workflow_task);
+            });
+        }
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+        // Core's own default, which Python does not override: a pending eviction and its reply
+        // count as pending work. The test helper flips it, and with it flipped the Run would be
+        // dropped at shutdown before its eviction activation was ever issued -- which is the very
+        // ordering under test here.
+        w.ignore_evicts_on_shutdown = false;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"before-eviction", false),
+                quiescent_command(1, &[1], Duration::from_secs(30)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    worker.request_workflow_eviction(&run_id);
+
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&finalize),
+        vec![(1, ParkReason::Shutdown, vec![1])],
+        "the finalization must be issued before the eviction, got {:?}",
+        finalize.jobs
+    );
+    assert!(
+        !finalize.is_only_eviction(),
+        "the eviction must not have overtaken the finalization"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(1, b"-terminal"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        *markers.lock(),
+        vec![(
+            1,
+            ParkReason::Shutdown,
+            b"before-eviction-terminal".to_vec()
+        )],
+        "the marker rides the finalization completion"
+    );
+    assert_eq!(*forced.lock(), vec![true]);
+
+    // Only now does the eviction go out, and it adds nothing to what was already written.
+    let evict = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        evict.is_only_eviction(),
+        "the eviction follows the finalization, got {:?}",
+        evict.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        markers.lock().len(),
+        1,
+        "one Workflow Task gets one marker, and the eviction completion writes none"
+    );
+    assert_eq!(*forced.lock(), vec![true]);
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
 // --- the reserved wake Signal (C11) ------------------------------------------
 
 /// A `WakeSignal` payload, serialized exactly the way a producer sends one.
@@ -2929,4 +3280,92 @@ async fn a_marker_no_machine_expects_is_reported_as_nondeterminism() {
 
     worker.shutdown().await;
     worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn the_replay_worker_claims_a_marker_followed_by_langs_own_command() {
+    // The shape a real Worker actually writes, driven through the entry point lang's `Replayer`
+    // actually uses.
+    //
+    // Core emits the marker command *before* lang's commands are pushed into the machines, so in
+    // History the marker sits between the Workflow Task's completion and the command that task
+    // produced. On replay the lookahead has to claim that marker; if it does not, the marker event
+    // reaches the next machine in the command queue -- lang's timer -- and replay fails with a
+    // nondeterminism error naming a machine that has nothing to do with streams.
+    //
+    // `init_replay_worker` rather than a mock poller because that is the path a whole-history
+    // replay takes: one poll response carrying every event, a previous-started id from the *last*
+    // Workflow Task, and no live task ever arriving. The mock-poller tests reach the same machines
+    // by a different route and would not have caught a difference between the two.
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_external_stream_marker_covering(
+        2,
+        ParkReason::CommandsProduced,
+        b"header.segment.terminal",
+        &[(1, 0)],
+    );
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+
+    let worker = crate::init_replay_worker(crate::replay::ReplayWorkerInput::new(
+        crate::test_help::test_worker_cfg().build().unwrap(),
+        futures_util::stream::iter([crate::replay::HistoryForReplay::from(t)]),
+    ))
+    .unwrap();
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(
+        replay_jobs(&replayed),
+        vec![(
+            2,
+            ParkReason::CommandsProduced,
+            vec![(1, 0)],
+            b"header.segment.terminal".to_vec()
+        )],
+        "the lookahead must claim the marker even though lang's own command follows it in the \
+         same Workflow Task, got {:?}",
+        replayed.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(3))],
+        ))
+        .await
+        .unwrap();
+
+    // Reaching the timer at all is the second half of the assertion: the marker was consumed by
+    // the machine lookahead created for it, so the command queue still lines up with history.
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        fired.jobs.iter().any(|j| matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::FireTimer(_))
+        )),
+        "the timer that followed the marker must still match its event, got {:?}",
+        fired.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            fired.run_id.clone(),
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+
+    // The replay worker ends the stream only when the history ran to completion without a
+    // nondeterminism failure, so this is what makes the whole replay -- not just the two
+    // activations above -- the thing under test.
+    assert!(
+        matches!(
+            worker.poll_workflow_activation().await,
+            Err(PollError::ShutDown)
+        ),
+        "replay must run the history to its end"
+    );
 }
