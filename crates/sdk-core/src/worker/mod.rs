@@ -1506,19 +1506,6 @@ impl Worker {
         }
     }
 
-    /// Test-only reach into the park-result input, which lang's completion will carry (C8).
-    #[cfg(test)]
-    pub(crate) fn notify_external_stream_park_result(
-        &self,
-        run_id: &str,
-        quiescence_generation: u64,
-        confirmed: bool,
-    ) {
-        if let Some(workflows) = self.task_subsystems.workflows.as_ref() {
-            workflows.notify_external_stream_park_result(run_id, quiescence_generation, confirmed);
-        }
-    }
-
     /// Test scaffolding: put a cached run's external stream wait set into a given state.
     #[cfg(test)]
     pub(crate) async fn seed_external_stream_waits(

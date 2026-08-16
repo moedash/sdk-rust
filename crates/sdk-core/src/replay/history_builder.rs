@@ -14,7 +14,7 @@ use temporalio_common::protos::{
             build_local_activity_marker_details,
         },
         external_data::{
-            ExternalStreamMarkerData, LocalActivityMarkerData, ParkReason,
+            ExternalStreamMarkerData, ExternalWaitMarker, LocalActivityMarkerData, ParkReason,
             build_external_stream_marker_details,
         },
         workflow_commands::ScheduleActivity,
@@ -346,10 +346,35 @@ impl TestHistoryBuilder {
         terminal_boundary: ParkReason,
         replay_annotation: &[u8],
     ) {
+        self.add_external_stream_marker_covering(
+            quiescence_generation,
+            terminal_boundary,
+            replay_annotation,
+            &[],
+        );
+    }
+
+    /// Add an External Workflow Stream marker recording the waits it closed.
+    ///
+    /// The wait list is what replay hands back to lang alongside the annotation, so a test that
+    /// asserts a replayed set was resolved from history needs a marker that actually names one.
+    pub fn add_external_stream_marker_covering(
+        &mut self,
+        quiescence_generation: u64,
+        terminal_boundary: ParkReason,
+        replay_annotation: &[u8],
+        waits: &[(u32, u64)],
+    ) {
         let data = ExternalStreamMarkerData {
             schema_version: 1,
             quiescence_generation,
-            waits: vec![],
+            waits: waits
+                .iter()
+                .map(|(wait_id, generation)| ExternalWaitMarker {
+                    wait_id: *wait_id,
+                    generation: *generation,
+                })
+                .collect(),
             replay_annotation: replay_annotation.to_vec(),
             terminal_boundary: terminal_boundary as i32,
         };

@@ -16,11 +16,6 @@
 //! `park_generation` is not a fourth counter: it takes the value of the `quiescence_generation`
 //! that was parked.
 
-// Some of this lands before the code that drives it: the annotation buffer and its invariant wait
-// on C14a/C14b, the all-fenced park trigger on C8, and the wake-generation check on C11. Until
-// then only the unit tests below reach them.
-#![allow(dead_code)]
-
 use std::{collections::HashMap, time::Duration};
 
 /// The reserved `park_generation` meaning "the sender knows of no confirmed park".
@@ -251,6 +246,7 @@ pub(crate) struct ExternalWaitSet {
 }
 
 impl ExternalWaitSet {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -263,6 +259,12 @@ impl ExternalWaitSet {
         self.quiescence_generation
     }
 
+    /// The confirmed park generation, if the set is parked.
+    ///
+    /// Only the unit tests below read this directly; the run's own paths ask
+    /// [`Self::accepts_wake_generation`] or [`Self::run_status`] instead, both of which answer a
+    /// question about the set rather than handing out the number.
+    #[cfg(test)]
     pub(crate) fn park_generation(&self) -> Option<u64> {
         self.park_generation
     }
@@ -450,7 +452,11 @@ impl ExternalWaitSet {
             // A park generation *is* the quiescence generation that was parked, not a fourth
             // counter, which is what lets a wake Signal carry one number that Core can match.
             self.park_generation = Some(quiescence_generation);
-            self.wft_open = false;
+            // `wft_open` deliberately stays as it was. The Workflow Task is still open at this
+            // instant -- Core is about to write the park's marker on it and only then complete it
+            // -- and clearing it here would make `take_annotation` refuse the very annotation the
+            // confirmation just supplied the terminal for. The task is closed by
+            // `mark_wft_complete`, which is where every other completion path closes it too.
             ParkResolution::Confirmed
         } else {
             self.abort_parking();
@@ -479,6 +485,20 @@ impl ExternalWaitSet {
     pub(crate) fn mark_all_ready_for_wake(&mut self) {
         self.park_generation = None;
         self.wft_open = true;
+        self.mark_all_ready();
+    }
+
+    /// Marks every wait ready because a park handshake's final recheck found records.
+    ///
+    /// All of them, for the same reason parking is all-or-nothing: the recheck covered every
+    /// stream, so any of them may now have data, and lang probes them all on the resolve anyway.
+    /// Unlike a wake, this leaves `park_generation` and `wft_open` alone -- no park was ever
+    /// confirmed and the Workflow Task never stopped being open.
+    pub(crate) fn mark_all_ready_after_aborted_park(&mut self) {
+        self.mark_all_ready();
+    }
+
+    fn mark_all_ready(&mut self) {
         for wait in self.waits.values_mut() {
             wait.status = ExternalWaitStatus::Ready;
             self.ready.insert(wait.wait_id, wait.wait_generation);
@@ -731,6 +751,45 @@ mod tests {
         assert_eq!(set.notify_ready(1, 0), ReadinessOutcome::Parked);
         assert_eq!(set.park_generation(), Some(quiesc));
         assert!(!set.retains_wft());
+    }
+
+    #[test]
+    fn a_confirmed_park_leaves_its_own_marker_writable() {
+        // The confirmation is what supplies the terminal, and the marker carrying it is written
+        // on the still-open Workflow Task. If confirming closed the task here, the annotation the
+        // confirmation just completed would be refused by the unwritten-annotation invariant and
+        // the park could never write anything.
+        let mut set = quiescent_set(&[1]);
+        let quiesc = set.quiescence_generation();
+        set.accumulate_annotation(b"observed");
+        set.start_parking(quiesc, ParkTrigger::IdleTimeout);
+
+        assert_eq!(set.resolve_park(quiesc, true), ParkResolution::Confirmed);
+
+        set.accumulate_annotation(b"-terminal");
+        assert_eq!(
+            set.take_annotation().unwrap(),
+            b"observed-terminal".to_vec()
+        );
+    }
+
+    #[test]
+    fn an_aborted_park_makes_every_wait_ready_at_its_new_generation() {
+        // The recheck that abandoned the park covered every stream, so every wait is re-probed.
+        // The ids must be published at the *bumped* generations, or the resolve activation would
+        // name blocks that the abort has already superseded.
+        let mut set = quiescent_set(&[1, 2]);
+        let quiesc = set.quiescence_generation();
+        set.start_parking(quiesc, ParkTrigger::AllWriteFenced);
+        assert_eq!(set.resolve_park(quiesc, false), ParkResolution::Aborted);
+
+        set.mark_all_ready_after_aborted_park();
+
+        assert_eq!(set.take_ready_wait_ids(), vec![1, 2]);
+        assert_eq!(set.wait(1).unwrap().wait_generation, 1);
+        assert_eq!(set.wait(1).unwrap().status, ExternalWaitStatus::Ready);
+        // Nothing was parked, so no generation is left for a producer to claim.
+        assert_eq!(set.park_generation(), None);
     }
 
     #[test]
