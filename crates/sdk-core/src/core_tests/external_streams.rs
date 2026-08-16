@@ -7,13 +7,15 @@
 
 use crate::{
     ExternalStreamReadyResult, ExternalStreamRunStatus,
-    replay::canned_histories,
+    replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, WorkerExt, build_fake_worker, build_mock_pollers, mock_worker, start_timer_cmd,
     },
     worker::client::mocks::mock_worker_client,
 };
+use prost::Message as _;
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -22,6 +24,7 @@ use std::{
 };
 use temporalio_common::{
     protos::coresdk::{
+        external_stream::{self, WakeSignal},
         workflow_activation::workflow_activation_job,
         workflow_commands::{
             CompleteWorkflowExecution, ExternalStreamWait, WorkflowStreamProgress,
@@ -29,6 +32,7 @@ use temporalio_common::{
         },
         workflow_completion::WorkflowActivationCompletion,
     },
+    protos::temporal::api::{common::v1::Payload, enums::v1::EventType},
     worker::WorkerTaskTypes,
 };
 
@@ -1173,6 +1177,254 @@ async fn a_budget_rollover_forces_a_replacement_without_a_deadline() {
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+// --- the reserved wake Signal (C11) ------------------------------------------
+
+/// A `WakeSignal` payload, serialized exactly the way a producer sends one.
+///
+/// Built with the protocol's own serialization rather than through a
+/// `DataConverter`, because Core is the component that has to read it.
+fn wake_payload(wake: WakeSignal) -> Payload {
+    Payload {
+        metadata: HashMap::from([
+            ("encoding".to_string(), b"binary/protobuf".to_vec()),
+            (
+                "messageType".to_string(),
+                external_stream::WAKE_SIGNAL_MESSAGE_TYPE
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ]),
+        data: wake.encode_to_vec(),
+        ..Default::default()
+    }
+}
+
+fn wake(park_generation: u64, first_execution_run_id: &str) -> WakeSignal {
+    WakeSignal {
+        envelope_version: external_stream::WAKE_SIGNAL_ENVELOPE_VERSION,
+        stream_name: "tokens".to_string(),
+        wait_id: 1,
+        park_generation,
+        first_execution_run_id: first_execution_run_id.to_string(),
+        producer_session_id: "producer-a".to_string(),
+    }
+}
+
+/// A worker whose second Workflow Task carries one Signal.
+fn worker_with_a_signal(signal_name: &str, payloads: Vec<Payload>) -> crate::Worker {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_we_signaled(signal_name, payloads);
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "fakeid",
+        t,
+        [1, 2],
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+/// Asserts that a wake Signal which failed validation changed nothing.
+///
+/// Two things must hold, and both are asserted against whatever Core actually produces rather
+/// than against a particular activation shape: the Signal never reaches a user handler, and no
+/// wait is resolved. Whether an activation arrives at all depends on the wait set's state -- a
+/// still-blocked set retains the task and produces nothing, a parked one lets it complete -- and
+/// neither outcome is the point.
+async fn assert_the_wake_changed_nothing(worker: &crate::Worker, run_id: &str) {
+    for _ in 0..4 {
+        let polled = tokio::time::timeout(
+            Duration::from_millis(200),
+            worker.poll_workflow_activation(),
+        )
+        .await;
+        let Ok(Ok(activation)) = polled else {
+            // Nothing further to deliver: the task is retained, or the worker is done.
+            return;
+        };
+
+        assert!(
+            !activation.jobs.iter().any(|j| matches!(
+                j.variant,
+                Some(workflow_activation_job::Variant::SignalWorkflow(_))
+            )),
+            "the reserved Signal must be suppressed whether or not it validates, got {:?}",
+            activation.jobs
+        );
+        assert_eq!(
+            resolve_hints(&activation),
+            Vec::<u32>::new(),
+            "a wake Signal that failed validation must resolve no wait"
+        );
+
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(activation.run_id))
+            .await
+            .unwrap();
+    }
+    let _ = run_id;
+}
+
+/// Completes the first (initialize) task and seeds the wait set for the second.
+async fn advance_to_the_signal_task(
+    worker: &crate::Worker,
+    wait_ids: Vec<u32>,
+    parked_at: Option<u64>,
+) -> String {
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
+        .await
+        .unwrap();
+    worker
+        .seed_external_stream_waits(&run_id, wait_ids, parked_at, false)
+        .await;
+    run_id
+}
+
+#[tokio::test]
+async fn an_unparked_wake_resumes_the_run() {
+    // `park_generation = 0` is the unparked wake: the sender knows of no confirmed park and is
+    // asking for a Workflow Task anyway. Core validates chain identity and otherwise accepts it
+    // as a recheck request, because the runtime rechecks every subscription on wakeup regardless
+    // and an unnecessary one costs at most one empty Workflow Task.
+    let worker = worker_with_a_signal(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(wake(0, ""))],
+    );
+    advance_to_the_signal_task(&worker, vec![1, 2], None).await;
+
+    let second = worker.poll_workflow_activation().await.unwrap();
+
+    // The Signal itself never reaches a user handler, and every active wait is named -- the
+    // Signal's stream is a hint, not an exhaustive claim.
+    assert!(
+        !second.jobs.iter().any(|j| matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::SignalWorkflow(_))
+        )),
+        "the reserved Signal must be suppressed from user handlers, got {:?}",
+        second.jobs
+    );
+    assert_eq!(resolve_hints(&second), vec![1, 2]);
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            second.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_wake_naming_a_recognized_park_generation_resumes_the_run() {
+    // The park handshake that would produce this generation live is C8, so it is injected here
+    // -- what is under test is the classification, not how the generation came to exist.
+    let worker = worker_with_a_signal(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(wake(7, ""))],
+    );
+    advance_to_the_signal_task(&worker, vec![1], Some(7)).await;
+
+    let second = worker.poll_workflow_activation().await.unwrap();
+
+    assert_eq!(resolve_hints(&second), vec![1]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            second.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stale_generation_neither_resumes_nor_reaches_a_handler() {
+    // A *non-zero* generation the Run does not recognise is a claim that turned out to be wrong,
+    // so it is ignored -- but it is still suppressed, because a Signal that failed validation
+    // reaching Workflow code as an unhandled Signal would be worse than dropping it.
+    let worker = worker_with_a_signal(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(wake(99, ""))],
+    );
+    let run_id = advance_to_the_signal_task(&worker, vec![1], Some(7)).await;
+
+    assert_the_wake_changed_nothing(&worker, &run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unknown_envelope_version_is_ignored_harmlessly() {
+    // An old Core must not break because a newer producer learned a new field.
+    let mut envelope = wake(0, "");
+    envelope.envelope_version = 99;
+    let worker = worker_with_a_signal(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(envelope)],
+    );
+    let run_id = advance_to_the_signal_task(&worker, vec![1], None).await;
+
+    assert_the_wake_changed_nothing(&worker, &run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_foreign_chain_neither_resumes_nor_reaches_a_handler() {
+    // Same chain plus an unknown generation is harmless; a *different* chain is a mis-addressed
+    // message, and honouring it would wake a Workflow on another Workflow's data.
+    let worker = worker_with_a_signal(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(wake(0, "some-other-chain"))],
+    );
+    let run_id = advance_to_the_signal_task(&worker, vec![1], None).await;
+
+    assert_the_wake_changed_nothing(&worker, &run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ordinary_signal_still_reaches_its_handler() {
+    // The interception must be by name and nothing else.
+    let worker = worker_with_a_signal("a-user-signal", vec![]);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(first.run_id))
+        .await
+        .unwrap();
+
+    let second = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        second.jobs.iter().any(|j| matches!(
+            &j.variant,
+            Some(workflow_activation_job::Variant::SignalWorkflow(s))
+                if s.signal_name == "a-user-signal"
+        )),
+        "an ordinary Signal must reach its handler, got {:?}",
+        second.jobs
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            second.run_id,
             vec![CompleteWorkflowExecution::default().into()],
         ))
         .await

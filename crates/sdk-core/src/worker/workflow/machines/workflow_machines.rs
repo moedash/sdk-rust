@@ -61,8 +61,10 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_stream,
             workflow_activation::{
-                self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
+                self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, WorkflowActivationJob,
+                workflow_activation_job,
             },
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
@@ -97,6 +99,9 @@ pub(crate) struct WorkflowMachines {
     pending_notifications: Vec<Notification>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
+    /// Reserved external stream wake Signals seen in history, decoded and suppressed from user
+    /// dispatch, waiting to be classified against the run's wait set.
+    pending_external_stream_wakes: Vec<external_stream::WakeSignal>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
     /// The event id of the next workflow task started event that the machines need to process.
@@ -297,6 +302,7 @@ impl WorkflowMachines {
             wft_start_time: None,
             current_wf_time: None,
             observed_internal_flags: Rc::new(RefCell::new(observed_internal_flags)),
+            pending_external_stream_wakes: vec![],
             history_size_bytes: 0,
             continue_as_new_suggested: false,
             suggest_continue_as_new_reasons: Default::default(),
@@ -483,6 +489,19 @@ impl WorkflowMachines {
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
         }
+    }
+
+    /// Takes any jobs queued since the last activation was built.
+    pub(crate) fn drain_pending_jobs(&mut self) -> Vec<WorkflowActivationJob> {
+        self.drive_me.drain_jobs()
+    }
+
+    /// Wake Signals decoded from history and not yet validated against the wait set.
+    ///
+    /// Validation needs the run's wait set, which lives on `ManagedRun`, so the two steps are
+    /// split: decode and suppress here, classify there.
+    pub(crate) fn take_external_stream_wakes(&mut self) -> Vec<external_stream::WakeSignal> {
+        std::mem::take(&mut self.pending_external_stream_wakes)
     }
 
     /// Queue a Core-generated job for lang.
@@ -1063,9 +1082,23 @@ impl WorkflowMachines {
                     attrs,
                 )) = event_dat.event.attributes
                 {
-                    self.drive_me.send_job(
-                        workflow_activation::SignalWorkflow::from((attrs, event_id)).into(),
-                    );
+                    if attrs.signal_name == external_stream::WAKE_SIGNAL_NAME {
+                        // Suppressed from user handlers **whether or not it decodes**, so an
+                        // unknown envelope version or a stale generation can never surface in
+                        // Workflow code as an unhandled Signal. Decoded without a DataConverter
+                        // because Core is the component that has to read it, and a user codec
+                        // that encrypts payloads would make it unreadable to exactly that
+                        // component.
+                        if let Some(wake) = decode_wake_signal(&attrs) {
+                            self.pending_external_stream_wakes.push(wake);
+                        } else {
+                            debug!("Ignoring an unreadable external stream wake Signal");
+                        }
+                    } else {
+                        self.drive_me.send_job(
+                            workflow_activation::SignalWorkflow::from((attrs, event_id)).into(),
+                        );
+                    }
                 } else {
                     // err
                 }
@@ -1882,6 +1915,28 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+/// Decodes a reserved wake Signal's envelope **without** a `DataConverter`.
+///
+/// Returns `None` for anything unreadable -- wrong metadata, an unknown envelope version, or
+/// bytes that are not a `WakeSignal`. All of those are ignored harmlessly rather than failing the
+/// Workflow Task: an old Core must not break because a newer producer learned a new field, and
+/// the Signal carries no user data whose loss would matter.
+fn decode_wake_signal(
+    attrs: &temporalio_common::protos::temporal::api::history::v1::WorkflowExecutionSignaledEventAttributes,
+) -> Option<external_stream::WakeSignal> {
+    let payload = attrs.input.as_ref()?.payloads.first()?;
+    let message_type = payload.metadata.get("messageType").map(|v| v.as_slice());
+    if message_type != Some(external_stream::WAKE_SIGNAL_MESSAGE_TYPE.as_bytes()) {
+        return None;
+    }
+    let wake =
+        <external_stream::WakeSignal as prost::Message>::decode(payload.data.as_slice()).ok()?;
+    if wake.envelope_version != external_stream::WAKE_SIGNAL_ENVELOPE_VERSION {
+        return None;
+    }
+    Some(wake)
 }
 
 /// Keep one notification per channel, in order of first appearance. A later one replaces

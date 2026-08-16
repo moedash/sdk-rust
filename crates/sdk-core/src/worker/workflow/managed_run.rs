@@ -275,6 +275,19 @@ impl ManagedRun {
             r
         };
 
+        // A wake Signal reaches Core as a history event, so it can only be classified once that
+        // history has been applied. The first valid one creates or accompanies this task.
+        let mut activation = activation;
+        if self.apply_external_stream_wakes() {
+            self.waiting_on_local_work
+                .external_wait_set
+                .set_wft_open(true);
+            self.maybe_issue_external_stream_resolve();
+            activation
+                .jobs
+                .extend(self.wfm.machines.drain_pending_jobs());
+        }
+
         if activation.jobs.is_empty() {
             if self.wfm.machines.outstanding_local_activity_count() > 0 {
                 // If the activation has no jobs but there are outstanding LAs, we need to restart
@@ -1172,6 +1185,66 @@ impl ManagedRun {
             Err(err) => self.update_to_acts(Err(err)),
         };
         (outcome.into(), act)
+    }
+
+    /// Classifies the wake Signals the machines decoded out of this task's history.
+    ///
+    /// Returns `true` if any of them should wake the Run. Every one is suppressed from user
+    /// handlers regardless -- that already happened in the machines -- so what is decided here is
+    /// only whether the Run resumes.
+    fn apply_external_stream_wakes(&mut self) -> bool {
+        let wakes = self.wfm.machines.take_external_stream_wakes();
+        if wakes.is_empty() {
+            return false;
+        }
+        let chain = self
+            .wfm
+            .machines
+            .get_started_info()
+            .map(|info| info.first_execution_run_id.clone())
+            .unwrap_or_default();
+
+        let mut resume = false;
+        for wake in wakes {
+            // Chain identity, not Run identity. The Signal is addressed to the Workflow ID
+            // without a Run ID, so it always lands on the current Run of the chain -- and a
+            // Signal from a *different* chain is a mis-addressed message, not a stale one.
+            //
+            // Compared strictly, including when this run's chain id is unknown: a Signal naming
+            // a chain we cannot confirm is ours is exactly the case that must not be honoured.
+            if wake.first_execution_run_id != chain {
+                debug!(
+                    signalled_chain = %wake.first_execution_run_id,
+                    "Rejecting an external stream wake Signal for a different chain"
+                );
+                continue;
+            }
+            if !self
+                .waiting_on_local_work
+                .external_wait_set
+                .accepts_wake_generation(wake.park_generation)
+            {
+                // A *non-zero* generation this Run does not recognise is a claim that turned out
+                // to be wrong. Generation 0 is never rejected here: it is the unparked wake, and
+                // an unnecessary one costs at most one empty Workflow Task.
+                debug!(
+                    park_generation = wake.park_generation,
+                    "Ignoring a stale external stream wake Signal"
+                );
+                continue;
+            }
+            resume = true;
+        }
+
+        if resume {
+            // The Signal names one stream, but it is only a hint: every active wait is marked so
+            // lang rechecks all of them on wakeup. A wake for a stream that turns out to have
+            // nothing costs one empty drain, and missing one costs a stalled Workflow.
+            self.waiting_on_local_work
+                .external_wait_set
+                .mark_all_ready_for_wake();
+        }
+        resume
     }
 
     /// Queues one `ResolveExternalStreamWaits` if readiness is pending and a task can carry it.

@@ -471,6 +471,20 @@ impl ExternalWaitSet {
         }
     }
 
+    /// Marks every wait ready because a wake Signal arrived.
+    ///
+    /// All of them, not just the one the Signal names: the Signal's stream is a hint, and lang
+    /// rechecks every active subscription on wakeup regardless. A parked set is also released
+    /// here -- the whole point of the wake is that the park is over.
+    pub(crate) fn mark_all_ready_for_wake(&mut self) {
+        self.park_generation = None;
+        self.wft_open = true;
+        for wait in self.waits.values_mut() {
+            wait.status = ExternalWaitStatus::Ready;
+            self.ready.insert(wait.wait_id, wait.wait_generation);
+        }
+    }
+
     /// Validates a wake Signal's `park_generation` against this Run.
     ///
     /// `park_generation = 0` is the unparked wake and is always accepted as a recheck request:
