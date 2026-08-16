@@ -1955,6 +1955,9 @@ enum CommandID {
 #[derive(Debug, Clone)]
 struct WorkflowStartedInfo {
     workflow_task_timeout: Option<Duration>,
+    /// Chain identity, not this Run's id. A wake Signal names it so Core can tell "same chain,
+    /// stale generation" -- harmless -- from "different chain" -- rejected.
+    first_execution_run_id: String,
     memo: Option<Memo>,
     search_attrs: Option<SearchAttributes>,
     retry_policy: Option<RetryPolicy>,
