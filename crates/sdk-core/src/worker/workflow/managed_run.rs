@@ -37,6 +37,7 @@ use temporalio_common::protos::{
     TaskToken,
     coresdk::{
         common::ExternalStorageMetrics,
+        external_data::{ExternalStreamMarkerData, ExternalWaitMarker, ParkReason},
         workflow_activation::{
             ResolveExternalStreamWaits, WorkflowActivation, create_evict_activation, query_to_job,
             remove_from_cache::EvictionReason, workflow_activation_job,
@@ -234,6 +235,12 @@ impl ManagedRun {
         }
 
         self.paginator = Some(pwft.paginator);
+        // A Workflow Task is open from here until it is reported. The unwritten-annotation
+        // invariant is stated against *that*, not against quiescence -- a task can accumulate a
+        // delta and complete without ever asking to be retained.
+        self.waiting_on_local_work
+            .external_wait_set
+            .set_wft_open(true);
         self.wft = Some(OutstandingTask {
             info: wft_info,
             pending_queries,
@@ -806,7 +813,8 @@ impl ManagedRun {
         // A run-level rollover deadline forces a replacement task on its own, with no local
         // activity involved -- which is the whole point of the deadline being the run's rather
         // than the local-activity subsystem's.
-        let completing_rollover = mem::take(&mut self.waiting_on_local_work.rollover_pending);
+        let completing_deadline_rollover =
+            mem::take(&mut self.waiting_on_local_work.deadline_rollover_pending);
         let data = CompletionDataForWFT {
             task_token: completion.task_token,
             query_responses: completion.query_responses,
@@ -863,11 +871,49 @@ impl ManagedRun {
             if progress.request_rollover {
                 // Lang decided this boundary, so the rollover needs no finalization round trip --
                 // this very command already carried the terminal.
-                self.waiting_on_local_work.rollover_pending = true;
+                self.waiting_on_local_work.budget_rollover_pending = true;
             }
         }
-        let completing_rollover =
-            completing_rollover || mem::take(&mut self.waiting_on_local_work.rollover_pending);
+        let completing_budget_rollover =
+            mem::take(&mut self.waiting_on_local_work.budget_rollover_pending);
+        let completing_rollover = completing_deadline_rollover || completing_budget_rollover;
+
+        // Whether this completion retains the task, decided before anything is pushed into the
+        // machines so the marker can be ordered ahead of lang's own commands.
+        let will_retain = stream_commands.quiescence.is_some()
+            && !has_server_bound_commands
+            && !data.activation_was_eviction
+            && data.query_responses.is_empty();
+
+        // `WorkflowStreamProgress` precedes every command whose value could depend on the
+        // consumed data, and so must the marker recording it. Emitting after lang's commands were
+        // pushed would put the marker *after* the terminal command in History, and on replay the
+        // command would then be matched before the record it came from was validated.
+        if !will_retain {
+            let terminal = if completing_budget_rollover {
+                Some(ParkReason::BudgetRollover)
+            } else if lang_commands.iter().any(|c| c.variant.is_terminal()) {
+                Some(ParkReason::WorkflowCompleted)
+            } else if has_server_bound_commands {
+                Some(ParkReason::CommandsProduced)
+            } else if completing_deadline_rollover {
+                // Core decided this boundary and lang was never asked for a terminal, so there is
+                // nothing to write. Obtaining one is the finalization round trip's job (C15a) and
+                // integrating it is C12b's; until then the annotation stays accumulated and the
+                // replacement task carries it forward.
+                None
+            } else {
+                Some(ParkReason::TaskCompleted)
+            };
+            if let Some(terminal) = terminal
+                && let Err(source) = self.emit_external_stream_marker(terminal)
+            {
+                return Err(RunUpdateErr {
+                    source,
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+        }
 
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
@@ -913,9 +959,7 @@ impl ManagedRun {
                 // the server can act on it; the subscriptions stay registered and are woken by
                 // the wake Signal instead.
                 if let Some(request) = stream_commands.quiescence
-                    && !has_server_bound_commands
-                    && !data.activation_was_eviction
-                    && data.query_responses.is_empty()
+                    && will_retain
                 {
                     self.begin_external_stream_quiescence(request);
                     return Ok(Some(FulfillableActivationComplete {
@@ -982,7 +1026,10 @@ impl ManagedRun {
                     // pending has not been acted on and must stay pending -- otherwise the
                     // deadline would be silently swallowed by the very completion that keeps the
                     // task open past it.
-                    self.waiting_on_local_work.rollover_pending |= completing_rollover;
+                    self.waiting_on_local_work.deadline_rollover_pending |=
+                        completing_deadline_rollover;
+                    self.waiting_on_local_work.budget_rollover_pending |=
+                        completing_budget_rollover;
                     Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -1020,6 +1067,46 @@ impl ManagedRun {
             .machines
             .get_started_info()
             .and_then(|attrs| attrs.workflow_task_timeout)
+    }
+
+    /// Writes the marker for a Workflow Task lang itself closed.
+    ///
+    /// These are the three paths where lang's own `WorkflowStreamProgress` carried the terminal,
+    /// so no finalization round trip is needed -- Core already has everything it needs. The
+    /// Core-decided boundaries (park, rollover deadline, shutdown) each integrate against this
+    /// same primitive but obtain their terminal first.
+    fn emit_external_stream_marker(
+        &mut self,
+        terminal_boundary: ParkReason,
+    ) -> Result<(), WFMachinesError> {
+        let set = &mut self.waiting_on_local_work.external_wait_set;
+        if set.replay_annotation().is_empty() {
+            // Nothing was observed, so there is nothing to record. Not an error: a Workflow Task
+            // that touched no stream is the ordinary case.
+            return Ok(());
+        }
+        let quiescence_generation = set.quiescence_generation();
+        let waits = set
+            .marker_waits()
+            .into_iter()
+            .map(|(wait_id, generation)| ExternalWaitMarker {
+                wait_id,
+                generation,
+            })
+            .collect();
+        let replay_annotation = set
+            .take_annotation()
+            .map_err(|err| WFMachinesError::Fatal(err.to_string()))?;
+
+        self.wfm
+            .machines
+            .emit_external_stream_marker(ExternalStreamMarkerData {
+                schema_version: EXTERNAL_STREAM_MARKER_SCHEMA_VERSION,
+                quiescence_generation,
+                waits,
+                replay_annotation,
+                terminal_boundary: terminal_boundary as i32,
+            })
     }
 
     /// Records a quiescent snapshot and starts the timers that bound it.
@@ -1141,7 +1228,7 @@ impl ManagedRun {
     /// readiness generation across that replacement is C12a's.
     pub(super) fn wft_rollover_deadline(&mut self) -> RunUpdateAct {
         self.waiting_on_local_work.wft_rollover_timer = None;
-        self.waiting_on_local_work.rollover_pending = true;
+        self.waiting_on_local_work.deadline_rollover_pending = true;
         let maybe_act = if self.activation.is_none() && self.wft.is_some() {
             Some(ActivationOrAuto::Autocomplete {
                 run_id: self.wfm.machines.run_id.clone(),
@@ -1297,6 +1384,21 @@ impl ManagedRun {
         } else {
             set.set_wft_open(msg.wft_open);
         }
+    }
+
+    /// Test scaffolding -- see [`super::EmitTerminalLessMarkerMsg`].
+    #[cfg(test)]
+    pub(super) fn emit_terminal_less_marker(&mut self) -> bool {
+        self.wfm
+            .machines
+            .emit_external_stream_marker(ExternalStreamMarkerData {
+                schema_version: EXTERNAL_STREAM_MARKER_SCHEMA_VERSION,
+                quiescence_generation: 1,
+                waits: vec![],
+                replay_annotation: b"no terminal here".to_vec(),
+                terminal_boundary: ParkReason::Unspecified as i32,
+            })
+            .is_err()
     }
 
     /// The accumulated, unwritten replay annotation. Core never parses it.
@@ -1842,6 +1944,11 @@ fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
     act.jobs.extend(query_jobs);
 }
 
+/// The annotation format version this Core writes.
+///
+/// Leads the marker envelope so a marker written by an older SDK stays readable.
+const EXTERNAL_STREAM_MARKER_SCHEMA_VERSION: u32 = 1;
+
 /// Lang's `WorkflowStreamQuiescent`, validated.
 struct QuiescenceRequest {
     waits: Vec<ExternalWaitState>,
@@ -1962,8 +2069,13 @@ struct WaitingOnLocalWork {
     /// Separate from the local-activity heartbeat handle: a retained task needs a rollover
     /// deadline whether or not any local activity is outstanding.
     wft_rollover_timer: Option<AbortHandle>,
-    /// Set when that deadline expired. Flows into `force_new_wft` on the next completion.
-    rollover_pending: bool,
+    /// Set when the *deadline* expired. Forces a replacement task -- but writes no marker, because
+    /// Core decided this boundary and has no terminal for it until finalization supplies one.
+    deadline_rollover_pending: bool,
+    /// Set when *lang* asked for a rollover at the annotation byte budget. Also forces a
+    /// replacement task, and unlike the deadline it may write its marker immediately: the very
+    /// command that asked for it already carried the terminal.
+    budget_rollover_pending: bool,
     /// Cancels the *global* quiescence timer for the external wait set.
     ///
     /// One timer for the whole set. Readiness for any member cancels it, which is what makes an

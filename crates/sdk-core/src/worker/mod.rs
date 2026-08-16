@@ -1459,6 +1459,19 @@ impl Worker {
         workflows.external_stream_run_status(run_id).await
     }
 
+    /// Test-only: drive marker emission with no terminal boundary.
+    #[cfg(test)]
+    pub(crate) async fn emit_terminal_less_external_stream_marker(&self, run_id: &str) -> bool {
+        match self.task_subsystems.workflows.as_ref() {
+            Some(workflows) => {
+                workflows
+                    .emit_terminal_less_external_stream_marker(run_id)
+                    .await
+            }
+            None => false,
+        }
+    }
+
     /// Test-only: read a run's accumulated, unwritten replay annotation.
     #[cfg(test)]
     pub(crate) async fn external_stream_annotation(&self, run_id: &str) -> Vec<u8> {

@@ -34,6 +34,7 @@ use crate::{
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
+                external_stream_state_machine::ExternalStreamMachine,
                 modify_workflow_properties_state_machine::modify_workflow_properties,
                 nexus_operation_state_machine::NexusOperationMachine,
                 update_state_machine::UpdateMachine,
@@ -61,6 +62,7 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_data::{ExternalStreamMarkerData, ParkReason},
             external_stream,
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, WorkflowActivationJob,
@@ -489,6 +491,35 @@ impl WorkflowMachines {
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
         }
+    }
+
+    /// Emits **exactly one** marker for this Workflow Task's accumulated annotation.
+    ///
+    /// The refusal below belongs to emission itself and needs no finalization job to state it: an
+    /// annotation without its terminal is durable and wrong, while an abandoned Workflow Task
+    /// commits no cursor and loses no record. So there is no best-effort path -- if the terminal
+    /// is missing, nothing is written and the task fails for retry.
+    pub(crate) fn emit_external_stream_marker(
+        &mut self,
+        data: ExternalStreamMarkerData,
+    ) -> Result<()> {
+        if data.terminal_boundary() == ParkReason::Unspecified {
+            return Err(fatal!(
+                "Refusing to write an external stream marker with no terminal boundary for \
+                 quiescence generation {}",
+                data.quiescence_generation
+            ));
+        }
+        let replaying = self.replaying;
+        self.add_cmd_to_wf_task(
+            ExternalStreamMachine::new(data, replaying),
+            Default::default(),
+            CommandIdKind::CoreInternal,
+        );
+        // Core generates this command *after* lang's own iteration has already prepared its
+        // commands, so it has to prepare its own. Without this the marker sits in the current
+        // task's queue and never reaches the server -- silently, since nothing else looks there.
+        self.prepare_commands()
     }
 
     /// Takes any jobs queued since the last activation was built.

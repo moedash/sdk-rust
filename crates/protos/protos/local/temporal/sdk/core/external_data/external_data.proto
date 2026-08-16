@@ -62,6 +62,10 @@ enum ParkReason {
   PARK_REASON_COMMANDS_PRODUCED = 6;
   // The completion carried a terminal command -- complete, fail, cancel, or continue-as-new.
   PARK_REASON_WORKFLOW_COMPLETED = 7;
+  // The Workflow Task completed normally with nothing else to report: records were consumed and
+  // no stream wait remained pending. Distinct from PARK_REASON_COMMANDS_PRODUCED so the marker
+  // says which of the two it actually was rather than implying commands that never existed.
+  PARK_REASON_TASK_COMPLETED = 8;
 }
 
 // What Core writes into a marker for a Workflow Task that consumed external streams. Exactly one

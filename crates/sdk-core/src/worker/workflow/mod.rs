@@ -782,6 +782,20 @@ impl Workflows {
         });
     }
 
+    /// Test scaffolding -- see [`EmitTerminalLessMarkerMsg`].
+    #[cfg(test)]
+    pub(super) fn emit_terminal_less_external_stream_marker(
+        &self,
+        run_id: impl Into<String>,
+    ) -> impl Future<Output = bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send_local(EmitTerminalLessMarkerMsg {
+            run_id: run_id.into(),
+            response_tx: tx,
+        });
+        async move { rx.await.unwrap_or(false) }
+    }
+
     /// Test scaffolding -- see [`ExternalStreamAnnotationMsg`].
     #[cfg(test)]
     pub(super) fn external_stream_annotation(
@@ -1509,6 +1523,17 @@ pub(crate) struct ExternalStreamRunStatusMsg {
 /// C8's handshake, neither of which exists yet. This rides the same serialized local-input lane
 /// as everything else, so a test that uses it still exercises the real routing rather than
 /// reaching into `ManagedRun`'s state.
+/// Test scaffolding: ask a run to emit a marker with no terminal boundary.
+///
+/// No completion path can produce this, which is exactly why the guard needs driving directly.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct EmitTerminalLessMarkerMsg {
+    pub(crate) run_id: String,
+    /// Whether emission refused. `false` would mean a terminal-less annotation was written.
+    pub(crate) response_tx: oneshot::Sender<bool>,
+}
+
 /// Test scaffolding: read a run's accumulated, unwritten replay annotation.
 #[cfg(test)]
 #[derive(Debug)]
