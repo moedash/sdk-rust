@@ -30,7 +30,7 @@ two communicate through a bounded, thread-safe buffer per subscription:
 | Register | Workflow thread, `subscribe()` | Registers `wait_id → (stream key, backend name, cursor)` with the manager. Non-blocking. |
 | Prefetch | Manager loop | Reads ahead from the cursor into the subscription's bounded buffer. Never calls Workflow code. |
 | Readiness | Manager loop | Reports readiness to Core **only after** a data or control record is buffered — never on a bare socket event. This is what makes the subsequent activation guaranteed non-blocking. |
-| Drain | Workflow thread, `_apply` | Pops from the buffer only. Never performs I/O, never blocks, completes in bounded time. |
+| Drain | Workflow thread, `_apply` | Pops from the buffer only, at most `MAX_RECORDS_PER_ACTIVATION` records. Never performs I/O, so it completes in bounded time. |
 | Advance | Workflow thread | Records the delivery in the observation delta; the manager advances the prefetch cursor from the committed marker, not from delivery. |
 
 ## Three cursors, not one
@@ -58,7 +58,22 @@ past what a marker has committed, so a speculative read can never be mistaken fo
 - **Readiness means "buffered", not "available".** A readiness notification for an unbuffered record
   would produce an activation whose drain must block, reintroducing the deadlock hazard.
 - **Backpressure is the buffer bound.** A full buffer stops prefetch; it never drops records and
-  never blocks the Workflow thread.
+  never blocks the Workflow thread. What it bounds is memory held ahead of delivery, not how much
+  one activation delivers: the watcher refills from the Worker's loop while the Workflow thread
+  drains, so against a producer that keeps the buffer non-empty the buffer bounds nothing at all.
+- **Delivery within one activation is bounded by a record count, never by elapsed time.**
+  `MAX_RECORDS_PER_ACTIVATION` is 256 records handed to Workflow code per activation; the segment
+  that reaches it ends with `BATCH_LIMIT` (`annotation-format.md`). A time-based bound would cut the
+  segment at a nondeterministic point, and because segment boundaries are recorded in the
+  annotation, replay would divide the same records differently and diverge from the live run. When
+  the budget is exhausted the subscription blocks **even though records are still buffered**, and
+  that block is what ends the activation — without it the drain never finishes, because the watcher
+  refills concurrently, and the Workflow Task fails on the 2-second deadlock timeout on every
+  attempt. Exhausting the budget therefore **re-arms readiness for the records still buffered**:
+  otherwise the Workflow waits forever on data already in front of it, since `prefetch_cursor` is
+  already past those records and no further notification is coming. The budget does not apply during
+  replay, where delivery comes from the recorded segments, which already fix how many records each
+  activation received.
 - **Backend latency is invisible to the Workflow thread**, so a backend slower than the 2-second
   deadlock timeout delays readiness rather than failing an activation. A test covers exactly this.
 - **Cancellation** of a subscription drains and discards its buffer, cancels its watcher, and
