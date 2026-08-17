@@ -2817,6 +2817,77 @@ async fn an_unparked_wake_resumes_the_run() {
 }
 
 #[tokio::test]
+async fn an_intercepted_wake_does_not_flag_its_activation_replaying() {
+    // The wake Signal is suppressed from user handlers, so the Workflow Task it arrives on
+    // carries no job of its own and the resolve job is Core's alone. `is_replaying` is derived
+    // from the activation's job list -- "every job is a query" -- and that test is vacuously true
+    // over an empty list, so an activation whose only job is queued after it is built comes out
+    // marked as replay. Lang emits neither stream progress nor quiescence while replaying, so the
+    // wait generation would never advance, every later readiness report would be answered `Stale`
+    // against a watcher cursor that had already moved past those records, and the Workflow would
+    // stall with data sitting in its buffer. This asserts the flag over the same history an
+    // ordinary Signal is not-replaying on, so it catches the flag and not the history.
+    let worker = worker_with_a_signal(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(wake(0, ""))],
+    );
+    advance_to_the_signal_task(&worker, vec![1], None).await;
+
+    let second = worker.poll_workflow_activation().await.unwrap();
+
+    assert_eq!(
+        resolve_hints(&second),
+        vec![1],
+        "the wake must produce the resolve job this test is about, got {:?}",
+        second.jobs
+    );
+    assert!(
+        !second.is_replaying,
+        "an activation carrying a resolve job produced by an intercepted wake Signal is live \
+         work, not replay, got jobs {:?}",
+        second.jobs
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            second.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ordinary_signal_on_the_same_history_is_not_replaying_either() {
+    // The control for the test above: identical history, an ordinary Signal in place of the
+    // reserved one. If this ever starts failing, the replay flag on the wake path is not the
+    // thing at fault -- the history these tests are built on stopped being live work.
+    let worker = worker_with_a_signal("a-user-signal", vec![]);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(first.run_id))
+        .await
+        .unwrap();
+
+    let second = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        !second.is_replaying,
+        "the second Workflow Task of this history is live work, got jobs {:?}",
+        second.jobs
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            second.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
 async fn a_wake_naming_a_recognized_park_generation_resumes_the_run() {
     // The park handshake that would produce this generation live is C8, so it is injected here
     // -- what is under test is the classification, not how the generation came to exist.
