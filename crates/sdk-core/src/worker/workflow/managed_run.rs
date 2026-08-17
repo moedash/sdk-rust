@@ -1246,6 +1246,17 @@ impl ManagedRun {
             .and_then(|attrs| attrs.workflow_task_timeout)
     }
 
+    /// When the workflow task this run currently holds started.
+    ///
+    /// The rollover deadline is anchored here rather than at the moment it is (re)armed, because
+    /// what it bounds is the *task*, not the wait it was armed for.
+    fn current_wft_start_time(&self) -> Instant {
+        self.wft
+            .as_ref()
+            .map(|wft| wft.start_time)
+            .unwrap_or_else(Instant::now)
+    }
+
     /// Writes the marker for a Workflow Task lang itself closed.
     ///
     /// These are the three paths where lang's own `WorkflowStreamProgress` carried the terminal,
@@ -1471,8 +1482,15 @@ impl ManagedRun {
 
         // The rollover deadline is what stops a continuously fed stream -- one whose gaps never
         // reach the idle timeout -- from holding the task until it *fails*.
+        //
+        // It is anchored at the Workflow Task's start, not at this snapshot. Becoming quiescent
+        // again is what a delivered record *does*, so re-anchoring here would push the deadline
+        // out for as long as records keep arriving -- and that is exactly the workload rollover
+        // exists for. The deadline would then never fire, the idle timer is clamped below it and
+        // cannot fire either, and the retained task would run until the server timed it out.
         if let Some(wft_timeout) = wft_timeout {
-            self.start_wft_rollover_timer(Instant::now(), wft_timeout);
+            let started_at = self.current_wft_start_time();
+            self.start_wft_rollover_timer(started_at, wft_timeout);
         }
 
         let idle_timeout = clamp_idle_below_rollover(request.idle_timeout, wft_timeout);
