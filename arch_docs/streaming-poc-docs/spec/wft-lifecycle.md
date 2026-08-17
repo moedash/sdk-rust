@@ -9,7 +9,9 @@ Owned by C6, C7, C8, C12a, C12b, C13, C15b (Core) and P10a, P11, P20 (Python).
 
 When `subscribe()` has demand during an open Workflow Task, the SDK runtime reads from the last
 committed offset and resumes the Workflow for each data record. It continues draining while
-records are available.
+records are available, across as many activations as that takes: one activation delivers at most
+`MAX_RECORDS_PER_ACTIVATION` records and then blocks so the activation can end, even where more
+records are already buffered (`python-runtime.md`).
 
 The runtime parks the subscription and allows the Workflow Task to complete when either:
 
@@ -46,6 +48,10 @@ long, it *fails*. The runtime therefore always runs a rollover deadline derived 
 Task timeout, independent of the idle timeout, and completes the current task early when rollover
 wins. Every active subscription, cursor, annotation delta, and readiness generation survives
 rollover. The idle timeout is clamped below the rollover deadline so rollover stays authoritative.
+
+**Rollover bounds the Workflow Task, not an activation.** Core decides it between activations and
+cannot interrupt one in progress, so it is no protection against a single activation that never
+returns. What bounds an activation is the per-activation record budget in `python-runtime.md`.
 
 Rollover also bounds a second effect of holding a Workflow Task open: while the task is retained,
 the server cannot start another one, so Signals, Updates, and non-legacy Queries queue until the
