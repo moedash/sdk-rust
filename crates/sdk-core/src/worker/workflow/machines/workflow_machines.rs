@@ -67,7 +67,7 @@ use temporalio_common::{
             external_stream,
             workflow_activation::{
                 self, NotifyHasPatch, ReplayExternalStreams, UpdateRandomSeed, WorkflowActivation,
-                WorkflowActivationJob, workflow_activation_job,
+                workflow_activation_job,
             },
             workflow_commands::{ContinueAsNewWorkflowExecution, ExternalStreamWait},
         },
@@ -575,11 +575,6 @@ impl WorkflowMachines {
         let machine = ExternalStreamMachine::resolved_from_marker_lookahead(data);
         let key = self.all_machines.insert(machine.into());
         self.external_stream_marker_machines.push_back(key);
-    }
-
-    /// Takes any jobs queued since the last activation was built.
-    pub(crate) fn drain_pending_jobs(&mut self) -> Vec<WorkflowActivationJob> {
-        self.drive_me.drain_jobs()
     }
 
     /// Wake Signals decoded from history and not yet validated against the wait set.

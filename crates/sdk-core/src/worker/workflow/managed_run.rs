@@ -2,7 +2,7 @@ use crate::{
     MetricsContext, WorkerConfig,
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
-    protosext::{WorkflowActivationExt, protocol_messages::IncomingProtocolMessage},
+    protosext::WorkflowActivationExt,
     worker::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
@@ -270,36 +270,45 @@ impl ManagedRun {
         }
 
         // The update field is only populated in the event we hit the cache
-        let activation = if work.update.is_real() {
+        let update_was_real = work.update.is_real();
+        if update_was_real {
             if is_incremental {
                 self.metrics.sticky_cache_hit();
             }
-            self.wfm.new_work_from_server(work.update, work.messages)?
-        } else {
-            let r = self.wfm.get_next_activation()?;
-            if r.jobs.is_empty() {
-                return Err(RunUpdateErr {
-                    source: crate::worker::workflow::fatal!(
-                        "Machines created for {} with no jobs",
-                        self.wfm.machines.run_id
-                    ),
-                    complete_resp_chan: None,
-                });
-            }
-            r
-        };
+            self.wfm
+                .machines
+                .new_work_from_server(work.update, work.messages)?;
+        }
 
         // A wake Signal reaches Core as a history event, so it can only be classified once that
         // history has been applied. The first valid one creates or accompanies this task.
-        let mut activation = activation;
+        //
+        // This has to happen *before* the activation is built, not after it. `get_wf_activation`
+        // derives `is_replaying` from the job list it drains, and an empty list satisfies the
+        // "every job is a query" test vacuously, so an activation built with no jobs is flagged
+        // replaying. The reserved wake Signal is suppressed from user handlers and therefore
+        // produces no job of its own, which is exactly that case: appending the resolve job after
+        // the build would hand lang a replacement task marked as replay, lang would report
+        // neither stream progress nor quiescence while replaying, the wait generation would never
+        // advance, and every later readiness report would be answered `Stale` while the watcher's
+        // cursor had already moved past those records -- a silent stall. Queueing the job first
+        // lets the flag be computed over a job list that reflects the work being sent.
         if self.apply_external_stream_wakes() {
             self.waiting_on_local_work
                 .external_wait_set
                 .set_wft_open(true);
             self.maybe_issue_external_stream_resolve();
-            activation
-                .jobs
-                .extend(self.wfm.machines.drain_pending_jobs());
+        }
+
+        let activation = self.wfm.get_next_activation()?;
+        if !update_was_real && activation.jobs.is_empty() {
+            return Err(RunUpdateErr {
+                source: crate::worker::workflow::fatal!(
+                    "Machines created for {} with no jobs",
+                    self.wfm.machines.run_id
+                ),
+                complete_resp_chan: None,
+            });
         }
 
         if activation.jobs.is_empty() {
@@ -2582,22 +2591,8 @@ impl WorkflowManager {
         }
     }
 
-    /// Given info that was just obtained from a new WFT from server, pipe it into this workflow's
-    /// machines.
-    ///
-    /// Should only be called when a workflow has caught up on replay (or is just beginning). It
-    /// will return a workflow activation if one is needed.
-    fn new_work_from_server(
-        &mut self,
-        update: HistoryUpdate,
-        messages: Vec<IncomingProtocolMessage>,
-    ) -> Result<WorkflowActivation> {
-        self.machines.new_work_from_server(update, messages)?;
-        self.get_next_activation()
-    }
-
     /// Update the machines with some events from fetching another page of history. Does *not*
-    /// attempt to pull the next activation, unlike [Self::new_work_from_server].
+    /// attempt to pull the next activation, unlike [Self::get_next_activation].
     fn feed_history_from_new_page(&mut self, update: HistoryUpdate) -> Result<()> {
         self.machines.new_history_from_server(update)
     }
