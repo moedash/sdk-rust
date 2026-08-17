@@ -72,6 +72,16 @@ there the sender is making a claim that turned out to be wrong.
   counter, both held fixed across retries of that one attempt. Without that, two Workers shutting
   down at different times would derive the same request ID and the server would deduplicate the
   second wake away — turning a correct retry mechanism into silent loss.
+
+  That sender identity is unique per sender **instance**, drawn once when the sender is constructed
+  and held for its lifetime. The client identity is not enough: two Workers in one process share a
+  `Client` and each one's counter restarts at 1, so their first unparked wakes would derive
+  byte-identical request IDs and the collision above is exactly what happens. Drawn once rather
+than per attempt,
+  because a value that changed between attempts would make the retry a second wake. The value is
+  random, which is safe here because the wake Signal is sent from the Worker's own event loop and
+  never from Workflow code, so it is not replay-visible; the client identity is carried alongside it
+  so a request ID stays traceable to a client in server-side logs.
 - **Chain identity.** `first_execution_run_id` lets Core classify a Signal that arrives after
   Continue-As-New: same chain and a live wait means wake, same chain and an unknown generation means
   ignore harmlessly, different chain means reject. The Signal is addressed to the Workflow ID without
