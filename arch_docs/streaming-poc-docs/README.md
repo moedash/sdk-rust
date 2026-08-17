@@ -15,6 +15,7 @@ alternative was considered and rejected, the reasoning is in `decisions/`, not i
 | Know why something is shaped the way it is | [`decisions/`](decisions/README.md) |
 | Build a piece of it | [`plan/`](plan/README.md) — find your deliverable, follow its spec links |
 | Find a file-and-line anchor in Core or the SDK | [`spec/code-anchors.md`](spec/code-anchors.md) |
+| Trust a test result before acting on it | [`verification-hazards.md`](verification-hazards.md) |
 
 ## Specs — one subsystem per file
 
