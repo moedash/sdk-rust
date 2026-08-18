@@ -106,23 +106,54 @@ uses a generation-based handshake coordinated through the backend:
 1. Core marks every wait `Parking` and sends `PrepareExternalStreamPark`. This is runtime-internal;
    no user Workflow code runs.
 2. Python installs a park intent per **subscription**, keyed `(stream key, wait_id)`, carrying its
-   cursor boundary and the park generation.
-3. After all intents are installed, it rechecks every stream.
+   cursor boundary and the park generation. **The set is the one the job names**, not every
+   subscription the Worker holds: a registered subscription nobody is blocked on could otherwise
+   abort a legitimate park on a record that belongs to no wait Core is parking, and it would leave
+   an intent behind for a park that never covered it.
+3. After all intents are installed, it rechecks every stream in that set.
 4. All still empty → `ParkSetConfirmed`, carrying the terminal `final_observation_delta`. Core
    appends it, records the marker, and completes the WFT.
 5. Any stream ready → Python removes every installed intent and returns `StreamSetBecameReady`. Core
    aborts that parking generation and issues `ResolveExternalStreamWaits`.
+
+An attempt that fails part-way withdraws every intent it installed, whether an install or a recheck
+raised. A park visible to producers for a generation Core never confirmed is one they send wakes
+against and Core discards as stale, and the eviction that follows takes with it the only record that
+those intents were installed at all.
 
 A producer appends its record *before* it observes or claims the park generation, and only then sends
 the wake Signal. That ordering plus the recheck at step 3 is what closes the empty-check/completion
 race: an append is either seen by the recheck or paired with a Signal. Readiness accepted before
 `ParkSetConfirmed` wins, and the confirmation for that generation is then stale.
 
-**A park intent exists only while its park is outstanding**, and both halves of that are obligations.
-Python removes the intents of a park this Run is no longer sitting in — `ResolveExternalStreamWaits`
-is the notice, because it covers both ways a confirmed park ends and Core's own state moving on is
-not something the backend can observe. The provider must stop reporting a generation once its intent
-is removed (`backend-contract.md`), or every reader of that call acts on a park that is over.
+**A park intent exists only while its park is outstanding**, and it takes two enforcement points on
+the consumer side to hold, because the intent is durable backend state while the record of which
+Worker installed it is not.
+
+- **A resolve ends a park this Run is sitting in.** `ResolveExternalStreamWaits` is the notice,
+  because it covers both ways a confirmed park ends and Core's own state moving on is not something
+  the backend can observe. Python removes the intents it installed for that park.
+- **Registration reconciles an intent this Worker inherited.** A Worker registering a wait that
+  already has an intent in the backend, having installed none itself, removes it. Registration is
+  where such an intent becomes visible and where its status is unambiguous: a subscription is
+  registered by user Workflow code running, and no user code runs inside a park, so an intent found
+  there belongs to a park that is over.
+
+The first point alone reaches only the intents whose installer still holds the Run. An eviction, a
+handoff, or a Worker restart takes that record with it and leaves the intent behind for good, and
+every later resolve consults the same missing record. What a left-behind intent costs is the
+invariant's whole point: `current_park_generation` keeps answering a generation Core has discarded,
+each producer wake names it and Core discards it as stale, and because a parked wake's request ID
+ignores sender identity the second such wake is byte-identical to the first and the server
+deduplicates it away. The Workflow waits forever on a record that is durably present.
+
+Reconciliation reads before it writes, and is serialized against this Run's own parking and
+resolving: a Run that never parked owes the backend nothing, and a reconciliation overlapping a
+confirming park must not remove the intent that park has just installed — an unwakeable Run produced
+by the mechanism that exists to prevent one.
+
+The provider holds up the rest: it must stop reporting a generation once its intent is removed
+(`backend-contract.md`), or every reader of that call acts on a park that is over.
 
 ## Three generations, named separately
 

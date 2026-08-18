@@ -37,6 +37,10 @@ scheduling and condition evaluation match.
   `segment_end_reason`.
 - **An empty segment is meaningful** and must round-trip: an activation that drained and found nothing
   still ran one `_run_once`.
+- Segmentation reproduces **how many** drains happened; the global order of runs within a segment
+  reproduces **which wait** each drain served. A replay that kept the segment boundaries but let a
+  drain search the segment for its own wait would reproduce the count and reorder the deliveries,
+  which is the half of the live schedule concurrent coroutines can observe.
 - This is safe with respect to Workflow time: all segments of a marker belong to one Workflow Task, so
   `workflow.now()` is constant across them in both the live run and replay. Commands produced during
   a retained Workflow Task are buffered until the task completes, in both directions.

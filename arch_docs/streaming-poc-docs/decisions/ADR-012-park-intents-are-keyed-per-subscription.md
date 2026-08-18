@@ -40,6 +40,8 @@ replaces its predecessor's for the same key.
   backend or the wire. `wait_generation` never leaves the Core/lang boundary.
 - The parking conformance suite must fail a stub that keys intents by stream alone, using the
   two-subscription case.
-- Claims must be **leased and renewable**: a producer crashing between claiming a generation and
-  signaling must not strand it. A provider that cannot lease must expose observe-only semantics and
-  let every producer signal idempotently.
+- Claims must be **leased and renewable**, so a claim abandoned by a crashed producer becomes
+  takeable rather than standing for the life of the store. The lease is not what keeps such a crash
+  from stranding the generation — a producer that loses the claim signals anyway
+  (`spec/wake-signal.md`). A provider that cannot lease must expose observe-only semantics and let
+  every producer signal idempotently.

@@ -75,8 +75,7 @@ there the sender is making a claim that turned out to be wrong.
   and held for its lifetime. The client identity is not enough: two Workers in one process share a
   `Client` and each one's counter restarts at 1, so their first unparked wakes would derive
   byte-identical request IDs and the collision above is exactly what happens. Drawn once rather
-than per attempt,
-  because a value that changed between attempts would make the retry a second wake. The value is
+  than per attempt, because a value that changed between attempts would make the retry a second wake. The value is
   random, which is safe here because the wake Signal is sent from the Worker's own event loop and
   never from Workflow code, so it is not replay-visible; the client identity is carried alongside it
   so a request ID stays traceable to a client in server-side logs.
@@ -101,8 +100,18 @@ version or a stale generation can never reach Workflow code as an unhandled Sign
 2. Observe or lease-claim the current park generation.
 3. Send the Signal idempotently.
 
-Only successfully appended records may trigger wakeup. Claims are leased and renewable so a producer
-crashing between claim and Signal does not strand the generation — see `backend-contract.md`.
+Only successfully appended records may trigger wakeup: a wake for a record that did not land produces
+a Workflow Task that finds nothing.
+
+**The Signal is sent whether or not the claim was granted.** Losing the claim means another producer
+*intends* to send; it is not evidence that one did. A lease permits takeover once it expires, but it
+schedules nobody to take over, so a producer that crashed between claiming and signalling strands
+the generation until some later append happens along — and the producer that stayed silent has
+already reported an acknowledged wake. Sending anyway costs almost nothing, because a **parked**
+wake's request ID is derived from the generation and ignores sender identity: racing producers issue
+byte-identical requests and the server collapses them into one wake. A granted claim therefore saves
+a round trip, not a wakeup. What the claim is for, and what its lease buys, is in
+`backend-contract.md`.
 
 Wake signaling is independently retryable and idempotent. Retrying the wake step is a producer
 obligation, not an automatic property; `publish()`'s acknowledged-wake contract (P6b) is what turns
