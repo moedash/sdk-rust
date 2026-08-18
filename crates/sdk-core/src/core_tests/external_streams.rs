@@ -9,8 +9,8 @@ use crate::{
     ExternalStreamReadyResult, ExternalStreamRunStatus, PollError,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
-        MockPollCfg, WorkerExt, build_fake_worker, build_mock_pollers, mock_worker,
-        schedule_activity_cmd, start_timer_cmd,
+        MockPollCfg, ResponseType, WorkerExt, build_fake_worker, build_mock_pollers,
+        hist_to_poll_resp, mock_worker, query_ok, schedule_activity_cmd, start_timer_cmd,
     },
     worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
 };
@@ -45,6 +45,7 @@ use temporalio_common::{
             command::v1::command,
             common::v1::Payload,
             enums::v1::{CommandType, EventType},
+            query::v1::WorkflowQuery,
         },
     },
     worker::WorkerTaskTypes,
@@ -376,8 +377,17 @@ fn quiescent_command(
 /// A worker whose completions are all recorded, so a test can assert that a retained task
 /// reported *nothing* to the server.
 fn worker_recording_completions(completions: Arc<AtomicUsize>) -> crate::Worker {
-    let t = canned_histories::single_timer("1");
-    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    worker_counting_completions(completions, canned_histories::single_timer("1"), vec![1])
+}
+
+/// The same, over a history and batch schedule the test chooses.
+fn worker_counting_completions(
+    completions: Arc<AtomicUsize>,
+    history: TestHistoryBuilder,
+    batches: Vec<usize>,
+) -> crate::Worker {
+    let t = history;
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, batches, mock_worker_client());
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
         for _ in 0..4 {
             let counter = completions.clone();
@@ -661,6 +671,87 @@ async fn a_pending_timer_suppresses_retention_but_its_subscriptions_survive_it()
             "wait {wait_id} must have survived the command-producing completion at generation 0"
         );
     }
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+/// A history whose first Workflow Task starts a timer and whose second carries a wake Signal.
+///
+/// The task timeout is long on purpose: what is under test is registration, and a park handshake
+/// arriving from an idle deadline would be a different activation entirely.
+fn timer_then_wake_history() -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
+    t.add_full_wf_task();
+    t.add_by_type(EventType::TimerStarted);
+    t.add_we_signaled(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(wake(0, ""))],
+    );
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+    t
+}
+
+#[tokio::test]
+async fn a_server_bound_command_suppresses_retention_without_dropping_the_registration() {
+    // Registering a wait set and retaining the Workflow Task for it are two questions, and only
+    // the second one a timer answers "no" to. Welded together they make an ordinary Workflow --
+    // one that starts a timer and first blocks on a stream in the *same* activation -- permanently
+    // unresumable: the completion registers nothing, so a wake Signal has no wait to mark ready,
+    // every Workflow Task the Signal produces is empty, and the records sit in the buffer for ever.
+    //
+    // Both halves are asserted here deliberately. A test that only checked non-retention is
+    // exactly what let this through: suppressing retention was already right, and losing the
+    // registration along with it was the defect.
+    let completions = Arc::new(AtomicUsize::new(0));
+    let worker =
+        worker_counting_completions(completions.clone(), timer_then_wake_history(), vec![1, 2]);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                quiescent_command(1, &[1, 2], Duration::from_secs(30)),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    // Half one: the task really was reported. The server has to see the timer, so retention is
+    // correctly refused and the wake Signal covers the window that leaves.
+    assert_eq!(
+        completions.load(Ordering::Relaxed),
+        1,
+        "a completion carrying a server-bound command must be reported, not retained"
+    );
+
+    // Half two: the subscriptions that same completion described are registered, so the wake
+    // Signal on the next Workflow Task finds a set to mark ready. Both waits, not only the one the
+    // Signal names -- the stream in a wake is a hint and lang rechecks every subscription.
+    let woken = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        resolve_hints(&woken),
+        vec![1, 2],
+        "the wake Signal must resolve the registered waits; with nothing registered it marks \
+         nothing ready and the activation comes back empty, got {:?}",
+        woken.jobs
+    );
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "the registration must hold the replacement task open once the wake resolved it"
+    );
 
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
@@ -1274,6 +1365,154 @@ async fn a_core_decided_boundary_asks_for_a_terminal_before_writing_anything() {
         ))
         .await
         .unwrap();
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+/// A workflow-only worker recording the markers and the query ids answered per completion.
+fn worker_recording_query_answers(
+    markers: StreamMarkers,
+    answered: Arc<Mutex<Vec<String>>>,
+    history: TestHistoryBuilder,
+    resps: Vec<ResponseType>,
+) -> crate::Worker {
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, resps, mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        for _ in 0..4 {
+            let collected = markers.clone();
+            let answered = answered.clone();
+            asserts.then(move |wft| {
+                collected.lock().extend(stream_markers(wft));
+                answered
+                    .lock()
+                    .extend(wft.query_responses.iter().map(|q| q.query_id.clone()));
+            });
+        }
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+#[tokio::test]
+async fn a_query_riding_along_asks_for_a_terminal_rather_than_committing_without_one() {
+    // A query answer has to be reported, so it refuses retention -- and that makes the boundary
+    // *Core's*. Lang asked to be held open, so its `WorkflowStreamProgress` deliberately carried
+    // no terminal: the terminal was going to arrive on a park result or a finalization. Writing
+    // `TaskCompleted` from that report would commit `header, segment*` with no terminal frame,
+    // which is durable and wrong and which ADR-008 forbids without exception. Core owes a
+    // finalization round trip here exactly as the rollover deadline and a teardown do.
+    //
+    // The query must survive that round trip, which runs no user Workflow code and so gives lang
+    // no way to resend what it already answered.
+    let markers: StreamMarkers = Default::default();
+    let answered: Arc<Mutex<Vec<String>>> = Default::default();
+    let history = marker_then_replacement_history(1, ParkReason::TaskCompleted, b"observed|end");
+    let mut with_query =
+        hist_to_poll_resp(&history, "fakeid".to_owned(), ResponseType::ToTaskNum(1));
+    with_query.queries = HashMap::from([(
+        "q1".to_string(),
+        WorkflowQuery {
+            query_type: "query-type".to_string(),
+            query_args: Some(b"hi".into()),
+            header: None,
+        },
+    )]);
+    let worker = worker_recording_query_answers(
+        markers.clone(),
+        answered.clone(),
+        history,
+        vec![with_query.into()],
+    );
+
+    // Lang consumed a record and asked to be held open, so its report stops short of the terminal.
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"observed", false),
+                quiescent_command(1, &[1], Duration::from_secs(30)),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "the task must be retained here, or the query has nothing to interrupt"
+    );
+
+    // The query arrives on its own activation -- which is exactly why lang cannot supply the
+    // terminal itself: the completion answering it produces no stream command at all, and the
+    // annotation at risk was accumulated on the activation before.
+    let queried = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        queried.jobs.iter().any(|j| matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::QueryWorkflow(_))
+        )),
+        "the query has to reach lang, or this test proves nothing, got {:?}",
+        queried.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            query_ok("q1", "the-answer"),
+        ))
+        .await
+        .unwrap();
+
+    // Nothing was written and nothing was reported: Core asks first.
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "a query answer must not commit an annotation Core never obtained a terminal for"
+    );
+    assert_eq!(
+        *answered.lock(),
+        Vec::<String>::new(),
+        "the task stays open until its terminal exists, so the query has not been reported yet"
+    );
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&finalize),
+        vec![(1, ParkReason::TaskCompleted, vec![1])],
+        "a query-refused retention must ask lang to finalize the boundary it created, got {:?}",
+        finalize.jobs
+    );
+    assert_eq!(
+        worker.external_stream_annotation(&run_id).await,
+        b"observed",
+        "the accumulated annotation is held across the round trip, not discarded"
+    );
+
+    // Lang supplies the terminal, and only now is the marker written -- on the same completion
+    // that finally carries the query answer.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(1, b"|end"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *markers.lock(),
+        vec![(1, ParkReason::TaskCompleted, b"observed|end".to_vec())],
+        "the marker carries the accumulated annotation with lang's terminal appended"
+    );
+    assert_eq!(
+        *answered.lock(),
+        vec!["q1".to_string()],
+        "the query answer must ride the finalization round trip out: the round trip runs no user \
+         Workflow code, so lang cannot resend it"
+    );
 
     worker.drain_pollers_and_shutdown().await;
 }
@@ -4264,6 +4503,131 @@ async fn a_completion_while_replaying_writes_no_second_marker() {
         ))
         .await
         .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+/// A replayable history whose recorded boundary is followed by a Signal, on a short task timeout.
+///
+/// Two things matter. The Signal rather than a timer means the replayed Workflow Task can be
+/// completed with **no** server-bound command, so retention is refused for one reason only -- that
+/// the activation was a replay -- and a test can tell that reason from the others. The short task
+/// timeout puts both deadlines a retained snapshot would arm (the idle timeout and the rollover
+/// deadline at 80% of the task timeout) inside the test's own wait rather than beyond its end.
+fn replayable_marker_then_signal_history() -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_millis(200));
+    t.add_full_wf_task();
+    t.add_external_stream_marker_covering(
+        2,
+        ParkReason::Idle,
+        b"header.segment.terminal",
+        &[(1, 3), (2, 0)],
+    );
+    t.add_we_signaled("keep-the-run-going", vec![]);
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+    t
+}
+
+#[tokio::test]
+async fn a_replaying_quiescence_registers_its_waits_and_arms_no_timer() {
+    // A replayed Run has to rebuild its wait set: that set is per-Worker runtime state, not
+    // History, so nothing else recreates it and lang reports its quiescent snapshot while
+    // replaying too. But Core must run no timer for it. The recorded marker is what reproduces the
+    // boundary, and a replay slower than the idle timeout would otherwise queue a park handshake
+    // in between replay activations -- proposing a park for a boundary History already settled,
+    // against wall-clock time that has nothing to do with the recorded one.
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_recording_rollovers(
+        markers.clone(),
+        forced.clone(),
+        replayable_marker_then_signal_history(),
+        // One batch carrying both Workflow Tasks, so the first is replayed rather than executed.
+        vec![2],
+    );
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    let run_id = replayed.run_id.clone();
+    assert!(
+        replayed.is_replaying,
+        "this test is only meaningful while replaying, got {replayed:?}"
+    );
+    assert_eq!(
+        replay_jobs(&replayed).len(),
+        1,
+        "the recorded boundary must reach lang, got {:?}",
+        replayed.jobs
+    );
+
+    // Lang reports the snapshot it rebuilt, and nothing else -- no server-bound command rides
+    // along, so replay is the only thing standing between this and retention.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1, 2], Duration::from_millis(30)),
+        ))
+        .await
+        .unwrap();
+
+    // Registered: an empty wait set answers `NoOpenWorkflowTask` here whatever the task is doing.
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "a replayed Run must rebuild the wait set nothing else recreates"
+    );
+
+    // Hold an activation outstanding across the wait, so a timer that did fire could only queue
+    // its job rather than racing this poll, and the job is then delivered on the next one.
+    let signalled = worker.poll_workflow_activation().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            signalled.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+
+    // Whatever comes next -- an eviction, or nothing at all -- must not be a park handshake or a
+    // finalization request, because neither deadline was ever armed.
+    if let Ok(Ok(after)) = tokio::time::timeout(
+        Duration::from_millis(300),
+        worker.poll_workflow_activation(),
+    )
+    .await
+    {
+        assert_eq!(
+            park_jobs(&after),
+            Vec::new(),
+            "replay must run no idle timer: the recorded marker is the boundary, got {:?}",
+            after.jobs
+        );
+        assert_eq!(
+            finalization_jobs(&after),
+            Vec::new(),
+            "and no rollover deadline either -- a replayed task holds no retention to roll over, \
+             got {:?}",
+            after.jobs
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(after.run_id))
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        !forced.lock().iter().any(|f| *f),
+        "no completion may ask for a replacement task on behalf of a boundary History already \
+         recorded, got {:?}",
+        forced.lock()
+    );
+    assert_eq!(
+        *markers.lock(),
+        Vec::new(),
+        "and replay writes no marker: the one it would write is the one it just read"
+    );
+
     worker.drain_pollers_and_shutdown().await;
 }
 
