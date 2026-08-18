@@ -19,6 +19,7 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | Know what a Workflow Task does from open to marker | [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) |
 | Implement a backend provider | [`spec/backend-contract.md`](spec/backend-contract.md) |
 | Trust a test result before acting on it | [`verification-hazards.md`](verification-hazards.md) |
+| Review the feature, or know which commits it is | [`review-guide.md`](review-guide.md) — a dated snapshot, not design |
 
 ## Specs — one subsystem per file
 
