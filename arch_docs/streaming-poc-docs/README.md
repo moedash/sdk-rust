@@ -35,7 +35,7 @@ narrative, and where an alternative was considered and rejected the reasoning is
 
 ## The rest of the set
 
-- [`decisions/`](decisions/README.md) — 26 records, one per decision, each with the alternatives that
+- [`decisions/`](decisions/README.md) — 27 records, one per decision, each with the alternatives that
   were rejected. A spec states what is true; a decision record states why the other shape was not
   taken.
 - [`required-tests/`](required-tests/) — the two required-test lists. These are not prose: the Python

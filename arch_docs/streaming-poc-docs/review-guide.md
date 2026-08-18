@@ -164,7 +164,18 @@ correctness, durability, determinism, and liveness defects only; it deliberately
 contains no code-style findings. The already-documented activation-over-WFT-timeout
 `dbg_panic` is also excluded because it is explicitly listed above as unfinished.
 
+**Status lines were added afterwards**, at Python `7e040b7e`; the reviewer's text
+under each is unchanged, including where a fix took a different shape from the
+proposed test. Thirteen of the fifteen findings are fixed, all of them Python-side;
+Core is unchanged since the review. The two still open are the failure taxonomy
+that is not connected to the activation failure path, and payload decoding on the
+Workflow thread.
+
 ### P0 — A park intent cannot be removed after a Worker handoff
+
+**Status:** Fixed — Python `0442dc4e`, *Reconcile an inherited park intent, and make parking match
+Core's wait set*. Registration is now the second enforcement point: a Worker that finds an intent
+for a wait it is registering, having installed none itself, removes it (`spec/wft-lifecycle.md`).
 
 **Code:** `sdk-python/temporalio/worker/_workflow.py:874-883` and
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:684-735`
@@ -193,6 +204,10 @@ verify that its wake is unparked rather than the stale generation from A.
 
 ### P0 — `publish()` can report an acknowledged wake when nobody sent one
 
+**Status:** Fixed — Python `a9c03eca`, *Bind each wait to its own backend, and stop reporting unsent
+wakes as sent*. The producer that loses the claim signals anyway; the duplicate collapses because a
+parked wake's request ID ignores sender identity (`spec/wake-signal.md`).
+
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_producer.py:283-339`
 and `:382-434`
@@ -213,6 +228,12 @@ returns an offset immediately, sends no Signal, and still sends none when the
 lease later expires.
 
 ### P0 — Replay never verifies that recorded waits match Workflow subscriptions
+
+**Status:** Fixed — Python `a9c03eca`, *Bind each wait to its own backend, and stop reporting unsent
+wakes as sent*. The binding is verified at registration and at the start of replay, and a replay
+that ends holding an unconsumed recorded delivery fails; both are reported as nondeterminism rather
+than integrity loss. Only the stream *name* is compared, because a replay harness supplies its own
+namespace and Run ids.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:737-771`,
@@ -236,6 +257,11 @@ driver with Workflow code that registers wait 1 as stream `"right"`. Assert a
 left-hand value is yielded from the right-hand subscription.
 
 ### P0 — The annotation cannot identify the backend that owns each wait
+
+**Status:** Fixed — Python `a9c03eca`, *Bind each wait to its own backend, and stop reporting unsent
+wakes as sent*. Schema version 2 moves the provider identity into a per-wait binding and adds the
+Worker-registered `backend_name` the Workflow chose; a version-1 annotation is rejected rather than
+read as though its single label applied everywhere.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_annotation.py:189-194`,
@@ -265,6 +291,11 @@ reads it silently.
 
 ### P1 — A subscription created after the first delta is absent from the header
 
+**Status:** Fixed — Python `1e369ec3`, *Bind a late subscription, and replay a segment in its
+recorded order*. A late wait's binding rides its own frame (ADR-027). The same commit fixed a
+second defect this one did not name: a replay drain searched its segment for its own wait id, so a
+segment recorded as (wait 2, wait 1) replayed in the reverse order.
+
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_runtime.py:251-296`
 and `:689-717`
@@ -285,6 +316,9 @@ plan is valid and wait 2's record is delivered. It currently fails because wait
 
 ### P1 — A `Stale` readiness acknowledgement strands the buffered record
 
+**Status:** Fixed — Python `0c92c99f`, *Make readiness reporting total, and stop dropping a stale
+answer*. The report is re-sent against the generation Core currently holds, bounded.
+
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:553-622`
 
@@ -301,6 +335,11 @@ append and the record remains available for delivery. Today it is invoked once
 and the watcher blocks after the buffered record.
 
 ### P1 — Wake and readiness failures have no working retry path
+
+**Status:** Fixed — Python `0c92c99f`, *Make readiness reporting total, and stop dropping a stale
+answer*. The Worker's wake callback now raises, the watcher guards its own call to it, a raising
+notifier is treated as the sixth answer the five do not name, and the sweep's retries and
+`external_stream_shutdown_wake_failed` are reached.
 
 **Code:** `sdk-python/temporalio/worker/_workflow.py:1024-1086` and
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:553-635`
@@ -329,6 +368,10 @@ alive and retries; today its task exits.
 
 ### P1 — The park handshake ignores Core's exact wait set
 
+**Status:** Fixed — Python `0442dc4e`, *Reconcile an inherited park intent, and make parking match
+Core's wait set*. The park set is the job's `waits`; the runtime supplies only each wait's cursor
+boundary.
+
 **Code:** `sdk-python/temporalio/worker/_workflow.py:945-950` and
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:639-682`
 
@@ -348,6 +391,10 @@ and the legitimate park is aborted.
 
 ### P1 — A failed multi-wait park leaves a partial externally visible park
 
+**Status:** Fixed — Python `0442dc4e`, *Reconcile an inherited park intent, and make parking match
+Core's wait set*. Every intent an attempt installed is withdrawn on any failure, and the original
+storage error propagates.
+
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:639-682`
 
@@ -366,6 +413,11 @@ installed for that attempted generation. Today the first case leaves wait 1's
 intent and the second leaves both.
 
 ### P1 — The specified external-storage failure taxonomy is not connected
+
+**Status:** **Open.** `classify_read_failure` and `StreamMetrics` still have no production caller,
+the activation failure path still never sets
+`WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE`, and `StreamDecodeError` is still never
+constructed outside tests.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_errors.py:90-180`,
@@ -391,6 +443,11 @@ counter. All three assertions fail in the current integration.
 
 ### P1 — Payload decoding performs arbitrary async work on the Workflow thread
 
+**Status:** **Open.** The subscription iterator still awaits the full `DataConverter.decode()` on
+the Workflow thread (`_api.py`'s `_decode`, `_codec.py`), so a payload codec that performs I/O still
+runs inside `activate()` under the deadlock timeout. `0c92c99f` changed the order of decode and
+consumption, not where decoding happens.
+
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_api.py:426-439`
 and `:525-528`,
@@ -415,6 +472,9 @@ fails the codec's loop assertion).
 
 ### P1 — A record is consumed before decoding succeeds
 
+**Status:** Fixed — Python `03969dbf`, *Make merge fair, and stop consuming a record before it
+decodes*. Decoding happens first; consumption is committed only once the value is in hand.
+
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_api.py:426-439` and
 `:477-528`
@@ -433,6 +493,12 @@ the same record. Today the cursor is after the record and the record has
 disappeared.
 
 ### P1 — An unused or cancelled subscription remains logically blocked
+
+**Status:** Fixed — Python `03969dbf`, *Make merge fair, and stop consuming a record before it
+decodes*. A subscription nobody has iterated is not blocked, a cancelled wait leaves the blocked
+set, and `close()` ends the iteration. The Worker-side teardown the proposed test also asks for —
+the watcher and any installed intent — is deliberately not part of `close()`; an inherited intent is
+reached by the reconciliation above instead.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_api.py:393-441` and
@@ -458,6 +524,10 @@ wait in both cases and no API path performs the teardown.
 
 ### P1 — `merge()` can starve every stream except the lowest wait ID
 
+**Status:** Fixed — Python `03969dbf`, *Make merge fair, and stop consuming a record before it
+decodes*. Each pass takes at most one record per subscription, which bounds the skew between two
+streams at a single record without a rotating start position that replay would have to reproduce.
+
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_api.py:338-351`
 
@@ -474,6 +544,10 @@ the Worker does, and assert wait 2 is yielded within a bounded number of cycles.
 It is never yielded by the current wait-ID-first whole-buffer drain.
 
 ### P1 — Redis maps distinct logical streams to the same physical keys
+
+**Status:** Fixed — Python `ee4fbf86`, *Make the Redis key layout injective, and stop a stream name
+widening a scan*, with the obligation lifted into the contract by `7e040b7e`, *Require a provider's
+key derivation to be injective* (`spec/backend-contract.md`).
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_redis.py:133-148`

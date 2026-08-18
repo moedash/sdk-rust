@@ -19,6 +19,7 @@ A backend implementation must provide:
 - **Idempotent append that is idempotent on identity, not on key alone** (ADR-020). An append
   reusing an existing `(session_id, sequence)` with byte-identical content is a no-op returning
   the original offset; the same pair with *different* bytes must be rejected as an error.
+- **Key derivation that is injective** — see "Key derivation must be injective".
 
 Control records and data records share the same offset sequence. Control records are consumed by
 the runtime and are not yielded to Workflow code.
@@ -77,6 +78,23 @@ within a validated range are exactly the bytes that were written, so a DataConve
 cannot decode them indicates a configuration mismatch between producer and consumer — not a
 damaged stream (ADR-015). See `failure-taxonomy.md`.
 
+## Key derivation must be injective
+
+**Distinct `StreamKey` values must map to distinct physical keys**, and to distinct keys for every
+structure derived from one: records, idempotency state, park intents, and claims.
+
+Every component of a stream identity — namespace, Workflow ID, first execution Run ID, stream name —
+is a user-chosen string, in which a provider's delimiter is an ordinary character. Joining them raw
+is therefore not injective: with `:` as the delimiter, `("ns", "wf", r1, f"{r2}:tokens")` and
+`("ns", f"wf:{r1}", r2, "tokens")` render identically. Two unrelated Workflows then share one
+stream, one idempotency hash, one park intent and one claim. Each reads the other's records, which
+is visible; and each concludes the other's claim has taken responsibility for the wake, so neither
+producer signals and both Runs wait forever on records already durable, which is not.
+
+Any injective encoding satisfies this — escaping the delimiter, percent-encoding each component, or
+length-prefixing them. A provider that derives a pattern match from a key owes the same property
+there: an identity carrying a metacharacter must not widen a scan onto another stream's intents.
+
 ## Conformance suite requirements
 
 The suite is the deliverable, not the interface. It must contain, at minimum:
@@ -111,9 +129,12 @@ chain, and only one Run of a chain is live at a time. Carrying the Run ID as the
 Run's intent deterministically replaces its predecessor's for the same key rather than
 accumulating alongside it.
 
-**An intent exists only while its park is outstanding.** The consumer holds up one half of that —
-installing an intent when a park is confirmed, removing it when that park is over — and the provider
-holds up the other: once an intent is removed, `current_park_generation` must report nothing for that
+**An intent exists only while its park is outstanding.** The consumer holds up one half of that,
+and it takes two enforcement points to do it: the resolve that ends a park the Run is sitting in,
+and reconciliation at registration for an intent this Worker inherited rather than installed
+(`wft-lifecycle.md`). Both are needed because the intent is durable backend state while the record
+of which Worker installed it is per-Worker, so an eviction or a handoff otherwise leaves it forever.
+The provider holds up the other half: once an intent is removed, `current_park_generation` must report nothing for that
 subscription. A provider that answered from a remembered "last generation" beside the intent passes
 every other requirement here and still breaks both of that call's readers, in the same direction and
 invisibly. A producer would name a generation Core has already discarded, and a non-zero generation
@@ -123,11 +144,14 @@ same answer and send a parked wake where it owes the unparked one; a parked wake
 sender identity by design, so it arrives byte-identical to the wake that ended that park and the
 server deduplicates it away.
 
-**Claims must be leased and renewable.** An unleased claim introduces a failure mode: a producer
-that crashes between claiming and signaling strands the generation, and other producers conclude
-the wake is already handled. A provider that implements `claim_park_generation` must therefore
-expire claims and permit takeover; a provider that cannot must expose observe-only semantics and
-let every producer signal idempotently.
+**Claims must be leased and renewable.** A claim is how a provider learns a wake is in flight, and
+its expiry is what makes one abandoned by a crashed producer takeable again; a claim that never
+expires says a wake is in flight for the life of the store, and nothing can take it back. What
+keeps a producer crashing between claiming and signalling from stranding the generation is not the
+lease — expiry permits takeover, it schedules nobody to take over — but the producer contract that
+a producer which loses the claim sends the wake anyway (`wake-signal.md`). A provider that cannot
+lease must expose observe-only semantics and always grant, which is the same behaviour every
+provider's callers already rely on.
 
 ## Producer binding
 

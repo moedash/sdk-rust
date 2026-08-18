@@ -32,6 +32,11 @@ segments in order, performing one event-loop drain per segment. The live run's *
 become *k* drains inside one replay activation, so coroutine scheduling and condition evaluation
 match.
 
+A segment's delivery list is the recorded **global** order across waits, not one list per wait: it
+is the order the runtime handed records over, which is the order Workflow code took them in. The
+segmentation reproduces how many drains an activation ran; the order within a segment reproduces
+which wait each of those drains served.
+
 This is safe with respect to Workflow time: all segments of a marker belong to one Workflow Task,
 so `workflow.now()` is constant across them in both the live run and replay. Commands produced
 during a retained Workflow Task are buffered until the task completes, in both directions.
@@ -42,11 +47,11 @@ The annotation is a versioned binary encoding. `schema_version` leads, so marker
 SDK versions stay readable.
 
 ```text
-annotation := header, segment*, terminal
+annotation := header, (bindings | segment)*, terminal
 
-header  := schema_version
-         , provider_id, provider_format_version
-         , streams[]                      // wait_id -> (stream_key, start_cursor)
+header   := schema_version, streams[]     // wait_id -> binding
+bindings := streams[]                     // the same, for waits bound after the header
+binding  := (stream_key, start_cursor, backend_name, provider_id, provider_format_version)
 
 segment := run*, segment_end_reason
 run     := (wait_id, first_offset, last_offset, count, control_positions)
@@ -54,6 +59,42 @@ segment_end_reason := NO_DATA_AVAILABLE | BATCH_LIMIT | FENCE_REACHED | BUDGET_R
 
 terminal := blocked_snapshot[]            // wait_id -> cursor boundary: BEGINNING | AFTER(offset)
 ```
+
+### Bindings are per wait
+
+A binding names the Worker-registered backend the Workflow's own `topic(backend=...)` chose, and
+carries the provider identity of whatever is registered under that name. One label for the whole
+annotation cannot say which of two registered backends owns a given wait, and two instances of one
+provider — two Redis clusters, two key prefixes — declare the same provider id, so a label does not
+distinguish those either: replay would read a wait's recorded range out of a store that never held
+it.
+
+Which half of a binding disagrees decides how the disagreement is reported. `stream_key` and
+`backend_name` are Workflow code's choice, so a mismatch is row four of `failure-taxonomy.md` —
+nondeterminism, fixed by versioning the Workflow. `provider_id` and `provider_format_version`
+describe whatever the Worker registered under that name, so a mismatch there is a deployment
+problem, with the Workflow unchanged and the backend undamaged.
+
+### A wait bound after the header
+
+`subscribe()` may run at any activation of a retained Workflow Task, so a wait can be created after
+the header frame has already gone to Core. Core appends observation deltas and never rewrites what
+it already holds, so a header cannot be extended in place — that wait's binding rides its own
+**bindings frame** instead (ADR-027), emitted with the delta of the activation that registered the
+wait and therefore ahead of both the segment that first records a run for it and the terminal.
+Without it the wait reaches the marker as runs and a terminal entry with no stream key, no backend,
+and no start cursor, and replay of *unchanged* code fails as a wait "the Workflow did not create".
+
+Decoding merges every bindings frame into the table the header opens, so what replay reads is one
+flat `wait_id -> binding` table and it never has to ask when a wait joined.
+
+A wait is bound **exactly once** per annotation. A second binding for the same `wait_id` is a decode
+failure rather than a value replay picks between: whichever of the two stream keys it chose could be
+the one the records were not written to.
+
+A late wait carries **its own** start cursor, not wherever the waits already in the header have
+reached. Recording another wait's position for it names a boundary this subscription never stood at
+— and for a wait that receives nothing, the start cursor is the whole of what replay knows about it.
 
 ### Runs
 
@@ -88,7 +129,7 @@ terminal := blocked_snapshot[]            // wait_id -> cursor boundary: BEGINNI
 - Every position in the annotation is a **cursor boundary**, `BEGINNING` or `AFTER(offset)`. Run
   endpoints are record offsets; blocked snapshots are boundaries. The two are not interchangeable
   and the encoding keeps them distinct types.
-- `start_cursor` in the header makes the initial position explicit rather than re-derived.
+- `start_cursor` in a wait's binding makes its initial position explicit rather than re-derived.
 - `ParkReason` is **not** in the terminal. It lives once, in the Core-readable
   `ExternalStreamMarkerData.terminal_boundary` (ADR-008).
 
@@ -148,8 +189,9 @@ about what a future per-record field would cost.
 
 ## Delta accumulation
 
-`WorkflowStreamProgress.observation_delta` carries the segments produced since the previous progress
-report for the same Workflow Task. Core appends each delta to `ExternalWaitSet.replay_annotation`
+`WorkflowStreamProgress.observation_delta` carries the frames produced since the previous progress
+report for the same Workflow Task — the header on the first of them, then whichever bindings and
+segments that activation produced. Core appends each delta to `ExternalWaitSet.replay_annotation`
 and writes the accumulated result as the marker's `replay_annotation`. Core never parses either.
 
 ## Replay read path
@@ -166,18 +208,29 @@ Python reads the full recorded offset range for each stream up front, in as few 
 the range allows, then delivers from memory in recorded order. Replay I/O cost is therefore a
 function of the consumed range, not of segment count.
 
+**A replay drain takes from the front of the segment, and only while the front belongs to the wait
+that is asking.** The segment is the global order, so a drain that searched past another wait's
+record would hand its asker a record that came *after* it live: a segment recorded as (wait 2,
+wait 1) replays as (wait 1, wait 2) for any reader that asks in `wait_id` order, and a wait
+appearing twice with another between them collapses two of the segment's drains into one. A drain
+that meets another wait's record answers empty, which is exactly what the live drain answered —
+the record was not in that wait's buffer yet — and it leaves the record where the drain that
+recorded it will find it.
+
 ## Cursor origin
 
 A cursor is never derived from mutable backend state, on any Run.
 
-- **First execution of a chain:** the subscription starts at the `BEGINNING` boundary, recorded in
-  the header's `start_cursor` in the subscription's **first** observation delta — which is emitted
-  whether or not a record was ever delivered.
+- **First execution of a chain:** the subscription starts at the `BEGINNING` boundary, recorded as
+  the `start_cursor` of its binding in the subscription's **first** observation delta — which is
+  emitted whether or not a record was ever delivered. That is the header frame for a wait the
+  annotation opened with, and a bindings frame for a subscription created after the header went
+  out.
 - **Subsequent Runs:** the committed continuation state arrives in the reserved Continue-As-New
   header as an `AFTER(offset)` boundary, persisted in `WorkflowExecutionStarted` and restored before
   any subscription is established (ADR-022).
 
-Both paths populate the same header field, so replay reads an explicit starting boundary in every
+Both paths populate the same binding field, so replay reads an explicit starting boundary in every
 case, including the case where the stream was empty for the subscription's entire life.
 
 ## Subscription numbering is a nondeterminism hazard
