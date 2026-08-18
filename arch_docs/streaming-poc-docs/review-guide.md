@@ -164,12 +164,10 @@ correctness, durability, determinism, and liveness defects only; it deliberately
 contains no code-style findings. The already-documented activation-over-WFT-timeout
 `dbg_panic` is also excluded because it is explicitly listed above as unfinished.
 
-**Status lines were added afterwards**, at Python `7e040b7e`; the reviewer's text
-under each is unchanged, including where a fix took a different shape from the
-proposed test. Thirteen of the fifteen findings are fixed, all of them Python-side;
-Core is unchanged since the review. The two still open are the failure taxonomy
-that is not connected to the activation failure path, and payload decoding on the
-Workflow thread.
+**Status lines were added afterwards**, from Python `7e040b7e` onward; the
+reviewer's text under each is unchanged, including where a fix took a different
+shape from the proposed test. **All fifteen findings are fixed**, all of them
+Python-side; Core is unchanged since the review.
 
 ### P0 — A park intent cannot be removed after a Worker handoff
 
@@ -414,10 +412,12 @@ intent and the second leaves both.
 
 ### P1 — The specified external-storage failure taxonomy is not connected
 
-**Status:** **Open.** `classify_read_failure` and `StreamMetrics` still have no production caller,
-the activation failure path still never sets
-`WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE`, and `StreamDecodeError` is still never
-constructed outside tests.
+**Status:** Fixed — Python `8ac891f6`, *Decode off the Workflow thread, and connect the failure
+taxonomy*. Every failed completion is inspected rather than an exception, because a decode raised on
+the Workflow thread is converted inside `activate()` and never exists as one out here; all three
+failing rows now reach a completion carrying the external-storage cause and increment exactly one
+counter (`spec/failure-taxonomy.md`). The same commit renames the shutdown counter to the
+`temporal_external_stream_shutdown_wake_failed` the taxonomy module documents.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_errors.py:90-180`,
@@ -443,10 +443,13 @@ counter. All three assertions fail in the current integration.
 
 ### P1 — Payload decoding performs arbitrary async work on the Workflow thread
 
-**Status:** **Open.** The subscription iterator still awaits the full `DataConverter.decode()` on
-the Workflow thread (`_api.py`'s `_decode`, `_codec.py`), so a payload codec that performs I/O still
-runs inside `activate()` under the deadlock timeout. `0c92c99f` changed the order of decode and
-consumption, not where decoding happens.
+**Status:** Fixed — Python `8ac891f6`, *Decode off the Workflow thread, and connect the failure
+taxonomy*. Decoding is split at the one seam that permits it: retrieval and the user's codec run on
+the Worker's loop — in the watcher before buffering, and over the replay plan's segments — while the
+Workflow thread runs only the synchronous `from_payloads` that needs the topic's type (ADR-028,
+`spec/python-runtime.md`). A record that arrives unprepared under a converter with a codec or
+external storage is refused rather than decoded late. (`0c92c99f` had changed the order of decode and
+consumption, not where decoding happens.)
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_api.py:426-439`

@@ -268,7 +268,7 @@ extra empty Workflow Task, against an ordering that would buy the guarantee with
 nothing.
 
 A wake still unacknowledged when the grace period expires is counted on a distinct
-`external_stream_shutdown_wake_failed` metric and shutdown proceeds. Retries within the period reuse
+`temporal_external_stream_shutdown_wake_failed` metric and shutdown proceeds. Retries within the period reuse
 the derived request ID and deduplicate server-side; past it, the Run falls back to the durability
 boundary below rather than blocking shutdown or pretending the wake happened.
 
