@@ -136,22 +136,39 @@ Two obligations the Python manager owes at shutdown, neither of which Core can d
 - **Teardown ordering.** Per-Run teardown is driven by `RemoveFromCache`, never by the shutdown
   hook, so a `FinalizeExternalStreams` in flight is always answered before the manager's Run state
   disappears.
-- **The sweep.** For every Run still holding active subscriptions, call C4's read-only
-  `external_stream_run_status`. `WftOpen` → C15b's first transition applies, wait for it; `Parked` →
-  nothing to do; `NoOpenWorkflowTask`/`RunNotFound` → send the unparked wake Signal and await
-  acknowledgement before tearing the subscription down. The probe is not the readiness call, which
-  would assert a buffered record that does not exist. An idle cached Run gets no eviction activation
-  at shutdown, so this cannot ride on the eviction path.
+- **The sweep, in two halves at two points in shutdown.** *Ask first*: before Core's
+  `initiate_shutdown()`, call C4's read-only `external_stream_run_status` once for every Run still
+  holding active subscriptions and record the answer, bounded by a short probe grace period. *Act
+  second*: once the pollers have stopped and every activation has been answered, `WftOpen` → C15b's
+  first transition already applied, nothing owed; `Parked` → nothing to do;
+  `NoOpenWorkflowTask`/`RunNotFound` → send the unparked wake Signal and await acknowledgement
+  before tearing the subscription down. The probe is not the readiness call, which would assert a
+  buffered record that does not exist. An idle cached Run gets no eviction activation at shutdown,
+  so this cannot ride on the eviction path.
+The split is forced, not a preference. Core's workflow-state lane ends at `initiate_shutdown()`
+itself — `bump_stream()` pushes an input, `shutdown_done()` sees the shutdown token cancelled and an
+idle cached Run with no pending work, and the stream returns `PollError::ShutDown` — so
+`external_stream_run_status` falls through to `RunNotFound` from that point on, and a Run answers
+`NoOpenWorkflowTask` one line before it and `RunNotFound` one line after. Probing after the pollers
+stop therefore collapses all four answers into the one that still owes a wake, leaving the `Parked`
+and `WftOpen` branches unreachable and the sweep looking correct while it wakes parked Runs and
+races C15b. Moving the wakes up to join the probe is equally unavailable: teardown must stay driven
+by `RemoveFromCache`, so a `FinalizeExternalStreams` in flight is answered first, and a wake offered
+to a task queue this Worker is still polling is not a hand-off. The trade is explicit — the probe gives up the guarantee that no Run acquires a Workflow
+Task after it, so a Run recorded `NoOpenWorkflowTask` may take one before the pollers stop and
+receive both C15b's replacement task and the sweep's wake, costing one extra empty Workflow Task,
+which the design permits.
 An unacknowledged wake is retried within the grace period under the same request ID, then reported
 through the `external_stream_shutdown_wake_failed` metric; shutdown is never blocked past the grace
 period and the wake is never reported as delivered when it was not.
 *Done when:* shutdown in the `NoOpenWorkflowTask` window sends an acknowledged unparked wake and the
-server records a new Workflow Task for the Run, without waiting for an unrelated Workflow event;
-shutdown in the `WftOpen` state sends none and lets C15b finish; teardown never precedes an
-outstanding finalization; and a wake that cannot be acknowledged surfaces on the
-`external_stream_shutdown_wake_failed` metric instead of being dropped silently. That a *second
-Worker* then reconstructs the subscription from the marker needs the replay path (P13) and is a P16a
-case.
+server records a new Workflow Task for the Run, without waiting for an unrelated Workflow event; the
+sweep's own probe answers `NoOpenWorkflowTask` there rather than `RunNotFound`, which is what shows
+it ran early enough to distinguish anything; shutdown in the `WftOpen` state sends none and lets
+C15b finish; teardown never precedes an outstanding finalization; and a wake that cannot be
+acknowledged surfaces on the `external_stream_shutdown_wake_failed` metric instead of being dropped
+silently. That a *second Worker* then reconstructs the subscription from the marker needs the replay
+path (P13) and is a P16a case.
 
 **P21 — Multiple streams, `merge`, and same-stream subscriptions** ⇢ C8, P2b, P3b, P5, P9, P11
 Multi-stream coordination on the Python side: `merge`/`select` over several subscriptions as one wait

@@ -226,21 +226,49 @@ Two consequences that constrain the implementation:
 
 Nothing local can create server-visible work here, so the wake Signal does it. The manager runs
 this as an explicit shutdown sweep rather than leaving it to watchers, because watchers only fire
-on an append and the point is to hand the Run to another Worker whether or not one arrives:
+on an append and the point is to hand the Run to another Worker whether or not one arrives.
 
-1. Worker shutdown begins. Core stops polling for new Workflow Tasks, so the Run cannot acquire a
-   Workflow Task after this point on this Worker.
-2. For every Run with active subscriptions, the manager calls `external_stream_run_status(run_id)`
-   once per Run — a **read-only** probe answered on the same serialized local-input lane as
-   readiness, returning `WftOpen | Parked | NoOpenWorkflowTask | RunNotFound`. It is a separate
-   call from `notify_external_stream_ready` on purpose: readiness means "a record is buffered", and
-   using it as a probe would be a false claim that manufactures a spurious activation on the way
-   out.
-3. `WftOpen` — Core is handling it; wait for the resulting activation and the first table row
-   applies. `Parked` — nothing to do. `NoOpenWorkflowTask` or `RunNotFound` — send the wake Signal
-   and await the server's acknowledgement before tearing the subscription down.
-4. Teardown happens only after step 3 resolves for that Run, or after the Worker's graceful-shutdown
-   grace period expires.
+**The sweep is in two halves, at two points in shutdown**, because the moment the answers still
+exist is not the moment the wakes may be sent:
+
+1. **Before Core's shutdown is initiated**, the manager calls `external_stream_run_status(run_id)`
+   once for every Run with active subscriptions and **records** the answer — a **read-only** probe
+   answered on the same serialized local-input lane as readiness, returning
+   `WftOpen | Parked | NoOpenWorkflowTask | RunNotFound`. It is a separate call from
+   `notify_external_stream_ready` on purpose: readiness means "a record is buffered", and using it
+   as a probe would be a false claim that manufactures a spurious activation on the way out. This
+   half is bounded by a grace period of its own, much shorter than the sweep's: it is one message
+   per Run on Core's own local lane, so it is either quick or wedged, and everything it delays is a
+   Worker that has already been asked to stop.
+2. **After the pollers have stopped and every activation has been answered**, the manager acts on
+   the recorded answers. `WftOpen` — Core handled it; the finalization is already answered and the
+   first table row applies, so no wake is owed. `Parked` — nothing to do. `NoOpenWorkflowTask` or
+   `RunNotFound` — send the wake Signal and await the server's acknowledgement. A Run the first
+   half never reached is probed again here, on whatever Core has left to say.
+3. Teardown of a Run happens only after step 2 resolves for it, or after the Worker's
+   graceful-shutdown grace period expires.
+
+**Why the probe cannot wait for the pollers to stop.** Core's workflow-state lane ends at
+`initiate_shutdown()` itself: `bump_stream()` pushes an input, `shutdown_done()` sees the shutdown
+token cancelled and an idle cached Run with no pending work, and the stream returns
+`PollError::ShutDown`. `external_stream_run_status` has no lane left to be answered on and falls
+through to `RunNotFound` — the same Run answers `NoOpenWorkflowTask` one line before
+`initiate_shutdown()` and `RunNotFound` one line after. Since `RunNotFound` owes a wake exactly as
+`NoOpenWorkflowTask` does, a sweep that probes afterwards still sends its wake and still looks
+correct, while the two answers that mean *do not send one* stop being reachable at all: a parked Run
+gets a wake it does not need, and a Run holding a Workflow Task gets one that races Core's own
+shutdown transition.
+
+**Why the wakes cannot go out with the probe.** Per-Run teardown is driven by `RemoveFromCache` and
+nothing else, so a `FinalizeExternalStreams` in flight has to be answered before the manager's state
+for that Run disappears; and a wake sent while this Worker is still polling offers the Run to a task
+queue this Worker will answer itself, which is the opposite of a hand-off.
+
+**What the split gives up.** The probe no longer carries the guarantee that no Run can acquire a
+Workflow Task after it. A Run recorded `NoOpenWorkflowTask` may pick one up before the pollers stop
+and then receive both C15b's replacement task and the sweep's wake. That costs one extra empty
+Workflow Task, which this design permits; the ordering that would prevent it buys the guarantee with
+an answer that describes nothing.
 
 An idle cached Run receives no eviction activation at shutdown at all — `shutdown_done` treats a Run
 with no pending work as finished — so the sweep cannot be folded into the eviction path.
@@ -252,8 +280,9 @@ unacknowledged when the grace period expires, the Worker logs and increments a d
 indefinitely and it does not pretend the wake happened. The Run then falls back to the durability
 boundary below.
 
-Python's obligations on shutdown are therefore: answer finalization while a Workflow Task is open,
-sweep the no-open-WFT Runs, and only then tear down watchers, buffers, and backend connections.
+Python's obligations on shutdown are therefore, in this order: record each Run's state before Core's
+shutdown is initiated, answer finalization while a Workflow Task is open, send the wakes the
+recorded answers owe, and only then tear down watchers, buffers, and backend connections.
 
 ## The durability boundary, stated honestly
 
