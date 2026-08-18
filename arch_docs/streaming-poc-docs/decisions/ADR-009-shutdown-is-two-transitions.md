@@ -47,7 +47,7 @@ routinely begins while no Python activation is outstanding, so there may be no c
 - The sweep cannot ride on the eviction path: an idle cached Run with no Workflow Task has no pending
   work, so `shutdown_done` drops it with no eviction activation at all.
 - An unacknowledged shutdown wake is retried within the grace period under the same request ID, then
-  reported through `external_stream_shutdown_wake_failed`. **A shutting-down Worker can promise a
+  reported through `temporal_external_stream_shutdown_wake_failed`. **A shutting-down Worker can promise a
   hand-off attempt; it cannot promise the hand-off.**
 - C15b and P20 are declared as separate deliverables because they cover mutually exclusive Run states;
   testing them together would hide the case where the wrong mechanism is applied to the wrong state.

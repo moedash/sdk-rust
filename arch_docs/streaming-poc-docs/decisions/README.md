@@ -36,6 +36,7 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [025](ADR-025-wake-signal-bypasses-the-data-converter.md) | The wake Signal bypasses the user's `DataConverter` | `spec/wake-signal.md` |
 | [026](ADR-026-delivery-is-bounded-by-a-record-count.md) | Delivery within one activation is bounded by a record count, not by time | `spec/python-runtime.md` |
 | [027](ADR-027-a-late-binding-rides-its-own-frame.md) | A subscription created after the header is bound by its own frame | `spec/annotation-format.md` |
+| [028](ADR-028-decoding-is-split-across-the-boundary.md) | Decoding a record is split across the Worker/Workflow boundary | `spec/python-runtime.md` |
 
 ## The decisions that constrain the most
 

@@ -22,6 +22,58 @@ Only an opaque handle crosses the sandbox boundary — the manager module is reg
 passthrough, and no provider instance is reachable from Workflow code, which names a backend
 registered on the Worker and nothing else.
 
+## Decoding is split across the boundary
+
+"Pops from a bounded buffer" is only true if popping is the whole of getting a value, and
+`DataConverter.decode` is not: it is external-payload retrieval, then the user's `PayloadCodec`,
+then `from_payloads`. The first two are arbitrary asynchronous work — a network fetch, a KMS round
+trip — and neither depends on the value's type. Only the third needs the topic's declared type,
+and it is synchronous. The boundary falls between them:
+
+| Half | Runs on | Steps | Needs the type |
+|---|---|---|---|
+| preparation | the Worker's asyncio loop | external retrieval, then the user's `PayloadCodec` | no |
+| conversion | the Workflow thread | `from_payloads` with the topic's type | yes |
+
+This is the split the Worker already applies to every other payload an activation carries:
+`decode_activation` is awaited in `_handle_activation` before `activate()` reaches the executor.
+Running the asynchronous half on the Workflow thread does not merely block — it **corrupts
+History**, because the deterministic event loop turns a codec's `await` into a real Temporal timer
+command, so History depends on the codec's internals and replays only while that codec behaves
+identically. A codec that blocks rather than awaits fails against the sandbox's restrictions
+instead, and either way arbitrary user I/O sits under the deadlock timeout (ADR-028).
+
+Preparation happens at exactly two points, which are the only two ways a record reaches Workflow
+code:
+
+- **Live delivery** — in the watcher, before the record enters the subscription's buffer, and
+  *before* the epoch check a reposition invalidates. Preparing awaits, so a reposition landing while
+  a user's codec runs would otherwise slip past a check that had already passed and the retracted
+  records would be buffered anyway.
+- **Replay** — over every segment of the replay plan, while the replay job is prepared out of
+  `activate()`. Replay's records never pass through a watcher, and a marker's segments are all
+  delivered inside one activation, so this is both the only point at which they can be prepared and
+  the last point before any of them is handed over.
+
+**A preparation failure is carried on the record rather than raised.** The watcher has no Workflow
+Task to fail and no Workflow to tell, and raising there would end the watcher for the whole Run,
+taking every later record with it. The error travels with the record and is raised by the delivery
+that would have yielded its value — the only point at which a Workflow exists to be told, and the
+only point at which the record is known to have been wanted.
+
+**A record that reaches the Workflow thread unprepared is refused, not converted**, whenever the
+converter has a payload codec or external storage. The two cases are indistinguishable from the
+bytes, because a codec's output is just another payload, so converting anyway yields a plausible
+wrong value that nothing reports. A converter with neither has an empty asynchronous half and
+converts correctly with no preparation at all, which is why the refusal keys on the converter rather
+than on the delivery path. What it reports is a routing defect — some path delivered without
+preparing — and not a user's converter mismatch.
+
+Nothing Worker-side crosses the boundary to make this work. The Workflow-facing API asks its opaque
+handle for a codec bound to the topic's type and gets back the synchronous half only; the manager
+holds the Worker's converter and uses it for the asynchronous half only, with no type at all,
+because the type belongs to the topic and the topic is Workflow code.
+
 ## Four positions, one commit
 
 "Cursor" covers four different positions, owned by four different components, and conflating any two
@@ -126,6 +178,6 @@ wake. Three obligations are the runtime's own, and they constrain this code rath
 
 Both halves are bounded: the probe by a grace short enough that it cannot hold up stopping the
 pollers, the wakes by the Worker's graceful-shutdown grace. A wake still unacknowledged when the
-grace expires is counted on `external_stream_shutdown_wake_failed` and shutdown proceeds. It is
-counted rather than only logged because a dropped wake is silent by nature: the Workflow simply
-waits, and nothing distinguishes that from a producer having nothing to say.
+grace expires is counted on `temporal_external_stream_shutdown_wake_failed` and shutdown proceeds.
+It is counted rather than only logged because a dropped wake is silent by nature: the Workflow
+simply waits, and nothing distinguishes that from a producer having nothing to say.

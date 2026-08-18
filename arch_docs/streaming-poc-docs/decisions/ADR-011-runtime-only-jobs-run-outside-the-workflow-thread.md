@@ -39,7 +39,7 @@ are partitioned in the same place:
 ## Consequences
 
 - **`_apply` performs no I/O, ever**, and completes in bounded time. It pops from the buffer and
-  nothing else.
+  converts what it popped, and conversion is the half of decoding that awaits nothing (ADR-028).
 - Replay is indistinguishable from live delivery to the Workflow thread, because both drain the same
   buffer — one filled by the replay reader, one by a live watcher.
 - Failures propagate through the defined activation-failure path — transient backend error →

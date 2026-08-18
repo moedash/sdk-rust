@@ -90,8 +90,8 @@ gate checks that the two agree.
   unwritten annotation exists only while a Workflow Task is open holds across both eviction
   states.
 - An unacknowledged shutdown wake follows the documented policy: retried within the grace period
-  under the same request ID, then reported through the `external_stream_shutdown_wake_failed`
-  metric without blocking shutdown and without being reported as delivered.
+  under the same request ID, then reported through the
+  `temporal_external_stream_shutdown_wake_failed` metric without blocking shutdown and without being reported as delivered.
 - `FinalizeExternalStreams` calls no provider method: with a provider that raises on every call,
   finalization still produces a marker with a terminal, and provider code runs on neither the
   Workflow thread nor the finalization path.
