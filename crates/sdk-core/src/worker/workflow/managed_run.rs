@@ -248,6 +248,12 @@ impl ManagedRun {
         // set would make the next ordinary completion look like a lang protocol violation.
         self.waiting_on_local_work.pending_finalization = None;
         self.waiting_on_local_work.pending_park = None;
+        // Same reasoning for a query answer held across that finalization: the task it was going
+        // to be reported on is gone, and the server re-delivers the query on the replacement if it
+        // is still outstanding. Reporting it on *this* task would answer a query nobody asked.
+        self.waiting_on_local_work
+            .deferred_query_responses
+            .clear();
         self.wft = Some(OutstandingTask {
             info: wft_info,
             pending_queries,
@@ -859,7 +865,7 @@ impl ManagedRun {
         // than the local-activity subsystem's.
         let completing_deadline_rollover =
             mem::take(&mut self.waiting_on_local_work.deadline_rollover_pending);
-        let data = CompletionDataForWFT {
+        let mut data = CompletionDataForWFT {
             task_token: completion.task_token,
             query_responses: completion.query_responses,
             has_pending_query: completion.has_pending_query,
@@ -880,11 +886,24 @@ impl ManagedRun {
             )));
         }
 
+        // A query answer held across a `FinalizeExternalStreams` round trip rides back onto the
+        // completion that finally reports the task. The round trip keeps the Workflow Task open
+        // and runs no user Workflow code, so lang has no way to resend the answer; without this it
+        // would be answered to nobody and the server would wait its query out.
+        if !self
+            .waiting_on_local_work
+            .deferred_query_responses
+            .is_empty()
+        {
+            data.query_responses
+                .append(&mut self.waiting_on_local_work.deferred_query_responses);
+        }
+
         // External stream commands are consumed here rather than by the machines. Taking them
         // first is also what makes "no server-bound command accompanies the completion" checkable:
         // whatever is left after this *is* the server-bound set.
         let mut lang_commands = completion.commands;
-        let stream_commands = match take_external_stream_commands(&mut lang_commands) {
+        let mut stream_commands = match take_external_stream_commands(&mut lang_commands) {
             Ok(taken) => taken,
             Err(source) => {
                 return Err(RunUpdateErr {
@@ -1006,9 +1025,18 @@ impl ManagedRun {
             || completing_budget_rollover
             || finalized_boundary == Some(ParkReason::Rollover);
 
-        // Whether this completion retains the task, decided before anything is pushed into the
+        // Registering the wait set and retaining the Workflow Task are two separate questions, and
+        // they are decided separately here. Both are decided before anything is pushed into the
         // machines so the marker can be ordered ahead of lang's own commands.
         //
+        // These are the boundaries that answer *both* questions "no". Each of them either tears
+        // the Run down or hands it to a finalization round trip that has already named the current
+        // quiescence generation, so re-recording lang's snapshot would bump that generation
+        // underneath a job already in flight for it.
+        let boundary_closes_the_run = data.activation_was_eviction
+            || completing_rollover
+            || completing_shutdown
+            || finalized_boundary.is_some();
         // A pending rollover overrides a retention request. Lang asked to be held open without
         // knowing the deadline had already expired, and honouring that would restart the deadline
         // and hold the task past the timeout it exists to stay inside -- rollover is
@@ -1017,13 +1045,49 @@ impl ManagedRun {
         // A teardown overrides it for a harder reason still: lang asked to be held open on a
         // Worker that is going away, and honouring that would leave a Workflow Task retained with
         // nothing left to release it and no replacement task ever coming.
-        let will_retain = (stream_commands.quiescence.is_some() || park_retains)
+        let retention_requested =
+            (stream_commands.quiescence.is_some() || park_retains) && !boundary_closes_the_run;
+        // Replay runs no timers. A replayed Run still has to *register* its wait set -- that set
+        // is per-Worker runtime state, not History, so nothing else rebuilds it -- but retaining a
+        // replayed task would arm the idle and rollover deadlines against wall-clock time that has
+        // nothing to do with the recorded boundary, and a replay slower than the idle timeout
+        // would queue a park handshake in between replay activations. The marker reproduces the
+        // boundary instead; there is nothing here for a timer to decide.
+        let replaying = self.wfm.machines.replaying;
+        let answering_a_query = !data.query_responses.is_empty();
+        let will_retain =
+            retention_requested && !has_server_bound_commands && !answering_a_query && !replaying;
+
+        // Registering is not retaining. A completion that also produced a timer, activity, child
+        // workflow or signal must be reported so the server can act on it -- but the subscriptions
+        // that same completion described are still what the Workflow is blocked on, and Core is
+        // the only place they are recorded. Dropping them along with the retention leaves the Run
+        // permanently unresumable: nothing is registered, so a wake Signal marks nothing ready,
+        // readiness has no wait to resolve against, and every Workflow Task the wake produces is
+        // empty.
+        let registers_without_retaining = !will_retain && !boundary_closes_the_run;
+        // The one refusal lang's own commands do not account for. Lang asked to be held open, so
+        // its `WorkflowStreamProgress` deliberately carried no terminal -- the terminal was going
+        // to arrive on a park result or a finalization. Core is refusing because a query answer
+        // has to be reported, and that makes this a boundary *Core* decided, owed a finalization
+        // round trip exactly as the rollover deadline and a teardown are. Writing `TaskCompleted`
+        // here instead would commit an annotation with no terminal frame, which ADR-008 forbids
+        // without exception.
+        //
+        // "Still blocked" covers two shapes and has to cover both. Lang may have reported a fresh
+        // snapshot on this very completion, or the snapshot it reported earlier may still be
+        // registered and still retaining -- which is what a query answered on its own activation
+        // looks like, since the completion carrying the answer produces no stream command at all.
+        // Lang's terminal is no more available in the second shape than in the first, and the
+        // annotation at risk was accumulated before either.
+        let stream_waits_still_pending = stream_commands.quiescence.is_some()
+            || park_retains
+            || self.waiting_on_local_work.external_wait_set.retains_wft();
+        let query_refused_retention = stream_waits_still_pending
+            && !boundary_closes_the_run
             && !has_server_bound_commands
-            && !data.activation_was_eviction
-            && data.query_responses.is_empty()
-            && !completing_rollover
-            && !completing_shutdown
-            && finalized_boundary.is_none();
+            && !replaying
+            && answering_a_query;
 
         // `WorkflowStreamProgress` precedes every command whose value could depend on the
         // consumed data, and so must the marker recording it. Emitting after lang's commands were
@@ -1045,27 +1109,13 @@ impl ManagedRun {
             Some(ParkReason::WorkflowCompleted)
         } else if has_server_bound_commands {
             Some(ParkReason::CommandsProduced)
-        } else if completing_deadline_rollover || completing_shutdown {
+        } else if completing_deadline_rollover || completing_shutdown || query_refused_retention {
             // Core decided this boundary and lang was never asked for a terminal. Nothing may be
             // written until the finalization round trip below supplies one.
             None
         } else {
             Some(ParkReason::TaskCompleted)
         };
-
-        // The rollover deadline and a teardown are the two boundaries that reach here still owing
-        // a terminal. `false` means there was no annotation to finalize, so the task simply
-        // completes with a replacement requested and no marker -- nothing is owed and nothing is
-        // missing. Teardown outranks the deadline when both are pending: the replacement task the
-        // deadline wanted is the same one the teardown asks for, and one boundary gets one marker.
-        let awaiting_finalization = terminal.is_none()
-            && !will_retain
-            && (completing_deadline_rollover || completing_shutdown)
-            && self.begin_external_stream_finalization(if completing_shutdown {
-                ParkReason::Shutdown
-            } else {
-                ParkReason::Rollover
-            });
 
         if let Some(terminal) = terminal
             && let Err(source) = self.emit_external_stream_marker(terminal)
@@ -1075,6 +1125,32 @@ impl ManagedRun {
                 complete_resp_chan: completion.resp_chan,
             });
         }
+
+        // Recorded *after* the marker, so a marker still closes the snapshot that was in effect
+        // while the records it carries were consumed, and *before* the finalization request below,
+        // so a job asking lang to finalize names the snapshot lang has just reported rather than
+        // the one it superseded.
+        if registers_without_retaining
+            && let Some(request) = stream_commands.quiescence.take()
+        {
+            self.register_external_stream_quiescence(request);
+        }
+
+        // The rollover deadline, a teardown, and a query answer are the three boundaries that
+        // reach here still owing a terminal. `false` means there was no annotation to finalize, so
+        // the task simply completes with no marker -- nothing is owed and nothing is missing.
+        // Teardown outranks the deadline when both are pending: the replacement task the deadline
+        // wanted is the same one the teardown asks for, and one boundary gets one marker.
+        let awaiting_finalization = terminal.is_none()
+            && !will_retain
+            && (completing_deadline_rollover || completing_shutdown || query_refused_retention)
+            && self.begin_external_stream_finalization(if completing_shutdown {
+                ParkReason::Shutdown
+            } else if completing_deadline_rollover {
+                ParkReason::Rollover
+            } else {
+                ParkReason::TaskCompleted
+            });
 
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
@@ -1120,6 +1196,12 @@ impl ManagedRun {
                 // answers -- which is the whole point of Core never writing a marker for a
                 // boundary it decided without one.
                 if awaiting_finalization {
+                    // A query answer that reached here must survive the round trip. The task is
+                    // still open, so nothing has been reported to the server yet, and the
+                    // finalization activation runs no user Workflow code -- lang cannot resend
+                    // what it already answered.
+                    self.waiting_on_local_work.deferred_query_responses =
+                        mem::take(&mut data.query_responses);
                     return Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -1481,14 +1563,39 @@ impl ManagedRun {
         }
     }
 
+    /// Records a quiescent snapshot, and nothing else.
+    ///
+    /// This is the *registration* half of quiescence, and it exists apart from the retaining half
+    /// because they answer different questions. What lang reports here is the set of subscriptions
+    /// the Workflow is blocked on, and Core is the only place that set is recorded -- a completion
+    /// that also produced a timer must be reported to the server, but the Workflow is no less
+    /// blocked on those streams for it, and a Run whose waits were never registered can never be
+    /// woken: readiness has no wait to resolve against and a wake Signal marks nothing ready.
+    ///
+    /// Nothing is armed here. No idle timer, no rollover deadline, and no all-fenced immediate
+    /// park -- each of those exists to end a *retained* Workflow Task, and a task that is about to
+    /// be reported, or that is being replayed, has no retention for them to end.
+    ///
+    /// Returns the new quiescence generation and the clamped idle timeout the snapshot was
+    /// recorded with, so the retaining path can arm its deadlines against the same values.
+    fn register_external_stream_quiescence(
+        &mut self,
+        request: QuiescenceRequest,
+    ) -> (u64, Duration) {
+        let idle_timeout = clamp_idle_below_rollover(request.idle_timeout, self.wft_timeout());
+        let generation = self
+            .waiting_on_local_work
+            .external_wait_set
+            .become_quiescent(request.waits, idle_timeout);
+        (generation, idle_timeout)
+    }
+
     /// Records a quiescent snapshot and starts the timers that bound it.
     ///
     /// **One** idle timer for the whole wait set, not one per subscription: the timeout measures
     /// *global* quiescence, so an idle stream cannot park a workflow task another stream is still
     /// driving.
     fn begin_external_stream_quiescence(&mut self, request: QuiescenceRequest) {
-        let wft_timeout = self.wft_timeout();
-
         // The rollover deadline is what stops a continuously fed stream -- one whose gaps never
         // reach the idle timeout -- from holding the task until it *fails*.
         //
@@ -1497,16 +1604,12 @@ impl ManagedRun {
         // out for as long as records keep arriving -- and that is exactly the workload rollover
         // exists for. The deadline would then never fire, the idle timer is clamped below it and
         // cannot fire either, and the retained task would run until the server timed it out.
-        if let Some(wft_timeout) = wft_timeout {
+        if let Some(wft_timeout) = self.wft_timeout() {
             let started_at = self.current_wft_start_time();
             self.start_wft_rollover_timer(started_at, wft_timeout);
         }
 
-        let idle_timeout = clamp_idle_below_rollover(request.idle_timeout, wft_timeout);
-        let generation = self
-            .waiting_on_local_work
-            .external_wait_set
-            .become_quiescent(request.waits, idle_timeout);
+        let (generation, idle_timeout) = self.register_external_stream_quiescence(request);
 
         self.cancel_external_stream_idle_timer();
 
@@ -2526,6 +2629,14 @@ struct WaitingOnLocalWork {
     /// can pick it up and reconstruct the subscriptions from the marker. Unlike the deadline, the
     /// Run does not expect to serve that replacement itself.
     shutdown_pending: bool,
+    /// A query answer held while a `FinalizeExternalStreams` round trip runs.
+    ///
+    /// A query response is what refuses retention on an otherwise ordinary quiescent completion,
+    /// and that refusal makes the boundary Core's rather than lang's -- so lang's report carries
+    /// no terminal and one has to be asked for. The round trip keeps the Workflow Task open, so
+    /// nothing has been reported yet, and it runs no user Workflow code, so lang cannot resend the
+    /// answer. Held here, it rides onto the completion that finally reports the task.
+    deferred_query_responses: Vec<QueryResult>,
 }
 
 impl Drop for WaitingOnLocalWork {
