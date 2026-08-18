@@ -1,9 +1,7 @@
 # Core/lang protocol
 
 Every message, call, and piece of Core state the feature adds. Names are internal to the Core
-bridge. Line anchors are in `code-anchors.md`.
-
-Owned by C1 (protos), C2–C15b (Core), P7 (bridge).
+bridge.
 
 ## Responsibility split
 
@@ -42,7 +40,9 @@ message WorkflowStreamProgress {
   bool request_rollover = 2;
 }
 
-// Tag 24. Asks Core to retain the open WFT. Carries no annotation data.
+// Tag 24. Reports the complete quiescent snapshot. Carries no annotation data.
+// Registration and retention are separate: Core always records the set, and
+// holds the WFT open only where the completion can be held open at all.
 message WorkflowStreamQuiescent {
   uint64 quiescence_generation = 1;
   repeated ExternalStreamWait waits = 2;
@@ -175,6 +175,7 @@ Core*, with no Python activation outstanding at the moment of decision:
 | Byte-budget rollover | Python, via `request_rollover` | already carried by the triggering `WorkflowStreamProgress` |
 | Command-producing completion | Python | already carried by the completion's `WorkflowStreamProgress` |
 | Terminal Workflow completion | Python | same, ordered before the terminal command |
+| Query answered while stream waits are still registered | Core, by refusing retention to report the answer | `FinalizeExternalStreams` → `ExternalStreamFinalized` |
 | Worker shutdown / eviction, Workflow Task open | Core | `FinalizeExternalStreams{SHUTDOWN}` → `ExternalStreamFinalized`. If Python cannot answer, **no marker is written** and the Workflow Task fails for retry |
 | Worker shutdown / eviction, no open Workflow Task | — | No marker exists to write; see `wft-lifecycle.md` |
 
@@ -327,7 +328,7 @@ reuse that mechanism — see ADR-017 and C13.
 
 ## Implementation locations
 
-Files to touch, with line anchors in `code-anchors.md`:
+The surface the feature occupies:
 
 **Core protobufs** (`crates/protos/protos/local/temporal/sdk/core/`):
 `workflow_commands/workflow_commands.proto`, `external_stream/external_stream.proto` (the

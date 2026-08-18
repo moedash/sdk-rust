@@ -1,6 +1,6 @@
 # ADR-024 — Milestone 0 is a throwaway spike that exports no public API
 
-**Status:** Accepted · **Affects:** all Milestone 0 members, P9 · **Spec:** `plan/milestones.md`
+**Status:** Accepted · **Affects:** all Milestone 0 members, P9 · **Spec:** —
 
 ## Context
 

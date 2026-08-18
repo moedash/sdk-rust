@@ -3,8 +3,6 @@
 The server-visible wakeup used whenever no open Workflow Task can accept local readiness. It never
 carries stream payloads.
 
-Owned by C1 (envelope proto), C11 (interception), P14 (producer send path), P20 (shutdown sweep).
-
 ## Where it is used
 
 ```text
