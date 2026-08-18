@@ -1,12 +1,15 @@
 # Milestone 1 required tests — 55 cases
 
-One stream, end to end. This list is P16a's gate. Milestone 2's 12 cases are in
-`tests-m2.md`; the two partition the 67 required cases exactly. A Milestone 1 gate that
-required the whole list would be unmeetable, because a fifth of it exercises capabilities
-Milestone 1 deliberately does not ship.
+One stream, end to end. Milestone 2's 12 cases are in `tests-m2.md`; the two partition the
+67 required cases exactly.
 
-Every bullet is one case. If you add or remove one, update the count in this heading and in
-P16a's title and `Done when`.
+This list is read at test time, not by a human: `tests/contrib/external_workflow_streams/
+m1_gate.py` parses the count in the heading and every bullet below it, and maps each case
+to the test that covers it. A case added here with no mapping fails that gate rather than
+passing unnoticed.
+
+Every bullet is one case. If you add or remove one, update the count in this heading; the
+gate checks that the two agree.
 
 ## Progress, observation, and marker transport
 

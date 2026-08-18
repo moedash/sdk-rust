@@ -2,8 +2,6 @@
 
 Four distinct outcomes, deliberately not collapsed — each has a different operator response.
 
-Owned by P18 (error types and metrics), P13 (classification at the replay read path).
-
 ## One channel, four meanings
 
 All four outcomes are expressed through the same channel, because a Workflow activation completion

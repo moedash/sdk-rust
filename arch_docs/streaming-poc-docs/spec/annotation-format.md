@@ -3,9 +3,6 @@
 The opaque bytes Python encodes, Core stores in a marker, and Python decodes on replay. Core never
 parses it.
 
-Owned by P5 (codec), P10b (emission), P13 (replay read path), C14a/C14b (accumulation and marker
-emission).
-
 ## The invariant
 
 Workflow code is deterministic given two things, and only these two need to be reproduced:

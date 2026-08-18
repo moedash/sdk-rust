@@ -32,7 +32,7 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [021](ADR-021-delivery-is-broadcast.md) | Delivery to multiple subscriptions is broadcast, not work-sharing | `spec/wft-lifecycle.md` |
 | [022](ADR-022-continue-as-new-cursor-in-a-reserved-header.md) | The Continue-As-New cursor travels in a reserved internal header | `spec/annotation-format.md` |
 | [023](ADR-023-park-generation-zero-is-the-unparked-wake.md) | `park_generation = 0` is the unparked wake | `spec/wake-signal.md` |
-| [024](ADR-024-milestone-0-is-throwaway.md) | Milestone 0 is a throwaway spike that exports no public API | `plan/milestones.md` |
+| [024](ADR-024-milestone-0-is-throwaway.md) | Milestone 0 is a throwaway spike that exports no public API | — |
 | [025](ADR-025-wake-signal-bypasses-the-data-converter.md) | The wake Signal bypasses the user's `DataConverter` | `spec/wake-signal.md` |
 | [026](ADR-026-delivery-is-bounded-by-a-record-count.md) | Delivery within one activation is bounded by a record count, not by time | `spec/python-runtime.md` |
 

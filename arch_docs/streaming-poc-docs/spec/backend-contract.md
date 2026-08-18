@@ -2,9 +2,6 @@
 
 What a stream provider must implement to be registrable, and what the producer side must supply.
 
-Owned by P2 (core interface + conformance suite), P2b (parking extension), P3/P3b (Redis),
-P6/P6a/P6b (producer), P17 (registry).
-
 ## Required operations
 
 A backend implementation must provide:
@@ -90,13 +87,20 @@ The suite is the deliverable, not the interface. It must contain, at minimum:
   since that error is invisible until the first replay;
 - a case that fails a backend comparing offsets lexically, crossing a millisecond-width boundary;
 - a case that fails a backend accepting an idempotency-key reuse with different bytes;
-- park intents keyed by stream alone failing the two-subscription case (ADR-012); and
+- park intents keyed by stream alone failing the two-subscription case (ADR-012);
+- a case that removes an installed intent and requires `current_park_generation` to report nothing
+  afterwards, since a provider that keeps answering is wrong only where nothing else looks at it; and
 - a claim that never expires failing the leased-claim case.
 
 ## Parking operations
 
-`install_park_intent`, `remove_park_intent`, `recheck`, `claim_park_generation`,
-`current_park_generation`.
+`install_park_intent`, `remove_park_intent`, `park_intent`, `recheck`, `parked_wait_ids`,
+`claim_park_generation`, `current_park_generation`.
+
+`parked_wait_ids` is enumeration rather than a new concept — the `wait_id` half of the intent key,
+for one stream — and it is what makes the other operations reachable from the producer side at all.
+A producer knows the stream it appended to and nothing about the Workflow's subscriptions, because
+`wait_id` comes from a per-Run counter inside `subscribe()` that no producer can see.
 
 Intents are keyed **`(stream key, wait_id)`**, never by stream key alone (ADR-012), carrying the
 cursor boundary, the `park_generation`, and the current Run ID as the intent's *value*.
@@ -106,6 +110,18 @@ and the stream key already contains the first execution Run ID, so the key is un
 chain, and only one Run of a chain is live at a time. Carrying the Run ID as the value means a new
 Run's intent deterministically replaces its predecessor's for the same key rather than
 accumulating alongside it.
+
+**An intent exists only while its park is outstanding.** The consumer holds up one half of that —
+installing an intent when a park is confirmed, removing it when that park is over — and the provider
+holds up the other: once an intent is removed, `current_park_generation` must report nothing for that
+subscription. A provider that answered from a remembered "last generation" beside the intent passes
+every other requirement here and still breaks both of that call's readers, in the same direction and
+invisibly. A producer would name a generation Core has already discarded, and a non-zero generation
+the Run does not recognize is exactly what Core ignores as stale — so the record is appended, the
+Signal is sent, and the Workflow is never woken. The consumer's own shutdown sweep would read the
+same answer and send a parked wake where it owes the unparked one; a parked wake's request ID ignores
+sender identity by design, so it arrives byte-identical to the wake that ended that park and the
+server deduplicates it away.
 
 **Claims must be leased and renewable.** An unleased claim introduces a failure mode: a producer
 that crashes between claiming and signaling strands the generation, and other producers conclude

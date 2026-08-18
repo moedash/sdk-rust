@@ -1,74 +1,59 @@
 # Workflow Task lifecycle
 
-When a Workflow Task is retained, how it ends, and how a subscription is woken in each state it
-can be left in.
-
-Owned by C6, C7, C8, C12a, C12b, C13, C15b (Core) and P10a, P11, P20 (Python).
+When a Workflow Task is retained, how it ends, and how a subscription is woken in each state it can
+be left in.
 
 ## Live consumption
 
-When `subscribe()` has demand during an open Workflow Task, the SDK runtime reads from the last
-committed offset and resumes the Workflow for each data record. It continues draining while
-records are available, across as many activations as that takes: one activation delivers at most
-`MAX_RECORDS_PER_ACTIVATION` records and then blocks so the activation can end, even where more
+While a Workflow Task is open, the runtime reads from the last committed offset and resumes the
+Workflow for each data record, across as many activations as draining takes — one activation
+delivers a bounded number of records and then blocks so the activation can end, even where more
 records are already buffered (`python-runtime.md`).
 
-The runtime parks the subscription and allows the Workflow Task to complete when either:
-
-1. every active subscription has reached a write fence with no subsequent record immediately
-   available; or
-2. no record arrives on any active subscription before the configured idle timeout.
-
-The idle timeout covers producers that crash, omit `finish_writing()`, or do not use the SDK.
+The Workflow Task ends when either every active subscription has reached a write fence with no
+subsequent record immediately available, or no record arrives on any of them before the idle timeout.
+The timeout covers producers that crash, omit `finish_writing()`, or do not use the SDK.
 
 ## The idle timeout is a Workflow-Task policy
 
 It applies to the **complete set** of subscriptions the Workflow is blocked on, not to each
-subscription independently: one idle stream cannot park the Workflow Task while another is still
-delivering records. A later record does not violate a fence; it simply wakes the Workflow and
-consumption resumes.
-
-Because the timeout is a property of the set, subscriptions in one quiescent set configured with
-different idle timeouts must reduce to one value. **The reduction is `min`** (ADR-016), applied
-over the quiescent set in `wait_id` order, then clamped below the rollover deadline. The inputs
-are the configured values of the quiescent set and nothing else, so the result is deterministic
-and reproduces on replay.
-
-Default: one second, set through `with_options`. A non-positive or absent timeout is a
-configuration error rejected at `with_options` time, not silently coerced; Core independently
-rejects a `WorkflowStreamQuiescent` whose `idle_timeout` is non-positive as a malformed
-completion.
+subscription independently: one idle stream cannot park a Workflow Task another stream is still
+driving, and a fence on one stream cannot bypass the timer. So a set whose members are configured
+differently must reduce to one value — by `min`, in `wait_id` order, over the quiescent set and
+nothing else, which is what makes the result reproduce on replay (ADR-016). Core clamps the result
+below the rollover deadline so rollover stays authoritative, and rejects a non-positive timeout as a
+malformed completion rather than coercing it.
 
 ## Workflow Task rollover is mandatory
 
-A retained Workflow Task is bounded by the server's Workflow Task timeout. A continuously fed
-stream whose inter-record gaps stay below the idle timeout never reaches the idle parking path, so
-without rollover the retained task simply times out — the Workflow Task is not merely held too
-long, it *fails*. The runtime therefore always runs a rollover deadline derived from the Workflow
-Task timeout, independent of the idle timeout, and completes the current task early when rollover
-wins. Every active subscription, cursor, annotation delta, and readiness generation survives
-rollover. The idle timeout is clamped below the rollover deadline so rollover stays authoritative.
+A retained Workflow Task is bounded by the server's Workflow Task timeout, and a continuously fed
+stream never reaches the idle parking path at all. The runtime therefore always runs a rollover
+deadline derived from the Workflow Task timeout and independent of the idle timeout, and completes
+the current task early when it wins; every active subscription, cursor, annotation delta, and
+readiness generation survives. It needs a timer facility that does not depend on the local-activity
+request sink (ADR-017).
 
 **Rollover bounds the Workflow Task, not an activation.** Core decides it between activations and
 cannot interrupt one in progress, so it is no protection against a single activation that never
 returns. What bounds an activation is the per-activation record budget in `python-runtime.md`.
 
-Rollover also bounds a second effect of holding a Workflow Task open: while the task is retained,
-the server cannot start another one, so Signals, Updates, and non-legacy Queries queue until the
-task completes. This is the same property outstanding local activities already have, but a stream
-can hold a task open far longer. Retention latency for those inputs is therefore bounded by the
-rollover deadline and nothing else, and callers who need lower latency must lower the Workflow Task
-timeout rather than the idle timeout.
-
-Rollover needs a timer facility that does not depend on the local-activity request sink — see
-ADR-017 and C13.
+Rollover also bounds a second effect of holding a task open: while it is retained the server cannot
+start another one, so Signals, Updates, and non-legacy Queries queue until it completes. Outstanding
+local activities already have this property, but a stream can hold a task open far longer. Retention
+latency for those inputs is bounded by the rollover deadline and nothing else, so callers who need
+lower latency must lower the Workflow Task timeout rather than the idle timeout.
 
 ## Two independent questions at every activation return
 
-1. **Did replay-visible stream state change?** If yes, a `WorkflowStreamProgress` command carries
-   the observation delta, on *every* completion path. This is what commits the cursor boundary.
-2. **Should the Workflow Task be retained?** If yes, a `WorkflowStreamQuiescent` command asks Core
-   to hold it open. This is what starts the idle timer.
+1. **Did replay-visible stream state change?** If yes, a `WorkflowStreamProgress` command carries the
+   observation delta, on *every* completion path. This is what commits the cursor boundary, and it is
+   not conditional on why the Workflow Task ended: if a consumed record influences a command that
+   lands in History while the consumption itself is never marked, replay re-delivers that record
+   while the command it produced is already durable, and the divergence surfaces as an unrelated
+   nondeterminism error much later (ADR-005).
+2. **Is the Workflow blocked on streams?** If yes, a `WorkflowStreamQuiescent` command reports the
+   complete quiescent snapshot. This registers the wait set with Core and — on the completions that
+   can be held open — starts the idle timer.
 
 A completion may carry either command, both, or neither. `WorkflowStreamProgress` never implies
 retention, and `WorkflowStreamQuiescent` carries no annotation data (ADR-004).
@@ -76,29 +61,42 @@ retention, and `WorkflowStreamQuiescent` carries no annotation data (ADR-004).
 | Condition at return | Python sends | Core does |
 |---|---|---|
 | No subscriptions, nothing observed | Normal completion | Reports the WFT to the server |
-| Records consumed, no pending stream waits | `WorkflowStreamProgress{observation_delta}` | Records the marker, reports the WFT |
+| Records consumed, no pending stream waits | `WorkflowStreamProgress` | Records the marker, reports the WFT |
 | Records consumed **and** a terminal command (complete, fail, cancel, continue-as-new) | `WorkflowStreamProgress` **ordered before** the terminal command | Records the marker, then applies the terminal command |
-| Stream waits pending **and** server-bound commands (timer, activity, child workflow, signal) | `WorkflowStreamProgress` ordered before those commands; no `WorkflowStreamQuiescent` | Records the marker, completes the WFT normally; subscriptions stay registered |
-| Stream waits pending, no other command, **nothing consumed** | `WorkflowStreamProgress` carrying the header on first observation plus an **empty segment**, then `WorkflowStreamQuiescent` | Accumulates the delta, retains the WFT, starts the idle timer |
-| Stream waits pending, no other command, records consumed | `WorkflowStreamProgress`, then `WorkflowStreamQuiescent{quiescence_generation, waits[], idle_timeout}` with the **complete** set | Accumulates the delta, `ActivationCompleteOutcome::DoNothing`, retains the WFT, starts **one** idle timer for the set |
+| Stream waits pending **and** server-bound commands (timer, activity, child workflow, signal) | `WorkflowStreamProgress` ordered before those commands, then `WorkflowStreamQuiescent` with the same complete snapshot | Records the marker, **registers the waits, arms no timer**, reports the WFT |
+| Stream waits pending, no other command, **nothing consumed** | `WorkflowStreamProgress` carrying the header on first observation plus an **empty segment**, then `WorkflowStreamQuiescent` | Accumulates the delta, registers the waits, retains the WFT, starts the idle timer |
+| Stream waits pending, no other command, records consumed | `WorkflowStreamProgress`, then `WorkflowStreamQuiescent` with the **complete** set | Accumulates the delta, `ActivationCompleteOutcome::DoNothing`, retains the WFT, starts **one** idle timer for the set |
 
-**Command ordering is normative**: `WorkflowStreamProgress` precedes every command whose value
-could depend on consumed data. On replay this guarantees that integrity validation for a record
-runs before the command derived from it is matched.
+**Command ordering is normative**: `WorkflowStreamProgress` precedes every command whose value could
+depend on consumed data, and so does the marker recording it. On replay that is what guarantees a
+record is validated before the command derived from it is matched.
 
-While a Workflow Task is retained, successive deltas accumulate in
-`ExternalWaitSet.replay_annotation` and are written as one marker when the task finally completes
-— whether that completion comes from parking, rollover, or a later activation that produces
-commands. **Core never writes two markers for one Workflow Task.**
+Successive deltas accumulate while the task is retained and are written as **one** marker when it
+finally completes, whether from parking, rollover, or a later activation that produces commands.
 
-## Progress is committed on every completion path
+### Registering a wait set is not retaining the Workflow Task
 
-Consuming a record and committing that consumption are separate steps, and the second is not
-conditional on *why* the Workflow Task ended. The failure this rules out is specific and silent:
-if a consumed record influences a command that lands in History while the consumption itself is
-never marked, replay re-reads that record from the last committed cursor and delivers it again,
-while the command it produced is already durable. The result is a divergence that surfaces as an
-unrelated nondeterminism error much later. See ADR-005.
+The two are decided separately, and only the second is refusable. A completion carrying server-bound
+commands must be reported so the server can act on them, so it cannot ask for retention — but the
+Workflow is no less blocked on those subscriptions for it, and **Core is the only place that set is
+recorded**. Core therefore registers the waits and arms nothing: no idle timer, no rollover deadline,
+no all-fenced immediate park, because each of those exists to end a *retained* task.
+
+Welding the two together — withholding the snapshot on any completion that cannot be retained for —
+leaves a Workflow that starts a timer and first blocks on a stream in the same activation registered
+nowhere. Readiness then has no wait to resolve against, a wake Signal marks nothing ready, and every
+Workflow Task a wake produces completes empty: the Run is unresumable by any wake, with its records
+sitting in the stream. That is a permanent deadlock reachable from ordinary user code.
+
+Two more completions register without retaining. A **replayed** completion must, because the wait set
+is per-Worker runtime state rather than History and nothing else rebuilds it, while retaining a
+replayed task would arm wall-clock deadlines against a boundary the marker has already fixed. A
+**query answered on its own activation** refuses retention in order to report the answer, which makes
+it a boundary Core decided and so one owed a finalization round trip before any marker is written.
+
+The mirror-image rule: a boundary that tears the Run down, or that has already asked lang to
+finalize, registers **nothing** — re-recording a snapshot there would bump the quiescence generation
+underneath a job already in flight against it.
 
 ## Race-free parking
 
@@ -107,26 +105,24 @@ uses a generation-based handshake coordinated through the backend:
 
 1. Core marks every wait `Parking` and sends `PrepareExternalStreamPark`. This is runtime-internal;
    no user Workflow code runs.
-2. Python installs a park intent per **subscription**, keyed `(stream key, wait_id)`, containing
-   its cursor boundary and the park generation.
+2. Python installs a park intent per **subscription**, keyed `(stream key, wait_id)`, carrying its
+   cursor boundary and the park generation.
 3. After all intents are installed, it rechecks every stream.
 4. All still empty → `ParkSetConfirmed`, carrying the terminal `final_observation_delta`. Core
    appends it, records the marker, and completes the WFT.
-5. Any stream ready → Python removes every installed intent and returns `StreamSetBecameReady`.
-   Core aborts that parking generation and issues `ResolveExternalStreamWaits`.
+5. Any stream ready → Python removes every installed intent and returns `StreamSetBecameReady`. Core
+   aborts that parking generation and issues `ResolveExternalStreamWaits`.
 
-A producer first appends its record, then observes or claims the current park generation and sends
-a lightweight Temporal Signal. This ordering closes the empty-check/completion race: an append is
-either seen by the active consumer or paired with a wake Signal.
+A producer appends its record *before* it observes or claims the park generation, and only then sends
+the wake Signal. That ordering plus the recheck at step 3 is what closes the empty-check/completion
+race: an append is either seen by the recheck or paired with a Signal. Readiness accepted before
+`ParkSetConfirmed` wins, and the confirmation for that generation is then stale.
 
-Readiness accepted before `ParkSetConfirmed` wins; the confirmation for that generation is then
-stale. If the rollover deadline beats the idle timer, Core finalizes through
-`FinalizeExternalStreams{ROLLOVER}`, records one marker, completes with `force_new_wft = true`, and
-the subscriptions resume on the replacement Workflow Task.
-
-A provider may use an atomic backend transaction, but it is not required if per-stream intent
-installation plus the final all-stream recheck closes every append race. Core treats the result as
-one atomic state transition.
+**A park intent exists only while its park is outstanding**, and both halves of that are obligations.
+Python removes the intents of a park this Run is no longer sitting in — `ResolveExternalStreamWaits`
+is the notice, because it covers both ways a confirmed park ends and Core's own state moving on is
+not something the backend can observe. The provider must stop reporting a generation once its intent
+is removed (`backend-contract.md`), or every reader of that call acts on a park that is over.
 
 ## Three generations, named separately
 
@@ -136,49 +132,42 @@ one atomic state transition.
 | `quiescence_generation` | one complete blocked snapshot | the Workflow becomes quiescent again after any resumption | the quiescence report, the park preparation job, and the park result |
 | `park_generation` | one confirmed park of a set | a park set is confirmed | the backend park intent and the wake Signal |
 
-`park_generation` takes the value of the `quiescence_generation` that was parked, rather than being
-a fourth independent counter. A wake Signal carries `(wait_id, park_generation)`, and those two
-values are the only generation state that reaches the backend or the wire; `wait_generation` never
-leaves the Core/lang boundary.
+`park_generation` takes the value of the `quiescence_generation` that was parked rather than being a
+fourth counter. A wake Signal carries `(wait_id, park_generation)`, and those two values are the only
+generation state that reaches the backend or the wire; `wait_generation` never leaves the Core/lang
+boundary.
 
 A Signal naming a generation the current Run does not recognize is harmless: the runtime rechecks
-every active subscription on wakeup regardless, so a stale Signal costs at most one empty Workflow
-Task, which this design permits. A wake sent when **no** park generation exists carries the reserved
-value `park_generation = 0` and is a recheck request, not a stale Signal (ADR-023).
-
-A wake Signal names one stream, but it is only a hint: on wakeup the runtime rechecks every active
-subscription.
+every active subscription on wakeup regardless — the stream a wake names is only a hint — so a stale
+Signal costs at most one empty Workflow Task, which this design permits. A wake sent when **no** park
+generation exists carries the reserved `park_generation = 0` and is a recheck request rather than a
+stale Signal (ADR-023).
 
 ## Completions that leave subscriptions active but unparked
 
-Parking is not the only way a Workflow Task can end with subscriptions still waiting. A completion
-carrying server-bound commands, and a rollover, both end the task without a park handshake. In that
-state there is no retained task to notify locally and no park generation for a producer to observe,
-so a later append has nothing to wake.
+A completion carrying server-bound commands, and a rollover, both end the Workflow Task without a
+park handshake. In that state there is no retained task to notify locally and no park generation for
+a producer to observe, so a later append has nothing to wake. Three mechanisms cover it, and one of
+them always applies:
 
-Three mechanisms cover it, and one of them always applies:
+1. **The consumer's own watchers.** Watchers stay live while the Run is cached, and one that observes
+   an append with no Workflow Task open sends the wake Signal itself. This is the normal path, and it
+   also covers a producer that crashed after appending.
+2. **A forced replacement Workflow Task — only while a Workflow Task is open.** A Run being shut down
+   that still holds a task finalizes its marker and completes the task requesting a replacement.
+3. **An unparked wake Signal — when no Workflow Task is open.** A replacement is requested *on the
+   completion of an existing task*, and there is none, so the runtime sends the reserved wake Signal
+   itself and waits for the server to acknowledge it before the watchers go away.
 
-1. **The consumer's own watchers.** Watchers stay live while the Run is cached. A watcher that
-   observes an append when no Workflow Task is open sends the wake Signal itself. This is the
-   normal path, and it also covers a producer that crashed after appending.
-2. **A forced replacement Workflow Task — only while a Workflow Task is open.** When the runtime is
-   shutting a Run down and that Run still holds a Workflow Task, it finalizes the marker and
-   completes the task requesting a replacement.
-3. **An unparked wake Signal — when no Workflow Task is open.** Forcing a replacement is not
-   available there, because a replacement is requested *on the completion of an existing task* and
-   there is none. The runtime instead sends the reserved wake Signal itself and waits for the
-   server to acknowledge it before the watchers go away.
+Mechanisms (2) and (3) are runtime-owned state transitions, not something the consuming Workflow
+requests (ADR-009), and both are offers to the task queue rather than promises by the shutting-down
+Worker: any eligible Worker may pick the task up and reconstruct the subscription from the marker,
+and if none is available the task times out and the server retries it.
 
-Mechanisms (2) and (3) are **runtime-owned state transitions, not something the consuming Workflow
-requests** (ADR-009). Both are, deliberately, offers to the task queue rather than promises by the
-shutting-down Worker: any eligible Worker may pick the task up and reconstruct the subscription
-from the marker. If none is available, the task times out and the server retries it, which is
-ordinary Worker-shutdown behavior.
-
-**A marker is never written without its terminal.** Whichever mechanism applies, the runtime does
-not commit a partial replay annotation to History as a best effort. If the boundary cannot be
-finalized, the Workflow Task is abandoned and retried instead — an abandoned task commits no cursor
-and loses no record, while a truncated annotation is durable and wrong (ADR-008).
+**A marker is never written without its terminal.** If the boundary cannot be finalized the Workflow
+Task is abandoned and retried rather than committing a partial annotation as a best effort: an
+abandoned task commits no cursor and loses no record, while a truncated annotation is durable and
+wrong (ADR-008).
 
 ## Shutdown and eviction are two transitions
 
@@ -188,118 +177,85 @@ and loses no record, while a truncated annotation is durable and wrong (ADR-008)
 | No open Workflow Task — the window after a command-producing or rolled-over completion | **None.** Nothing is accumulated; see the invariant below | Python's manager sends the reserved wake Signal for each active subscription and awaits acknowledgement, then tears the watcher down |
 | No open Workflow Task and the wait set is parked | None | None needed. A confirmed park generation exists, so the producer's wake path applies unchanged |
 
+Core and Python must classify a Run into the same row — Core when it decides whether to finalize,
+Python's sweep when it decides whether a wake is owed — or a Run is handled by both mechanisms or by
+neither.
+
 ### The invariant that makes the first row safe
 
 > An accumulated, unwritten annotation exists only while a Workflow Task is open.
 
-Deltas arrive only on activation completions, activations exist only under a Workflow Task, and
-every Workflow Task completion path writes the accumulated annotation as exactly one marker and
-clears it. So a Core-decided boundary either has a Workflow Task to finalize against, or has
-nothing to write. There is no third state in which Core holds a partial annotation with no way to
-complete it. Core asserts the invariant when it clears `ExternalWaitSet.replay_annotation`.
+Deltas arrive only on activation completions, activations exist only under a Workflow Task, and every
+completion path writes the accumulated annotation as exactly one marker and clears it. So a
+Core-decided boundary either has a Workflow Task to finalize against or has nothing to write; there
+is no third state in which Core holds a partial annotation with no way to complete it.
 
 ### Sequencing: teardown cannot precede finalization
 
-The ordering falls out of structure Core already has (see `code-anchors.md`):
-
-1. `_check_more_activations` returns early while an activation is outstanding, and the eviction
-   activation is produced in its final branch. A `FinalizeExternalStreams` activation issued before
-   eviction is therefore always completed before `RemoveFromCache` is issued.
-2. Python's per-Run teardown is driven by `RemoveFromCache`, not by the shutdown signal itself. The
-   manager must keep a Run's subscriptions, buffers, and cursor state alive until that job arrives.
-3. `shutdown_done` requires every Run to have no pending work, and with
-   `ignore_evicts_on_shutdown = false` — the Core default, which Python does not override — pending
-   evictions and their replies count as pending work.
-
-Two consequences that constrain the implementation:
+Eviction is produced only once no activation is outstanding, so a `FinalizeExternalStreams` issued
+before eviction is always answered before `RemoveFromCache`; Python's per-Run teardown is driven by
+`RemoveFromCache` rather than by the shutdown signal; and pending evictions count as pending work, so
+shutdown does not finish underneath them. Two consequences constrain the implementation:
 
 - The marker is written by the **finalization completion**, never by the eviction completion. An
-  eviction completion may carry no commands and reports nothing, so a marker attached there would
-  be silently dropped.
+  eviction completion reports nothing, so a marker attached there would be silently dropped.
 - If finalization cannot be answered, Python fails the activation rather than returning a partial
-  terminal. Core writes **no** marker, the Workflow Task fails and is retried by the server, and
-  the replacement attempt replays from the previous marker. Nothing consumed during the abandoned
-  Workflow Task was committed, so no record is lost and no cursor moves; the cost is one repeated
-  Workflow Task.
+  terminal. Core writes **no** marker and the task is retried from the previous one. Nothing consumed
+  during the abandoned Workflow Task was committed, so the cost is one repeated Workflow Task.
 
 ### The no-open-WFT transition
 
-Nothing local can create server-visible work here, so the wake Signal does it. The manager runs
-this as an explicit shutdown sweep rather than leaving it to watchers, because watchers only fire
-on an append and the point is to hand the Run to another Worker whether or not one arrives.
+Nothing local can create server-visible work here, so the wake Signal does it. The manager runs this
+as an explicit shutdown sweep rather than leaving it to watchers, because watchers only fire on an
+append and the point is to hand the Run over whether or not one arrives. An idle cached Run receives
+no eviction activation at shutdown at all, so the sweep cannot be folded into the eviction path.
 
-**The sweep is in two halves, at two points in shutdown**, because the moment the answers still
-exist is not the moment the wakes may be sent:
+**The sweep is in two halves, at two points in shutdown**, because the moment the answers still exist
+is not the moment the wakes may be sent:
 
 1. **Before Core's shutdown is initiated**, the manager calls `external_stream_run_status(run_id)`
-   once for every Run with active subscriptions and **records** the answer — a **read-only** probe
+   once for every Run with active subscriptions and **records** the answer — a **read-only** probe,
    answered on the same serialized local-input lane as readiness, returning
-   `WftOpen | Parked | NoOpenWorkflowTask | RunNotFound`. It is a separate call from
-   `notify_external_stream_ready` on purpose: readiness means "a record is buffered", and using it
-   as a probe would be a false claim that manufactures a spurious activation on the way out. This
-   half is bounded by a grace period of its own, much shorter than the sweep's: it is one message
-   per Run on Core's own local lane, so it is either quick or wedged, and everything it delays is a
-   Worker that has already been asked to stop.
-2. **After the pollers have stopped and every activation has been answered**, the manager acts on
-   the recorded answers. `WftOpen` — Core handled it; the finalization is already answered and the
-   first table row applies, so no wake is owed. `Parked` — nothing to do. `NoOpenWorkflowTask` or
-   `RunNotFound` — send the wake Signal and await the server's acknowledgement. A Run the first
-   half never reached is probed again here, on whatever Core has left to say.
-3. Teardown of a Run happens only after step 2 resolves for it, or after the Worker's
-   graceful-shutdown grace period expires.
+   `WftOpen | Parked | NoOpenWorkflowTask | RunNotFound`. It is deliberately not the readiness call:
+   readiness means "a record is buffered", and probing with it would be a false claim that
+   manufactures a spurious activation on the way out.
+2. **After the pollers have stopped and every activation has been answered**, the manager acts on the
+   recorded answers. `WftOpen` — the finalization is already answered and the first table row
+   applies, so no wake is owed. `Parked` — nothing to do. `NoOpenWorkflowTask` or `RunNotFound` —
+   send the wake Signal and await the server's acknowledgement. A Run the first half never reached is
+   probed again here, on whatever Core has left to say.
+3. Teardown of a Run happens only after step 2 resolves for it, or after the graceful-shutdown grace
+   period expires.
 
-**Why the probe cannot wait for the pollers to stop.** Core's workflow-state lane ends at
-`initiate_shutdown()` itself: `bump_stream()` pushes an input, `shutdown_done()` sees the shutdown
-token cancelled and an idle cached Run with no pending work, and the stream returns
-`PollError::ShutDown`. `external_stream_run_status` has no lane left to be answered on and falls
-through to `RunNotFound` — the same Run answers `NoOpenWorkflowTask` one line before
-`initiate_shutdown()` and `RunNotFound` one line after. Since `RunNotFound` owes a wake exactly as
-`NoOpenWorkflowTask` does, a sweep that probes afterwards still sends its wake and still looks
-correct, while the two answers that mean *do not send one* stop being reachable at all: a parked Run
-gets a wake it does not need, and a Run holding a Workflow Task gets one that races Core's own
-shutdown transition.
+Neither half can move to where the other is. Core's workflow-state lane ends when shutdown is
+initiated, so every later probe answers `RunNotFound` — which owes a wake exactly as
+`NoOpenWorkflowTask` does, so a late-probing sweep still sends its wake and still looks correct while
+the two answers that mean *do not send one* have silently stopped being reachable. And a wake sent
+before the pollers stop offers the Run to a task queue this Worker will answer itself. What the split
+gives up is the guarantee that no Run acquires a Workflow Task after the probe — costing at most one
+extra empty Workflow Task, against an ordering that would buy the guarantee with an answer describing
+nothing.
 
-**Why the wakes cannot go out with the probe.** Per-Run teardown is driven by `RemoveFromCache` and
-nothing else, so a `FinalizeExternalStreams` in flight has to be answered before the manager's state
-for that Run disappears; and a wake sent while this Worker is still polling offers the Run to a task
-queue this Worker will answer itself, which is the opposite of a hand-off.
-
-**What the split gives up.** The probe no longer carries the guarantee that no Run can acquire a
-Workflow Task after it. A Run recorded `NoOpenWorkflowTask` may pick one up before the pollers stop
-and then receive both C15b's replacement task and the sweep's wake. That costs one extra empty
-Workflow Task, which this design permits; the ordering that would prevent it buys the guarantee with
-an answer that describes nothing.
-
-An idle cached Run receives no eviction activation at shutdown at all — `shutdown_done` treats a Run
-with no pending work as finished — so the sweep cannot be folded into the eviction path.
-
-**Failure policy for an unacknowledged shutdown wake.** The Signal is retried within the grace
-period using the same derived request ID, so retries deduplicate server-side. If it is still
-unacknowledged when the grace period expires, the Worker logs and increments a distinct
-`external_stream_shutdown_wake_failed` metric, then completes shutdown; it does not block shutdown
-indefinitely and it does not pretend the wake happened. The Run then falls back to the durability
-boundary below.
-
-Python's obligations on shutdown are therefore, in this order: record each Run's state before Core's
-shutdown is initiated, answer finalization while a Workflow Task is open, send the wakes the
-recorded answers owe, and only then tear down watchers, buffers, and backend connections.
+A wake still unacknowledged when the grace period expires is counted on a distinct
+`external_stream_shutdown_wake_failed` metric and shutdown proceeds. Retries within the period reuse
+the derived request ID and deduplicate server-side; past it, the Run falls back to the durability
+boundary below rather than blocking shutdown or pretending the wake happened.
 
 ## The durability boundary, stated honestly
 
-Mechanisms (1) and (3) are **not durable**. Both depend on the consuming Worker being alive — (1)
-with the Run cached and a watcher running, (3) for as long as the shutdown grace period lasts. Once
-the Workflow is parked and the Run is evicted or the Worker restarts, no watcher exists, and a
-producer that crashed between its append and its wake Signal leaves the Workflow parked with data
-available and nothing to wake it. Nothing in the consumer can repair that, because the consumer is
-not running.
+Mechanisms (1) and (3) are **not durable**. Both depend on the consuming Worker being alive — (1) with
+the Run cached and a watcher running, (3) for as long as the shutdown grace period lasts. Once the
+Workflow is parked and the Run is evicted or the Worker restarts, no watcher exists, and a producer
+that crashed between its append and its wake Signal leaves the Workflow parked with data available
+and nothing to wake it. Nothing in the consumer can repair that, because the consumer is not running.
 
-This design does **not** claim to solve that case implicitly. One of the following must be chosen
-per deployment, and the choice is explicit:
+This design does **not** claim to solve that case implicitly. One of the following must be chosen per
+deployment, and the choice is explicit:
 
-- **Durable producer (default expectation).** `publish()` is documented as complete only when its
-  wake step has been acknowledged. Producers that are themselves durable — an Activity, which is
-  retried by Temporal — satisfy this for free. A plain external process must retry `publish()`
-  until acknowledged, and the API surfaces the un-acknowledged state rather than hiding it (P6b).
+- **Durable producer (default expectation).** `publish()` is complete only when its wake step has been
+  acknowledged. Producers that are themselves durable — an Activity, which Temporal retries — satisfy
+  this for free. A plain external process must retry until acknowledged, and the API surfaces the
+  un-acknowledged state rather than hiding it.
 - **Backend outbox.** The provider durably records the pending wake and a relay delivers it. This
   removes the requirement on the producer at the cost of a component that must itself be operated.
   Out of scope; future work.
@@ -308,29 +264,22 @@ per deployment, and the choice is explicit:
 
 ## Multiple subscriptions to one stream
 
-Cursors are per **subscription**, not per stream. Two subscriptions in one Workflow to the same
-stream name have independent wait IDs, independent cursors, independent park intents keyed by
-`(stream key, wait_id)`, independent `wait_generation`s, and independent entries in the annotation
-header and the Continue-As-New continuation state.
-
-Delivery is **broadcast**: each subscription sees every record from its own cursor. Work-sharing
-between two subscriptions inside one Workflow is not supported (ADR-021).
+Cursors are per **subscription**, not per stream. Two subscriptions in one Workflow to the same stream
+name have independent wait IDs, cursors, park intents keyed by `(stream key, wait_id)`,
+`wait_generation`s, and entries in the annotation header and the Continue-As-New continuation state.
+Delivery is **broadcast**: each sees every record from its own cursor, and work-sharing between two
+subscriptions inside one Workflow is not supported (ADR-021).
 
 Cancelling a subscription commits its cursor at the next marker and removes it from the wait set.
-Re-subscribing to the same stream name creates a *new* subscription with a new wait ID; it does not
-resume the cancelled one. Resumption across Continue-As-New is by wait ID.
+Re-subscribing to the same stream name creates a *new* subscription with a new wait ID rather than
+resuming the cancelled one. Resumption across Continue-As-New is by wait ID.
 
-## Failure semantics
+## What a failure costs
 
-- Backend read or coordination failure fails the current Workflow Task so normal Temporal retry can
-  reattempt it; the cursor is not advanced until the task's marker is committed.
-- **Marker recording commits the cursor. Reading or delivering a record does not.**
-- A producer crash before a fence is handled by the idle timeout. A crash after append but before
-  wakeup is handled by the consumer's own watcher while the Run is cached, and otherwise by the
-  chosen durability mechanism.
-- Stale readiness notifications are ignored by wait and quiescence generation.
-- Spurious wakeups and empty Workflow Tasks are allowed correctness-wise, though implementations
-  should suppress them.
-- A worker crash discards uncommitted reads. Replay re-reads from the last committed marker.
-- Backend unavailability, retention loss, and integrity violations must surface distinctly — see
-  `failure-taxonomy.md`.
+**Marker recording commits the cursor. Reading or delivering a record does not.** So a backend read or
+coordination failure fails the current Workflow Task for normal Temporal retry, and a Worker crash
+discards uncommitted reads and replays from the last committed marker — in both cases the cost is a
+repeated Workflow Task and no record is lost. Spurious wakeups and empty Workflow Tasks are permitted
+correctness-wise, which is what makes stale readiness and stale wake Signals safe to ignore rather
+than something to resolve exactly. Backend unavailability, retention loss, and integrity violations
+must surface distinctly — see `failure-taxonomy.md`.

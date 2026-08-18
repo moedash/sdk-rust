@@ -1,202 +1,131 @@
 # Python runtime: the out-of-sandbox manager
 
-How stream I/O happens without ever touching the Workflow thread.
+How stream I/O happens without ever touching the Workflow thread, and which component owns which
+position in a stream.
 
-Owned by P8 (manager), P9 (Workflow API), P11 (`_apply` branch), P19 (async job partition), P17
-(registry). Line anchors are in `code-anchors.md`.
+## The constraint that shapes everything else
 
-## The constraint
+Workflow activations cannot perform backend I/O. This is a property of the existing Python Worker,
+not a stylistic preference: `_WorkflowInstanceImpl.activate()` is synchronous, runs on a thread-pool
+executor under a **2-second deadlock timeout**, and drives a custom deterministic event loop in
+which real network I/O cannot be awaited at all. **Any design in which `_apply` reads the backend is
+wrong by construction, not merely slow.**
 
-Workflow activations cannot perform backend I/O. This is a hard property of the existing Python
-Worker, not a stylistic preference:
+Everything below follows from it. The subscription manager lives outside the sandbox on the Worker's
+own asyncio loop and owns every backend connection and watcher task; the Workflow thread only pops
+from a bounded per-subscription buffer; readiness is reported to Core **only after** a record is
+buffered, which is what makes the activation it produces guaranteed non-blocking; and the activation
+jobs that need backend work are answered before `activate()` is ever called. A backend slower than
+the deadlock timeout therefore delays readiness rather than failing an activation.
 
-- `_WorkflowInstanceImpl.activate()` is **synchronous**, so `_apply` and everything it calls are
-  synchronous.
-- Activations run on a thread-pool executor under `asyncio.wait_for` with a deadlock timeout of
-  **2 seconds**; exceeding it raises `_DeadlockError` and fails the Workflow Task.
-- The Workflow event loop is a custom deterministic loop; awaiting real network I/O inside it is not
-  possible even where the code is nominally `async`.
+Only an opaque handle crosses the sandbox boundary — the manager module is registered for sandbox
+passthrough, and no provider instance is reachable from Workflow code, which names a backend
+registered on the Worker and nothing else.
 
-**Any design in which `_apply` reads Redis is wrong by construction, not merely slow.**
+## Four positions, one commit
 
-## The protocol
+"Cursor" covers four different positions, owned by four different components, and conflating any two
+of them is how a speculative read becomes a durable claim:
 
-The subscription manager lives outside the sandbox, on the Worker, and owns every backend connection
-and watcher task on the Worker's own asyncio loop. The Workflow instance never touches a socket. The
-two communicate through a bounded, thread-safe buffer per subscription:
+| Position | Owner | Advances on | Survives eviction | What reads it |
+|---|---|---|---|---|
+| committed | the marker | a marker commit, and nothing else | yes — reconstructed from History | where replay starts |
+| consumption | the runtime | a record handed to Workflow code | no | the Continue-As-New continuation |
+| delivery | the runtime | a record drained out of the buffer | no | the observation delta, hence replay's recorded ranges |
+| prefetch | the manager | a record read into the buffer | no — discarded outright | the watcher's next read |
 
-| Step | Where | What |
+The three uncommitted positions run ahead of `committed` in that order and claim nothing durable:
+reading a record is not consuming it, and consuming it is not committing it. On eviction, Workflow
+Task failure, or Worker restart, every buffer and all three are discarded and the subscription
+restarts from `committed` — which is exactly what makes "no cursor advances unless the marker
+commits" safe to state. The manager may reposition `prefetch` *backwards* to `committed`, never
+forwards past what a marker has committed, so a speculative read can never be mistaken for progress.
+
+`delivery` and `consumption` differ by whatever a drained batch left unread: a Workflow that stops
+iterating part-way through a batch was delivered the whole batch and consumed only its prefix. The
+annotation records `delivery`, because that is the schedule replay must reproduce; the
+Continue-As-New continuation carries `consumption`, because the buffer holding the difference dies
+with the Run and a successor resuming from `delivery` would step silently over records Workflow code
+never saw.
+
+## Delivery within one activation is bounded by a record count
+
+One activation hands Workflow code at most `MAX_RECORDS_PER_ACTIVATION` records, and the
+subscription then blocks **even though records are still buffered** — that block is what ends the
+activation, because the watcher refills from the Worker's loop while the Workflow thread drains
+(ADR-026). Without it the drain never finishes and the Workflow Task fails on the deadlock timeout
+on every attempt, so the Workflow is stuck permanently rather than merely slowed. Three consequences
+reach outside the runtime:
+
+- The segment that reaches the cap ends with `BATCH_LIMIT` in the annotation, so replay divides the
+  same records into the same activations (`annotation-format.md`). A time-based bound would cut the
+  segment at a nondeterministic point and diverge from the live run.
+- A completion the budget stopped must **re-arm readiness** for the records left buffered. The
+  watcher moved `prefetch` past them when it buffered them, so no further notification is coming and
+  the Workflow would otherwise wait forever on data already in front of it.
+- Those waits are blocked but **not immediately parkable**. They belong in the quiescent snapshot,
+  because that is what lets Core resolve them; declaring them parkable would ask Core to park a
+  Workflow Task whose records have already reached the Worker.
+
+The budget does not apply during replay, where delivery comes from the recorded segments, which
+already fix how many records each activation received.
+
+## Which side answers which activation job
+
+Two of the four stream jobs are themselves backend operations, so the dispatch splits in
+`_handle_activation` — already `async`, and already doing pre-activation await work — rather than
+running through the synchronous `_apply` chain (ADR-011):
+
+| Job | Answered | Why there |
 |---|---|---|
-| Register | Workflow thread, `subscribe()` | Registers `wait_id → (stream key, backend name, cursor)` with the manager. Non-blocking. |
-| Prefetch | Manager loop | Reads ahead from the cursor into the subscription's bounded buffer. Never calls Workflow code. |
-| Readiness | Manager loop | Reports readiness to Core **only after** a data or control record is buffered — never on a bare socket event. This is what makes the subsequent activation guaranteed non-blocking. |
-| Drain | Workflow thread, `_apply` | Pops from the buffer only, at most `MAX_RECORDS_PER_ACTIVATION` records. Never performs I/O, so it completes in bounded time. |
-| Advance | Workflow thread | Records the delivery in the observation delta; the manager advances the prefetch cursor from the committed marker, not from delivery. |
+| `ResolveExternalStreamWaits` | `_apply` | Readiness means "buffered", so the drain is a bounded buffer pop |
+| `ReplayExternalStreams` | *prepared* in `_handle_activation`, delivered in `_apply` | Inclusive range reads plus integrity validation over the whole recorded range |
+| `PrepareExternalStreamPark` | `_handle_activation` only | Installs intents and awaits the backend; runs no user Workflow code |
+| `FinalizeExternalStreams` | `_handle_activation` only | No backend work at all (ADR-010), but it must run no user code and be answered from out-of-sandbox state |
 
-## Three cursors, not one
+Routing the last three through `_apply` would put multi-second backend transactions inside a
+synchronous `activate()` under a 2-second timeout, failing the Workflow Task for a healthy backend
+and getting worse the more records replay must validate. Answered where they are, a transient
+backend error becomes `WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE` and an integrity
+violation becomes `StreamIntegrityError`, rather than surfacing as a deadlock timeout that
+misattributes a storage problem to the Workflow's own code.
 
-The word "cursor" covers three different positions in this manager, and conflating them is how
-speculative reads become durable claims:
-
-| Cursor | Owner | Advances on | Survives eviction |
-|---|---|---|---|
-| `committed_cursor` | the marker | marker commit only | yes — it is reconstructed from History |
-| `delivery_cursor` | the Workflow instance | a record being handed to Workflow code | no — rebuilt by replay from `committed_cursor` |
-| `prefetch_cursor` | the manager | a record being read into the buffer | no — discarded outright |
-
-`prefetch_cursor` is **speculative**. It may run arbitrarily far ahead of both others, bounded only
-by the buffer, and it claims nothing durable: reading a record is not consuming it, and consuming it
-is not committing it. On eviction, Workflow Task failure, or Worker restart, every buffer and both
-non-committed cursors are discarded, and the subscription restarts from `committed_cursor` — which
-is exactly why "no cursor advances unless the marker commits" is safe to state.
-
-The manager may only reposition `prefetch_cursor` backwards to `committed_cursor`, never forwards
-past what a marker has committed, so a speculative read can never be mistaken for progress.
-
-## Rules the implementation must not quietly violate
-
-- **Readiness means "buffered", not "available".** A readiness notification for an unbuffered record
-  would produce an activation whose drain must block, reintroducing the deadlock hazard.
-- **Backpressure is the buffer bound.** A full buffer stops prefetch; it never drops records and
-  never blocks the Workflow thread. What it bounds is memory held ahead of delivery, not how much
-  one activation delivers: the watcher refills from the Worker's loop while the Workflow thread
-  drains, so against a producer that keeps the buffer non-empty the buffer bounds nothing at all.
-- **Delivery within one activation is bounded by a record count, never by elapsed time.**
-  `MAX_RECORDS_PER_ACTIVATION` is 256 records handed to Workflow code per activation; the segment
-  that reaches it ends with `BATCH_LIMIT` (`annotation-format.md`). A time-based bound would cut the
-  segment at a nondeterministic point, and because segment boundaries are recorded in the
-  annotation, replay would divide the same records differently and diverge from the live run. When
-  the budget is exhausted the subscription blocks **even though records are still buffered**, and
-  that block is what ends the activation — without it the drain never finishes, because the watcher
-  refills concurrently, and the Workflow Task fails on the 2-second deadlock timeout on every
-  attempt. Exhausting the budget therefore **re-arms readiness for the records still buffered**:
-  otherwise the Workflow waits forever on data already in front of it, since `prefetch_cursor` is
-  already past those records and no further notification is coming. The budget does not apply during
-  replay, where delivery comes from the recorded segments, which already fix how many records each
-  activation received.
-- **Backend latency is invisible to the Workflow thread**, so a backend slower than the 2-second
-  deadlock timeout delays readiness rather than failing an activation. A test covers exactly this.
-- **Cancellation** of a subscription drains and discards its buffer, cancels its watcher, and
-  deregisters the wait ID.
-- **Eviction and shutdown**: `RemoveFromCache` and Worker shutdown both tear down every subscription
-  for the Run, cancel watchers, and close buffers. Manager state is keyed by run ID so a stale Run
-  cannot leak connections; the teardown path is the same one that must run when a Workflow Task
-  fails mid-batch.
-- **Replay uses the same buffer**, filled by the replay reader from recorded offsets instead of by a
-  live watcher. `_apply` cannot tell the difference, which is the point.
-- **Watchers survive Workflow Task completion.** They are torn down only on subscription
-  cancellation, Run eviction, or Worker shutdown.
-
-Sandbox passthrough: the manager module is registered in
-`temporalio/worker/workflow_sandbox/_restrictions.py`, and only an opaque handle crosses into
-Workflow code.
-
-## Runtime-only jobs are handled before `activate()`
-
-Keeping live reads out of the Workflow thread is not sufficient, because two of the stream
-activation jobs are *themselves* backend operations:
-
-| Job | Work it requires | Safe in `_apply`? |
-|---|---|---|
-| `ResolveExternalStreamWaits` | pop already-buffered records | **yes** — bounded, no I/O |
-| `ReplayExternalStreams` | inclusive range reads plus integrity validation over the whole recorded range | **no** |
-| `PrepareExternalStreamPark` | install intents, await the backend, recheck every stream | **no** |
-| `FinalizeExternalStreams` | encode the terminal from manager state; no backend read required | no I/O, but no user code either |
-
-Routing all four through the `job.HasField(...)` chain would put multi-second backend transactions
-inside a synchronous `activate()` running under a 2-second deadlock timeout — failing the Workflow
-Task for a healthy backend, and getting worse the more records replay must validate (ADR-011).
-
-The dispatch therefore splits in `_handle_activation`, which is already `async` and already performs
-pre-activation await work (`decode_activation` is awaited there before `workflow.activate` is handed
-to the executor):
-
-1. **`PrepareExternalStreamPark`** is handled entirely in `_handle_activation`. The manager installs
-   the intents, awaits the backend transaction, rechecks, and the worker synthesizes
-   `ExternalStreamParkResult` without calling `activate()` at all. No user Workflow code runs. If the
-   recheck finds records, the completion is `StreamSetBecameReady` and Core issues a normal resolve
-   activation next.
-2. **`FinalizeExternalStreams`** is handled in the same place but performs **no backend work**: the
-   manager reads each active subscription's current cursor boundary from its own state, encodes the
-   terminal, and the worker synthesizes `ExternalStreamFinalized`. It is here rather than in `_apply`
-   because it must run no user code and must be answered from out-of-sandbox state — not because it
-   blocks.
-3. **`ReplayExternalStreams`** is *prepared*, not handled: `_handle_activation` awaits the manager
-   filling and validating every recorded range into the per-subscription buffers, then passes the job
-   through to `activate()`. `_apply` performs deterministic delivery from memory only, exactly as it
-   does for a live resolve.
-4. **`ResolveExternalStreamWaits`** passes straight through. Readiness already means "buffered", so
-   the buffer is populated before the job exists.
-
-Failures in steps 1–3 propagate through the defined activation-failure path — a transient backend
-error becomes `WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE` with a retryable error type, an
-integrity violation becomes `StreamIntegrityError` — rather than surfacing as a deadlock timeout,
-which would misattribute a storage problem to the Workflow's own code.
-
-This is a named deliverable (P19), not an implementation detail of the manager: the partition lives
-in the worker's async layer and is the only thing standing between a slow backend and a spurious
-`_DeadlockError`.
-
-## Finalization is manager-state-only
-
-`FinalizeExternalStreams` reads the manager's in-memory blocked cursor snapshot — one
-`BEGINNING | AFTER(offset)` boundary per active subscription — encodes it as the annotation's
-terminal, and returns. **It calls no provider method** (ADR-010), so it is an asynchronous control
-operation and not a backend transaction. Three consequences:
-
-- **There is no transaction to race.** The boundary is not "wherever the stream is now"; it is where
-  this Workflow Task's deliveries stopped, which is fixed the moment the last activation of that task
-  returned. Refreshing it against the backend would be actively wrong — it could name a position
-  replay must not reproduce.
-- **Watchers keep running during finalization**, exactly as they do during park preparation. A record
-  arriving mid-finalization changes nothing about the terminal: it belongs to the next Workflow Task
-  and reaches Core through the normal readiness path or, if none is open by then, through the wake
-  Signal.
-- **The only failure mode is missing state** — the Run's manager entry is gone or unreadable. There
-  is no transient class here, because there is nothing to be transiently unavailable. Python fails
-  the activation, Core writes no marker, and the Workflow Task is retried.
-
-A test asserts the choice rather than trusting it: a provider that raises on every method is
-registered, a finalization is driven, and the marker must still be written — proving no provider call
-happens on this path from any layer.
+Watchers are torn down only on subscription cancellation, Run eviction, or Worker shutdown — never
+by a Workflow Task completing. A watcher outliving the Workflow Task is what the first wakeup
+mechanism in `wft-lifecycle.md` is made of.
 
 ## Wait ID assignment
 
-`wait_id` is allocated by the Python SDK from a per-Run counter starting at 1, incremented in
-`subscribe()` call order. Because Workflow code is deterministic, subscription creation order is
-reproducible on replay, so the same subscription receives the same `wait_id`. A `wait_id` is stable
-for the life of its subscription; its `wait_generation` increments each time that wait re-enters the
-blocked state.
+`wait_id` comes from a per-Run counter starting at 1, incremented in `subscribe()` call order.
+Workflow code is deterministic, so subscription creation order reproduces on replay and the same
+subscription receives the same `wait_id`. It is stable for the life of its subscription and across a
+Continue-As-New chain; its `wait_generation` increments each time that wait re-enters the blocked
+state.
 
-This makes subscription reordering a nondeterminism hazard — see `annotation-format.md`.
+Everything else is keyed off it — the annotation header, the park intent, the continuation, and
+Core's wait set — so inserting, removing, or reordering a `subscribe()` call renumbers every later
+wait and is a nondeterminism hazard on the same footing as inserting a timer
+(`annotation-format.md`).
 
-## Quiescence detection
+## The runtime's half of shutdown
 
-Detect quiescence after `_run_once` returns. It already drains `self._ready` until empty, so "no
-coroutine is runnable" is its post-condition; quiescence detection is a **registry check after it
-returns**, not an event-loop change.
+`wft-lifecycle.md` owns the shutdown sweep itself: what is probed, when, and which answers owe a
+wake. Three obligations are the runtime's own, and they constrain this code rather than Core's:
 
-Python reports quiescence only after no Workflow coroutine is runnable. An idle stream cannot start
-the Core timer while another stream is still driving Workflow code.
+- **Per-Run teardown is driven by `RemoveFromCache`, never by the shutdown hook.** The manager must
+  keep a Run's subscriptions, buffers, and cursor state alive until that job arrives, or a
+  `FinalizeExternalStreams` in flight finds nothing left to finalize from.
+- **The sweep's two halves sit at two points in the Worker's own shutdown sequence** — the probe
+  immediately before Core's shutdown is initiated, the wakes and teardown after every activation has
+  been answered. Both live on the Worker's shutdown path rather than in the workflow worker's poll
+  loop, because a clean shutdown never raises out of that loop and would otherwise leave every Run
+  registered, its watchers running, and its owed wakes unsent.
+- **An idle cached Run receives no eviction activation at shutdown**, so the sweep cannot be folded
+  into the eviction path — and that Run is exactly the one that most needs it, with records buffered
+  in a process about to exit and nothing else to tell the Workflow they arrived.
 
-## Python SDK work items
-
-- Add `temporalio/contrib/external_workflow_streams/` — the public consumer API, the distinct
-  producer API, and the backend-provider interface, plus a Redis Streams provider as the initial
-  implementation. Do not reuse any name from `temporalio/contrib/workflow_streams/` (ADR-001).
-- Add an `external_stream_backends` Worker option holding named provider instances, constructed
-  outside the sandbox and referenced from Workflow code by name only.
-- Add the per-worker subscription/watcher manager outside the sandbox; register its module for
-  sandbox passthrough.
-- Coalesce watcher readiness and probe every active stream on each resume or parked wakeup.
-- Add the Worker shutdown sweep: per-Run teardown is driven by `RemoveFromCache`, never by the
-  shutdown hook, so finalization is always answered first; every Run still holding active
-  subscriptions when no Workflow Task is open gets an unparked wake Signal, acknowledged before
-  teardown, within the graceful-shutdown grace period. An idle cached Run receives no eviction
-  activation at shutdown, so the sweep cannot be folded into the eviction path.
-- Extend the bridge (`temporalio/bridge/src/worker.rs`, `temporalio/bridge/worker.py`), surfacing
-  both result enums to Python.
-- Partition stream activation jobs in `_handle_activation`; handle only `ResolveExternalStreamWaits`
-  and the pre-filled `ReplayExternalStreams` in the `_apply` dispatch chain.
-- Regenerate Python protos with `scripts/gen_protos.py`. Any new message carrying a `Payload` also
-  requires re-running `scripts/gen_payload_visitor.py`.
+Both halves are bounded: the probe by a grace short enough that it cannot hold up stopping the
+pollers, the wakes by the Worker's graceful-shutdown grace. A wake still unacknowledged when the
+grace expires is counted on `external_stream_shutdown_wake_failed` and shutdown proceeds. It is
+counted rather than only logged because a dropped wake is silent by nature: the Workflow simply
+waits, and nothing distinguishes that from a producer having nothing to say.

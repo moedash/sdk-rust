@@ -1,10 +1,9 @@
 # Milestone 2 required tests — 12 cases
 
-Multiple streams, `merge`, same-stream subscriptions, and Continue-As-New. This list is P16b's
-gate. Together with `tests-m1.md`'s 55 cases it partitions the 67 required cases exactly.
+Multiple streams, `merge`, same-stream subscriptions, and Continue-As-New. Together with `tests-m1.md`'s 55 cases it partitions the 67 required cases exactly.
 
-Every bullet is one case. If you add or remove one, update the count in this heading and in
-P16b's title and `Done when`.
+Every bullet is one case. If you add or remove one, update the count in this heading; the
+gate checks that the two agree.
 
 - Readiness on any one of several streams resets global quiescence.
 - One idle stream cannot park the WFT while another stream is active.
