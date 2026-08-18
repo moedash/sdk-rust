@@ -27,15 +27,34 @@ documents live in the Core repository, which is why the submodule carries them.
 | Core | 18 | 62 | +12,224 / −119 |
 | Core, excluding these documents | | 23 | +9,110 / −119 |
 
+## Where everything is
+
+On disk, under `/Users/maxim/workarea/workspaces/projects/tasks/python-sdk-streaming/`:
+
+| Path | What it is |
+|---|---|
+| `sdk-python/` | The Python SDK. Everything Python-side is here. |
+| `sdk-python/temporalio/bridge/sdk-core/` | Core, vendored as a submodule, pinned to the head below. **These documents are inside it.** |
+| `sdk-rust/` | A second checkout of the same Core repository and branch. |
+
+The two Core checkouts share one branch, so either shows the same content; the
+vendored one is what the Python build compiles and what the test suite reads
+these lists from.
+
 ## Reading order
 
-1. `overview.md` — what the feature is and the cost model that motivates it.
-2. `spec/wft-lifecycle.md` and `spec/core-lang-protocol.md` — the contract
+1. [`README.md`](README.md) — the full map of this document set.
+2. [`overview.md`](overview.md) — what the feature is and the cost model that
+   motivates it.
+3. [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) and
+   [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md) — the contract
    between Core and lang, which is where most of the difficulty lives.
-3. `decisions/` — 27 records, one per decision, each with the alternatives that
-   were rejected. Code comments say why the code is as it is; only these say why
-   the other option was not taken.
-4. The commits below, in order.
+4. [`decisions/README.md`](decisions/README.md) — 27 records, one per decision,
+   each with the alternatives that were rejected. Code comments say why the code
+   is as it is; only these say why the other option was not taken.
+5. [`verification-hazards.md`](verification-hazards.md) — before running
+   anything, or judging any test result.
+6. The commits below, in order.
 
 ## Python commits
 
