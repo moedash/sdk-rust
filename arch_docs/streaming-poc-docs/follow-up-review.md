@@ -1,0 +1,260 @@
+# Workflow streaming implementation follow-up review
+
+Date: 2026-08-18
+
+This is a static follow-up review of the fixes made after the independent
+implementation review in `review-guide.md`. No tests were run for this review.
+It covers correctness, durability, determinism, and liveness; it does not cover
+code style.
+
+The earlier review listed fifteen findings and now says that all fifteen are
+fixed. The concrete reproducers for many of them have been addressed, but that
+blanket status is too strong. Eight findings appear fully addressed. The seven
+findings below are only partially addressed: their principal happy paths are
+fixed, while adjacent failure modes still violate the same invariant.
+
+The subscription-teardown finding also considers the current uncommitted
+changes to `_api.py`, `_runtime.py`, and `_manager.py`. Those changes improve the
+normal close path but do not close its failure path.
+
+## P0 — Inherited park-intent reconciliation is attempted only once
+
+**Related original finding:** “A park intent cannot be removed after a Worker
+handoff.”
+
+**Status:** Partially addressed.
+
+Registration now detects and removes an intent installed by a previous Worker.
+That fixes the ordinary handoff case. However,
+`StreamSubscriptionManager._reconcile_inherited_park()` treats a removal error
+as best-effort cleanup and retries only when the wait is registered again.
+Registration normally happens once for the lifetime of the cached Run, so a
+transient backend failure can leave the inherited intent in place indefinitely.
+
+That intent is not inert. Both producer and Worker wakes consult
+`current_park_generation()`, receive the generation of a park Core has already
+left, and send a parked wake naming that dead generation. Core correctly rejects
+it as stale. If no later registration occurs, the Workflow can remain asleep
+with a record already buffered or durable in the stream.
+
+**Code:**
+`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
+`StreamSubscriptionManager._reconcile_inherited_park`.
+
+**Proposed unit test:** Have manager A install and confirm a park, then shut it
+down while preserving the backend intent. Register the same wait on manager B
+with a backend whose first `remove_park_intent()` call fails and whose later
+calls succeed. Do not re-register the wait. Recover the backend and assert that
+manager B retries until the intent is absent. Then append another record and
+assert the wake uses generation zero rather than manager A's generation. The
+current implementation makes one removal attempt and leaves the stale intent.
+
+## P0 — Replay does not require an empty recorded subscription to be recreated
+
+**Related original finding:** “Replay never verifies that recorded waits match
+Workflow subscriptions.”
+
+**Status:** Partially addressed.
+
+Replay now verifies a binding when the corresponding subscription is
+registered, and it fails when a recorded delivery remains unconsumed. Neither
+check proves that every recorded binding was recreated. If a marker binds a
+wait but records no deliveries for it, removing that `subscribe()` call leaves
+no registration to compare and no delivery for the end-of-segment check to find.
+Replay therefore accepts an annotation whose subscription set differs from the
+one created by Workflow code.
+
+This contradicts the feature's stated determinism rule that inserting,
+removing, or reordering `subscribe()` calls is a versioned Workflow-code change.
+An empty subscription is still present in the annotation header and terminal,
+and its wait ID participates in numbering later subscriptions.
+
+**Code:**
+`sdk-python/temporalio/contrib/external_workflow_streams/_runtime.py`,
+`WorkflowStreamRuntime.begin_replay`, `register`, and
+`verify_replay_consumed`.
+
+**Proposed unit test:** Build an annotation whose header binds wait 1 and whose
+terminal contains wait 1 at `BEGINNING`, but whose segments contain no records.
+Prepare and drive replay with Workflow code that creates no subscriptions.
+Assert that replay raises `workflow.NondeterminismError` naming wait 1. The
+current implementation completes replay because there is neither a
+registration mismatch nor an unconsumed record.
+
+## P1 — A failed live wake is not retried while the Worker remains running
+
+**Related original finding:** “Wake and readiness failures have no working retry
+path.”
+
+**Status:** Partially addressed.
+
+Readiness notifier failures are now bounded and guarded, and the shutdown sweep
+can observe a raising wake callback and retry it. The live watcher path still
+does not retry a Signal that fails. `_report_ready()` increments `wakes_owed`,
+logs the send failure, and returns. The watcher has already advanced its
+prefetch cursor past the buffered record, so its next `read_after()` waits after
+that record. With no second append, `_report_ready()` is never called again.
+
+The shutdown sweep is not a live retry policy. A Worker may remain healthy and
+running for hours after a transient Signal failure, during which the Workflow
+can remain asleep on data already held by that Worker.
+
+**Code:**
+`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
+`StreamSubscriptionManager._report_ready` and `_watch`.
+
+**Proposed unit test:** Buffer one record, have the readiness notifier return
+`NO_OPEN_WORKFLOW_TASK`, and make the wake sender fail once and then succeed.
+Append no additional records and do not invoke shutdown. Assert that the live
+manager retries the same wake request and that the second send is acknowledged.
+The current implementation makes only the failed first attempt.
+
+## P1 — Cancellation bypasses park rollback
+
+**Related original finding:** “A failed multi-wait park leaves a partial
+externally visible park.”
+
+**Status:** Partially addressed.
+
+Ordinary exceptions during intent installation or recheck now withdraw every
+intent installed by that attempt. `asyncio.CancelledError` is explicitly
+re-raised before `_withdraw_park()` runs. Cancellation after the first install
+therefore leaves a partial park visible in the backend even though Core never
+received a confirmed result for that generation.
+
+Cancellation is a normal async termination path during Worker shutdown and task
+teardown. It must preserve the same all-or-nothing invariant as an ordinary
+storage exception. Otherwise producers observe a non-zero generation for a
+park that does not exist and send wakes Core discards as stale.
+
+**Code:**
+`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
+`StreamSubscriptionManager._prepare_park` and `_withdraw_park`.
+
+**Proposed unit test:** Register two waits. Let the first intent installation
+succeed and make the second installation block on a controllable future. Cancel
+the `prepare_park()` task while the second install is blocked, await its
+`CancelledError`, and assert that neither wait has an intent for the attempted
+generation. The current implementation leaves the first intent installed.
+
+## P1 — Off-thread decoding drops Workflow serialization context
+
+**Related original finding:** “Payload decoding performs arbitrary async work on
+the Workflow thread.”
+
+**Status:** Partially addressed.
+
+External retrieval and payload-codec decoding now run on the Worker's async
+loop, while synchronous payload conversion runs on the Workflow thread. That
+removes asynchronous work from `activate()`. Both halves, however, are built
+from the Worker's context-free `DataConverter`.
+
+Ordinary Workflow payload decoding first binds a
+`WorkflowSerializationContext` containing the namespace and Workflow ID.
+Components implementing `WithSerializationContext` rely on that binding. The
+stream manager's `_prepare()` and the runtime's `codec_for()` never apply it, so
+context-aware payload codecs and payload converters see their context-free
+instances or fail outright. External-stream values therefore do not use the
+same converter semantics as other payloads delivered to the same Workflow.
+
+**Code:**
+`sdk-python/temporalio/worker/_workflow.py`,
+`_WorkflowWorker._stream_manager` and `_create_external_stream_runtime`;
+`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
+`StreamSubscriptionManager._prepare`; and
+`sdk-python/temporalio/contrib/external_workflow_streams/_runtime.py`,
+`WorkflowStreamRuntime.codec_for`.
+
+**Proposed unit test:** Configure a payload codec implementing
+`WithSerializationContext`. Make its context-free `decode()` fail and make the
+copy returned by `with_context()` record the supplied context and decode
+successfully. Deliver one external-stream record through a Worker and assert
+that decoding succeeds with a `WorkflowSerializationContext` containing the
+correct namespace and Workflow ID. The current implementation invokes the
+context-free codec.
+
+## P1 — Closing a subscription can permanently abandon its park intent
+
+**Related original finding:** “An unused or cancelled subscription remains
+logically blocked.”
+
+**Status:** Partially addressed, including the current uncommitted teardown
+changes.
+
+The committed implementation now starts an unused subscription outside the
+blocked set, removes an abandoned readiness wait from that set, and provides a
+public `close()` that ends iteration. The uncommitted follow-up additionally
+schedules Worker-side cancellation, stops the watcher, and attempts to remove
+the park intent.
+
+The failure ordering in `StreamSubscriptionManager.cancel()` is still unsafe.
+It removes the subscription from `_runs` before awaiting intent removal. If the
+backend removal fails, the exception is logged and the watcher is stopped, but
+no registered subscription or cleanup object remains to retry the removal. The
+log says the intent will be reconciled if the Run is registered again; a closed
+wait is not expected to be registered again. The stale intent can therefore
+remain for the rest of the chain and corrupt subsequent producer wake
+generation selection.
+
+**Code:**
+current uncommitted changes in
+`sdk-python/temporalio/contrib/external_workflow_streams/_api.py`,
+`ExternalStreamSubscription.close`;
+`sdk-python/temporalio/contrib/external_workflow_streams/_runtime.py`,
+`WorkflowStreamRuntime.unsubscribe`; and
+`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
+`StreamSubscriptionManager.cancel`.
+
+**Proposed unit test:** Install a park intent for a subscription, make the first
+`remove_park_intent()` call fail and subsequent calls succeed, and call
+`subscription.close()`. Assert that the watcher stops, the wait remains outside
+the blocked set, and cleanup is retained and retried until the backend intent is
+absent. Finally assert that a producer sees no current park generation. The
+current implementation drops the manager subscription after the failed removal
+and never retries it.
+
+## P1 — `merge()` still starves waits beyond one activation's budget
+
+**Related original finding:** “`merge()` can starve every stream except the
+lowest wait ID.”
+
+**Status:** Partially addressed.
+
+`merge()` now takes at most one record from each subscription per pass. This is
+fair only when the number of ready subscriptions does not exceed
+`MAX_RECORDS_PER_ACTIVATION`, currently 256. Every activation begins its pass at
+the lowest wait ID. With 257 ready subscriptions, waits 1 through 256 can spend
+the complete budget before wait 257 is considered. The next activation starts
+at wait 1 again, so continuously backlogged lower waits starve wait 257
+indefinitely.
+
+The claim that skew is bounded to one record therefore needs either a bound on
+the number of subscriptions below the activation budget or a deterministic
+rotation carried across activation boundaries.
+
+**Code:**
+`sdk-python/temporalio/contrib/external_workflow_streams/_api.py`, `merge`.
+
+**Proposed unit test:** Create 257 subscriptions. Keep waits 1 through 256
+backlogged across at least three simulated activation-budget resets and place
+one ready record on wait 257. Drive `merge()` using the same readiness rearming
+performed at activation completion. Assert that wait 257 is yielded within a
+bounded number of activations. The current implementation spends every
+activation on waits 1 through 256 and never reaches it.
+
+## Summary
+
+The following original findings appear fully addressed by static inspection:
+
+1. a producer losing a wake claim now sends the idempotent wake itself;
+2. backend/provider identity is recorded and checked per wait;
+3. late subscriptions are emitted in bindings frames;
+4. stale readiness is re-reported against the current generation;
+5. the park handshake uses Core's wait-set membership;
+6. the external-storage failure taxonomy is connected to completions and
+   metrics;
+7. consumption advances only after successful decoding; and
+8. Redis stream identity and intent scans are injective and glob-safe.
+
+The seven sections above require additional work before the original review can
+accurately state that all fifteen findings are fixed.

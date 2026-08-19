@@ -159,6 +159,37 @@ Core's wait set — so inserting, removing, or reordering a `subscribe()` call r
 wait and is a nondeterminism hazard on the same footing as inserting a timer
 (`annotation-format.md`).
 
+## Closing a subscription
+
+Closing runs on the Workflow thread, so it divides the same way everything else here does: the part
+that is a synchronous change to in-memory state happens immediately, and the part that touches the
+backend is handed to the manager.
+
+The Workflow-side half ends the wait. It leaves the quiescent snapshot, iteration stops, and whatever
+the buffer still holds is dropped **without being consumed**, so the consumption cursor stops short
+of those records and a Continue-As-New successor receives them rather than stepping over them.
+One property of the wait changes permanently: it can never block again. A closed wait that re-entered
+the blocked set would be reported to Core, registered, and eventually retained or parked for on
+behalf of a coroutine that no longer exists — a Workflow Task held open for nobody, which only a wake
+would end.
+
+The Worker-side half — stopping the watcher and taking back the wait's park intent
+(`wft-lifecycle.md`) — is requested through the runtime handle, which hops it onto the manager's
+loop, rather than started from the subscription itself. Scheduling Worker work from the Workflow
+thread is not merely misplaced in the way ADR-011 describes: nothing runs it, and nothing reports that
+nothing ran it, so the watcher goes on prefetching into a buffer no one will drain for the rest of the
+Run, with every symptom of that remote from its cause. The hop is what makes the request take effect
+at all.
+
+**Closing does not forget the subscription** (ADR-029). Two things are built from the registered set
+after an individual wait has ended, and both are wanted precisely for a stream the Workflow finished
+reading early: the annotation binding for that wait, without which replay reads a `wait_id` no
+binding covers and reports it as a wait the Workflow did not create, against code that never changed;
+and the continuation cursor, without which a successor Run restarts that stream at `BEGINNING` and
+re-delivers everything the closed subscription consumed. The manager's entry for the wait holds
+resources and is dropped; the runtime's entry holds the record of what the wait was, and is marked
+closed instead.
+
 ## The runtime's half of shutdown
 
 `wft-lifecycle.md` owns the shutdown sweep itself: what is probed, when, and which answers owe a

@@ -126,9 +126,9 @@ the wake Signal. That ordering plus the recheck at step 3 is what closes the emp
 race: an append is either seen by the recheck or paired with a Signal. Readiness accepted before
 `ParkSetConfirmed` wins, and the confirmation for that generation is then stale.
 
-**A park intent exists only while its park is outstanding**, and it takes two enforcement points on
-the consumer side to hold, because the intent is durable backend state while the record of which
-Worker installed it is not.
+**A park intent exists only while its park is outstanding**, and it takes three enforcement points on
+the consumer side to hold: the intent is durable backend state while the record of which Worker
+installed it is not, and the subscription that record hangs off can itself go away.
 
 - **A resolve ends a park this Run is sitting in.** `ResolveExternalStreamWaits` is the notice,
   because it covers both ways a confirmed park ends and Core's own state moving on is not something
@@ -138,6 +138,12 @@ Worker installed it is not.
   where such an intent becomes visible and where its status is unambiguous: a subscription is
   registered by user Workflow code running, and no user code runs inside a park, so an intent found
   there belongs to a park that is over.
+- **A cancellation takes back the intent of the wait it drops.** Closing a subscription removes it
+  from the manager, so its intent is removed there — under the same serialization as this Run's
+  parking and resolving, and before the watcher stops — rather than left to either point above. Both
+  of those can afford to fail and be reached again, because the subscription they work from stays
+  registered; a cancellation *is* the removal of that registration, so nothing consults that wait
+  again for the life of the Run and an intent left behind is left behind for good (ADR-030).
 
 The first point alone reaches only the intents whose installer still holds the Run. An eviction, a
 handoff, or a Worker restart takes that record with it and leaves the intent behind for good, and
