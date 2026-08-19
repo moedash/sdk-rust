@@ -49,7 +49,7 @@ these lists from.
 3. [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) and
    [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md) — the contract
    between Core and lang, which is where most of the difficulty lives.
-4. [`decisions/README.md`](decisions/README.md) — 27 records, one per decision,
+4. [`decisions/README.md`](decisions/README.md) — 30 records, one per decision,
    each with the alternatives that were rejected. Code comments say why the code
    is as it is; only these say why the other option was not taken.
 5. [`verification-hazards.md`](verification-hazards.md) — before running
@@ -498,10 +498,12 @@ disappeared.
 ### P1 — An unused or cancelled subscription remains logically blocked
 
 **Status:** Fixed — Python `03969dbf`, *Make merge fair, and stop consuming a record before it
-decodes*. A subscription nobody has iterated is not blocked, a cancelled wait leaves the blocked
-set, and `close()` ends the iteration. The Worker-side teardown the proposed test also asks for —
-the watcher and any installed intent — is deliberately not part of `close()`; an inherited intent is
-reached by the reconciliation above instead.
+decodes*, completed by `88c3578d`, *Finish close(): stop the watcher and take back the park intent*.
+A subscription nobody has iterated is not blocked, a cancelled wait leaves the blocked set, and
+`close()` ends the iteration. The Worker-side teardown the proposed test also asks for is now part of
+it: closing hops onto the manager's loop, which removes the wait's park intent and then stops its
+watcher (ADR-029, ADR-030). What closing keeps is the wait's recorded state, which replay and a
+Continue-As-New successor both still read.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_api.py:393-441` and

@@ -29,13 +29,13 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) | When a Workflow Task is retained and when its wait set is merely registered, the idle timeout, rollover, parking, the three generations, shutdown and eviction, the durability boundary |
 | [`spec/annotation-format.md`](spec/annotation-format.md) | The replay annotation grammar, runs, segments, the byte budget, replay validation, cursor origin |
 | [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md) | Every proto message, activation job, readiness call, and piece of Core state |
-| [`spec/python-runtime.md`](spec/python-runtime.md) | The out-of-sandbox manager, the four cursor positions, the delivery budget, which side answers which activation job |
+| [`spec/python-runtime.md`](spec/python-runtime.md) | The out-of-sandbox manager, the four cursor positions, the delivery budget, what closing a subscription ends and what it keeps, which side answers which activation job |
 | [`spec/wake-signal.md`](spec/wake-signal.md) | The reserved Signal's name, envelope, request-ID derivation, and interception |
 | [`spec/failure-taxonomy.md`](spec/failure-taxonomy.md) | The four failure classes, their error types, metrics, and operator responses |
 
 ## The rest of the set
 
-- [`decisions/`](decisions/README.md) — 28 records, one per decision, each with the alternatives that
+- [`decisions/`](decisions/README.md) — 30 records, one per decision, each with the alternatives that
   were rejected. A spec states what is true; a decision record states why the other shape was not
   taken.
 - [`required-tests/`](required-tests/) — the two required-test lists. These are not prose: the Python
