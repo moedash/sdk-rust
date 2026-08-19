@@ -71,8 +71,55 @@ preparing — and not a user's converter mismatch.
 
 Nothing Worker-side crosses the boundary to make this work. The Workflow-facing API asks its opaque
 handle for a codec bound to the topic's type and gets back the synchronous half only; the manager
-holds the Worker's converter and uses it for the asynchronous half only, with no type at all,
-because the type belongs to the topic and the topic is Workflow code.
+runs the asynchronous half with no type at all, because the type belongs to the topic and the topic
+is Workflow code.
+
+### Both halves carry the Workflow's serialization context
+
+A `DataConverter`'s components may implement `WithSerializationContext`, which is how a codec derives
+an encryption key from the Workflow it serves. The Worker already binds a
+`WorkflowSerializationContext(namespace, workflow_id)` around every payload an activation carries, on
+both sides of this same split — `decode_activation` on its own loop, the Workflow instance's
+converters on the Workflow thread. A stream record is a payload like any other and must arrive the
+same way. Unbound, a record delivered in the **same activation** as the Workflow's own argument would
+be converted under no context while the argument was converted under one, and a per-Workflow key
+would decrypt nothing. The failure is not loud either: it is carried on the record, raised at
+delivery, and classified as row three of `failure-taxonomy.md`, whose operator instruction is to
+align the consumer's converter with the producer's — against a deployment where the two already
+agree and the SDK is what dropped the context.
+
+Where the binding happens differs by holder, and follows from what each holder is:
+
+- **The runtime is per Run**, so it is built with a converter that is already bound and hands
+  Workflow code a codec carrying it. Bound by the Worker rather than inside the runtime, because the
+  runtime crosses into the sandbox while `with_context` runs user code to clone the component
+  converters — work that belongs on the Worker's side of the boundary, and that a per-Run handle
+  need do only once.
+- **The manager is per Worker** and prepares records for every Run at once, so a converter bound at
+  construction would be bound to nothing in particular. It derives the context per record from that
+  record's **own stream key**: the live path from the subscription's, replay from the annotation
+  header's, which is the only place a replayed record's stream is written down while the Workflow
+  has not yet run far enough to re-subscribe. The bound clones are memoized for the one preparation
+  call; kept on the manager they would accumulate an entry per Workflow ID the Worker ever served.
+- **The producer is per chain** and binds once, at construction (`backend-contract.md`).
+
+All three key on `workflow_id`, never on any Run ID. A stream spans a Continue-As-New chain, so a
+successor Run reads records its predecessor wrote; a Run-scoped key would make a chain's own records
+unreadable from its first continuation onward.
+
+The binding is `with_context`, not `_with_contexts`. The latter additionally names the Workflow as
+the payload's **storer**, and a stream record is stored by its producer rather than by the consuming
+Run — nothing on the consumer's decode path reads that context anyway, since retrieval resolves the
+driver from the claim embedded in the payload. `with_context` returns the converter unchanged unless
+some component implements `WithSerializationContext`, so a default converter is untouched and the
+ordinary deployment sees no change at all.
+
+**One store-context gap is open and stated rather than closed.** A producer that stores an
+externally-stored payload does so with a store context naming no target, so a driver selector that
+routes by target has nothing to route on. Retrieval is unaffected, for the reason above. Closing it
+is a store-context question rather than a serialization-context one, and it needs a decision about
+what target an Activity-hosted producer names — itself, or the Workflow the record is for — which
+would change where blobs land.
 
 ## Four positions, one commit
 
@@ -121,6 +168,49 @@ reach outside the runtime:
 
 The budget does not apply during replay, where delivery comes from the recorded segments, which
 already fix how many records each activation received.
+
+## Merging several subscriptions
+
+`merge()` waits on several subscriptions at once and yields `(subscription, value)`. Each pass takes
+**at most one record from each subscription, in `wait_id` order, resuming after the subscription
+that last took one**, and each of those three is answering a different failure.
+
+*In `wait_id` order*, because that is what reproduces. Records that arrived in one batch across two
+streams have no inherent order between them, so an interleaving that depended on dict iteration, on
+arrival time, or on which watcher ran first would replay differently than it ran. `wait_id` comes
+from Workflow code's own `subscribe()` order, so replay reconstructs the same total order from the
+code, and the pass then depends only on which waits have a record ready — which replay reconstructs
+from the recorded segments.
+
+*At most one record*, because the budget above is charged per record handed to Workflow code over
+the merged set as a whole. Draining one subscription's ready list to the end lets the lowest
+`wait_id` spend the entire budget by itself, which is a priority order rather than a merge.
+
+*Resuming after the last take*, because the budget covering the set means a pass can be cut anywhere
+inside it, and a pass that always restarted at the lowest `wait_id` is cut in the same place on
+every activation. That is not a subtle bias. With more ready subscriptions than the budget has
+records — 257 against 256 — the last one is never reached at all, and it is not merely served
+nothing: filling stops on the spent budget before it consults the manager, so the Worker is never
+asked whether that stream has anything, for the life of the Run. The general case needs only a count
+that does not divide the budget: 100 always-ready waits against 256 records leaves the pass cut at
+the 56th, the first 56 taking one record per activation more than the other 44, forever, with the
+gap growing by one per activation and nothing bounding it. Rotating the start position is what makes
+the skew between any two continuously ready streams what it is claimed to be — a single record
+(ADR-034). A control record spends its subscription's turn like any other: it is consumed, because
+it occupies an offset inside a run, and it advances the rotation.
+
+**The rotation is not replay state.** It lives in the generator, is recorded nowhere, and is not
+reconstructed — and under replay the budget does not apply, so passes are not cut where they were
+cut live and the rotation reaches positions the live run never started from. What makes that safe is
+that a replay drain serves from the front of the recorded segment and only while the front belongs
+to the asking wait (`annotation-format.md`): a wait asked out of turn is told nothing and the record
+stays for whoever asks next. Every active wait is still asked exactly once per pass, so the front's
+owner is reached in every pass and the yielded sequence is the recorded global order whatever
+position the pass started at. No change to *ask* order can reorder a replayed segment. That premise
+is load-bearing rather than incidental: a variant that let a pass skip a wait — a per-subscription
+budget, an early return once the budget is spent — would let a replayed segment come out in an order
+the live run never delivered — fairness bought with nondeterminism, which is the one currency it
+may not be paid for in.
 
 ## Which side answers which activation job
 
@@ -186,7 +276,10 @@ after an individual wait has ended, and both are wanted precisely for a stream t
 reading early: the annotation binding for that wait, without which replay reads a `wait_id` no
 binding covers and reports it as a wait the Workflow did not create, against code that never changed;
 and the continuation cursor, without which a successor Run restarts that stream at `BEGINNING` and
-re-delivers everything the closed subscription consumed. The manager's entry for the wait holds
+re-delivers everything the closed subscription consumed. Keeping the entry is also what lets a
+replayed Run satisfy the check that every wait the marker bound was recreated
+(`annotation-format.md`): a closed wait was created, and a set the close had emptied would fail that
+check against a Workflow that did nothing wrong. The manager's entry for the wait holds
 resources and is dropped; the runtime's entry holds the record of what the wait was, and is marked
 closed instead.
 

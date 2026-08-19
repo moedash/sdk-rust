@@ -57,10 +57,13 @@ has no successor.
 - **Removal is serialized against this Run's parking and resolving**, on the same terms as
   reconciliation, so a cancellation racing a park in flight is ordered before or after it and cannot
   remove an intent that park is in the middle of installing.
-- **A removal that fails is reported and the cancellation proceeds.** Holding the cancellation open
-  on the backend would keep a watcher, a buffer, and a connection alive for a wait the Workflow has
-  already ended, and would not make the intent go away. Nothing downstream will observe the
-  leftover — that is what this decision is about — so the log line is the only notice there is.
+- **A removal that fails is retried, and then owed; the cancellation proceeds regardless.** Holding
+  the cancellation open on the backend would keep a watcher, a buffer, and a connection alive for a
+  wait the Workflow has already ended, and would not make the intent go away. But dropping the
+  subscription must not drop the obligation with it, which is what a removal recorded on the
+  `Subscription` would do: the removal is bounded-retried here and whatever is left is carried by
+  the Run's owed-removal ledger, which outlives both the subscription and this cancellation
+  (ADR-031).
 - A test that closes a subscription with an intent installed must assert the intent is **gone from
   the backend**, not merely that the watcher stopped; the two are separable and only one of them is
   durable.

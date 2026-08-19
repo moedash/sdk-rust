@@ -39,6 +39,11 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [028](ADR-028-decoding-is-split-across-the-boundary.md) | Decoding a record is split across the Worker/Workflow boundary | `spec/python-runtime.md` |
 | [029](ADR-029-a-closed-subscription-keeps-its-state.md) | A closed subscription keeps its recorded state | `spec/python-runtime.md` |
 | [030](ADR-030-cancellation-removes-its-own-park-intent.md) | Cancelling a subscription removes its park intent itself | `spec/wft-lifecycle.md` |
+| [031](ADR-031-an-owed-removal-belongs-to-the-run.md) | An owed park-intent removal belongs to the Run, not to the subscription | `spec/wft-lifecycle.md` |
+| [032](ADR-032-park-rollback-catches-cancellation-and-is-not-shielded.md) | Park rollback catches cancellation, and is not shielded | `spec/wft-lifecycle.md` |
+| [033](ADR-033-replay-checks-bound-waits-one-directionally.md) | Replay checks that every bound wait was recreated, in one direction only | `spec/annotation-format.md` |
+| [034](ADR-034-merge-rotates-its-start-position.md) | `merge()` rotates its start position across passes | `spec/python-runtime.md` |
+| [035](ADR-035-both-sides-bind-the-workflows-serialization-context.md) | Both sides of a stream bind the Workflow's serialization context | `spec/python-runtime.md` |
 
 ## The decisions that constrain the most
 

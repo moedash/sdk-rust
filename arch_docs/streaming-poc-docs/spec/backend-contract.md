@@ -107,7 +107,11 @@ The suite is the deliverable, not the interface. It must contain, at minimum:
 - a case that fails a backend accepting an idempotency-key reuse with different bytes;
 - park intents keyed by stream alone failing the two-subscription case (ADR-012);
 - a case that removes an installed intent and requires `current_park_generation` to report nothing
-  afterwards, since a provider that keeps answering is wrong only where nothing else looks at it; and
+  afterwards, since a provider that keeps answering is wrong only where nothing else looks at it;
+- a case that removes the same intent twice, and one that removes an intent that was never
+  installed, both of which must succeed — a removal that failed is retried later against whatever
+  the key holds by then, so a provider that raises on the second call turns a completed cleanup into
+  a permanent one; and
 - a claim that never expires failing the leased-claim case.
 
 ## Parking operations
@@ -129,12 +133,21 @@ chain, and only one Run of a chain is live at a time. Carrying the Run ID as the
 Run's intent deterministically replaces its predecessor's for the same key rather than
 accumulating alongside it.
 
-**An intent exists only while its park is outstanding.** The consumer holds up one half of that,
-and it takes two enforcement points to do it: the resolve that ends a park the Run is sitting in,
-and reconciliation at registration for an intent this Worker inherited rather than installed
-(`wft-lifecycle.md`). Both are needed because the intent is durable backend state while the record
-of which Worker installed it is per-Worker, so an eviction or a handoff otherwise leaves it forever.
-The provider holds up the other half: once an intent is removed, `current_park_generation` must report nothing for that
+The value must read back as it was written, because that is how a removal decided on earlier
+identifies what it is removing. `wait_id` restarts at 1 in a Continue-As-New successor while the
+stream key does not change, so a key alone does not distinguish a predecessor's abandoned intent
+from a successor's live one; the consumer compares the `park_generation` and Run ID it recorded
+before it deletes anything (`wft-lifecycle.md`). A provider that returned an intent with either
+field normalised, defaulted, or dropped would make every such comparison fail open or fail closed —
+a leaked intent in one direction, a legitimately parked Run unparked in the other.
+
+**An intent exists only while its park is outstanding.** The consumer holds up one half of that
+across three points — the resolve that ends a park the Run is sitting in, the reconciliation at
+registration for an intent this Worker inherited rather than installed, and the cancellation that
+closes a wait — with a removal none of them got confirmed carried as owed until one of them does
+(`wft-lifecycle.md`). All of that is needed because the intent is durable backend state while the
+record of which Worker installed it is per-Worker, so an eviction or a handoff otherwise leaves it
+forever. The provider holds up the other half: once an intent is removed, `current_park_generation` must report nothing for that
 subscription. A provider that answered from a remembered "last generation" beside the intent passes
 every other requirement here and still breaks both of that call's readers, in the same direction and
 invisibly. A producer would name a generation Core has already discarded, and a non-zero generation
@@ -166,8 +179,13 @@ A producer needs five things, none of which it can infer (ADR-019):
 - **A backend connection.** Workers register named backends; a plain process constructs a provider
   directly.
 - **A Temporal client**, for the wake Signal.
-- **The same `DataConverter`** the consuming Workflow uses, including any codec. A mismatch is
-  detected at decode time on the consumer and surfaces as a distinct decode failure.
+- **The same `DataConverter`** the consuming Workflow uses, including any codec, **bound to the
+  same serialization context** — which the producer derives from the chain key it was given, so it
+  matches what the consuming Worker converts under (`python-runtime.md`). The context is part of the
+  requirement rather than an implementation detail of it: two context-free sides agree and two bound
+  sides agree, but one of each encrypts under one key and decrypts under another (ADR-035). A
+  mismatch either way is detected at decode time on the consumer and surfaces as a distinct decode
+  failure.
 - **A stable producer session ID and sequence**, which is what makes append idempotent under
   Activity retry. Activities default it to a value derived from the Activity's identity so a
   retried attempt reuses it; plain processes must supply one, and the API requires it rather than

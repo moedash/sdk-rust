@@ -116,19 +116,26 @@ uses a generation-based handshake coordinated through the backend:
 5. Any stream ready → Python removes every installed intent and returns `StreamSetBecameReady`. Core
    aborts that parking generation and issues `ResolveExternalStreamWaits`.
 
-An attempt that fails part-way withdraws every intent it installed, whether an install or a recheck
-raised. A park visible to producers for a generation Core never confirmed is one they send wakes
-against and Core discards as stale, and the eviction that follows takes with it the only record that
-those intents were installed at all.
+An attempt that ends before Core confirms it withdraws every intent it installed — whether an
+install raised, a recheck raised, or **the attempt was cancelled**. Cancellation is not the exotic
+member of that list but the likeliest one: an activation withdrawn by Core and a Worker shutting
+down both abandon a half-installed park that way, and in Python cancellation does not arrive as an
+ordinary exception, so a rollback written for ordinary exceptions is exactly the rollback that
+misses it (ADR-032). A park visible to producers for a generation Core never confirmed is one they
+send wakes against and Core discards as stale, and the eviction that follows takes with it the only
+record that those intents were installed at all.
 
 A producer appends its record *before* it observes or claims the park generation, and only then sends
 the wake Signal. That ordering plus the recheck at step 3 is what closes the empty-check/completion
 race: an append is either seen by the recheck or paired with a Signal. Readiness accepted before
 `ParkSetConfirmed` wins, and the confirmation for that generation is then stale.
 
-**A park intent exists only while its park is outstanding**, and it takes three enforcement points on
-the consumer side to hold: the intent is durable backend state while the record of which Worker
-installed it is not, and the subscription that record hangs off can itself go away.
+**A park intent exists only while its park is outstanding.** Holding that true takes more than the
+moments at which a removal is decided, because the intent is durable backend state while nothing that
+knows about it is: the record of which Worker installed it dies with that Worker, and the
+subscription that record hangs off can be closed while the Run runs on for another week.
+
+Three moments decide a removal:
 
 - **A resolve ends a park this Run is sitting in.** `ResolveExternalStreamWaits` is the notice,
   because it covers both ways a confirmed park ends and Core's own state moving on is not something
@@ -137,26 +144,58 @@ installed it is not, and the subscription that record hangs off can itself go aw
   already has an intent in the backend, having installed none itself, removes it. Registration is
   where such an intent becomes visible and where its status is unambiguous: a subscription is
   registered by user Workflow code running, and no user code runs inside a park, so an intent found
-  there belongs to a park that is over.
+  there belongs to a park that is over. *Reading* it is what records it. An inherited intent is
+  mirrored nowhere on this Worker, so until the read writes it down there is nothing for any removal
+  path to work from, and the resolve and the cancellation both look at the same absence and do
+  nothing.
 - **A cancellation takes back the intent of the wait it drops.** Closing a subscription removes it
   from the manager, so its intent is removed there — under the same serialization as this Run's
-  parking and resolving, and before the watcher stops — rather than left to either point above. Both
-  of those can afford to fail and be reached again, because the subscription they work from stays
-  registered; a cancellation *is* the removal of that registration, so nothing consults that wait
-  again for the life of the Run and an intent left behind is left behind for good (ADR-030).
+  parking and resolving, and before the watcher stops — rather than left to either point above. A
+  closed wait is never registered again for the life of the Run, and the resolve iterates the
+  subscriptions the manager still holds, so neither of them ever reaches it (ADR-030).
 
-The first point alone reaches only the intents whose installer still holds the Run. An eviction, a
-handoff, or a Worker restart takes that record with it and leaves the intent behind for good, and
-every later resolve consults the same missing record. What a left-behind intent costs is the
-invariant's whole point: `current_park_generation` keeps answering a generation Core has discarded,
-each producer wake names it and Core discards it as stale, and because a parked wake's request ID
-ignores sender identity the second such wake is byte-identical to the first and the server
-deduplicates it away. The Workflow waits forever on a record that is durably present.
+A removal that one of those decided on and the backend did not confirm is **owed**: recorded per
+Run against `(stream key, wait_id)`, and retried by the next park, resolve, registration or eviction
+of that Run, each of which drains what is owed under the Run's park lock before doing its own work. A
+ledger entry says *a removal was decided on and has not been confirmed*, not *an intent exists* —
+which is what makes draining it safe from any of those rather than only from the path that recorded
+it. Removal is idempotent (`backend-contract.md`), so a drain that duplicates a removal that
+succeeded costs a round trip, and the entry holds nothing that a teardown could invalidate: no
+watcher, no buffer, no connection beyond the backend the removal has to go through. The entry is
+made **before** the backend call, because a call that never comes back — the backend raised, the
+task was cancelled mid-await — owes the removal exactly as an error does, and the subscription it
+was reached through is usually dropped in the same breath. A fresh install at that key supersedes
+it, since retrying a removal recorded against a generation that has since been overwritten would
+take out the park now sitting behind it. Why the ledger is a Run's own state rather than a field on
+the subscription is ADR-031.
+
+**A drain removes only the intent it recorded.** It re-reads the intent and removes it only if the
+`park_generation` and Run ID it carries both still match what was written down; anything else is
+forgotten rather than removed. The stream key is stable across a Continue-As-New chain while
+`wait_id` restarts at 1 in the successor, so an entry a predecessor Run left behind can name the key
+of a park a **successor** is sitting in, and taking that out is strictly worse than the leak the
+ledger exists to close: it unparks a Run whose park is real and whose producers have no reason to
+send anything. The read narrows the window to a single round trip, and the Run's park lock closes it
+for parks of that same Run; across Runs it is narrowed rather than closed, which would need a
+compare-and-delete the provider contract does not require.
+
+What a left-behind intent costs is the invariant's whole point: `current_park_generation` keeps
+answering a generation Core has discarded, each producer wake names it and Core discards it as
+stale, and because a parked wake's request ID ignores sender identity the second such wake is
+byte-identical to the first and the server deduplicates it away. The Workflow waits forever on a
+record that is durably present. Nor is the damage confined to the wait that owns the intent: a
+stale intent keeps `parked_wait_ids` non-empty for the whole stream, which suppresses the unparked
+fallback for every **other** wait on it, so a Workflow that closed one subscription can lose the
+wakes of the ones it is still reading.
 
 Reconciliation reads before it writes, and is serialized against this Run's own parking and
 resolving: a Run that never parked owes the backend nothing, and a reconciliation overlapping a
 confirming park must not remove the intent that park has just installed — an unwakeable Run produced
-by the mechanism that exists to prevent one.
+by the mechanism that exists to prevent one. It retries a bounded number of times before leaving the
+rest to the ledger, and takes that lock **per attempt** rather than holding it across the backoff:
+parking is answered inside an activation under Core's deadlock timeout, so a reconciliation asleep
+with the Run's park lock would spend an activation's budget on cleanup for a park that is already
+over.
 
 The provider holds up the rest: it must stop reporting a generation once its intent is removed
 (`backend-contract.md`), or every reader of that call acts on a park that is over.
@@ -190,6 +229,16 @@ them always applies:
 1. **The consumer's own watchers.** Watchers stay live while the Run is cached, and one that observes
    an append with no Workflow Task open sends the wake Signal itself. This is the normal path, and it
    also covers a producer that crashed after appending.
+
+   That Signal is retried in place until the server acknowledges it, because nothing behind it will
+   try again: the watcher moved its prefetch position past the record when it buffered it and goes
+   back to waiting for a *new* append, re-arming readiness needs the activation the lost wake was
+   supposed to cause, and the idle timer runs only while a Workflow Task is retained, which is
+   exactly what this state does not have. A single unacknowledged attempt is a lost record on a
+   Worker that is otherwise healthy and may stay running for hours; the shutdown sweep is a backstop
+   for the end of that Worker's life, not a retry policy. The retries are the **same** wake — every
+   attempt derives the identical request ID (`wake-signal.md`) — so one that did in fact arrive is
+   deduplicated server-side rather than producing a second empty Workflow Task.
 2. **A forced replacement Workflow Task — only while a Workflow Task is open.** A Run being shut down
    that still holds a task finalizes its marker and completes the task requesting a replacement.
 3. **An unparked wake Signal — when no Workflow Task is open.** A replacement is requested *on the

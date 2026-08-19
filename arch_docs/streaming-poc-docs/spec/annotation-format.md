@@ -153,6 +153,39 @@ sequence in place of a compact run.
 Replay then follows the marker's recorded availability/blocking decisions rather than consulting
 current stream timing.
 
+### What replay checks about the Workflow's own code
+
+Those four are about the bytes. Three more are about the code that is replaying, and all three
+report row four of `failure-taxonomy.md` — nondeterminism — rather than integrity loss, because the
+recorded ranges are exactly where they were written and it is the Workflow that moved.
+
+1. **Each recorded wait's binding**, when that wait is registered, and again when a marker is
+   replayed onto subscriptions that already exist. The comparison is the stream *name* and the
+   backend name, which are the two halves of a binding that Workflow code chose.
+2. **Every recorded delivery was taken.** A replay that reaches the end of the last segment still
+   holding one is running code that consumed less than History says it consumed.
+3. **Every bound wait was recreated**, checked once after the last segment as `bound ⊆ registered`
+   and reported naming the waits that are missing.
+
+The third does not follow from the other two, and what it catches is the ordinary shape rather than
+an exotic one. A binding is written for a subscription whether or not anything was ever delivered
+through it — the first observation has to carry provider identity, stream key, and start cursor even
+for a stream that stayed quiet for the whole Workflow Task — so a `subscribe()` on a quiet stream
+produces exactly a binding with no runs behind it, which every check that reasons from deliveries is
+blind to. Two removals escape without it. Removing the **last** `subscribe()` on a quiet stream
+renumbers nothing and leaves nothing undelivered, so the replay is accepted although the Workflow
+now holds one subscription fewer than History says it did. Removing a **middle** `subscribe()` where
+the later waits name the same stream and backend is worse: every survivor renumbers down by one, the
+binding comparison therefore compares equal for all of them, and the records recorded for wait *k*
+are consumed by what was subscription *k+1* — a different cursor, a different consumer, and nothing
+left over for the delivery check to find.
+
+**The check is one-directional deliberately** (ADR-033). `bound ⊆ registered` is the invariant;
+`registered ⊆ bound` is not, because replay runs the Workflow forward past the Workflow Task the
+marker covers and the subscriptions it makes there belong to the *next* marker's header. For the
+same reason it is checked once at the end of replay rather than before each segment: a wait bound by
+a later frame legitimately does not exist yet while an earlier segment is being delivered.
+
 ## Byte budget
 
 The encoder enforces a hard budget, `MAX_ANNOTATION_BYTES`, chosen well below the server's event
@@ -242,5 +275,11 @@ renumbers every later wait in that Run.
 - Such a change is nondeterministic for Workflows already running against deployed code and must be
   gated behind `workflow.patched()`, exactly as an inserted timer would be.
 - Adding a subscription on a code path a running Workflow has not yet reached is safe.
-- Detection is not best-effort: a renumbered wait produces the annotation mismatch in row four of
-  the failure table (`failure-taxonomy.md`) rather than a silently different stream result.
+- **Detection is by binding, and it is not complete.** A wait whose stream or backend changed is
+  reported where it is registered, and a wait the marker bound that the Workflow no longer creates is
+  reported at the end of replay — both as row four of the failure table (`failure-taxonomy.md`)
+  rather than as a silently different stream result. What no check can see is a change among waits
+  whose bindings are *identical*: inserting a `subscribe()` in the middle of several subscriptions to
+  the same stream on the same backend renumbers them without changing any comparison, and an
+  addition at the end is a supported change, so the two are indistinguishable from the annotation.
+  That residue is why this is stated as a rule about Workflow code rather than left to a check.

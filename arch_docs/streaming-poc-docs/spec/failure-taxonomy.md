@@ -34,9 +34,14 @@ Row three is separated from row two because a converter mismatch is a configurat
 *consumer*, and reporting it as stream integrity loss sends an operator to restore a backend that was
 never damaged (ADR-015).
 
-Row four covers both directions: a marker referencing a `wait_id` Python never created, and Workflow
-code subscribing where the annotation has no corresponding wait. Core-side, a marker found by
-lookahead with no matching state machine is handled as local activities already handle that case.
+Row four covers every way a marker and the code replaying it disagree about the wait set: a wait the
+marker bound that the Workflow no longer creates, a wait whose recorded stream or backend is not the
+one the code now subscribes, a recorded delivery the replay never took, and a stream name that
+disagrees with what the predecessor Run committed for that `wait_id` across a Continue-As-New. What
+is *not* row four is a subscription the annotation has no binding for: replay runs the Workflow past
+the Workflow Task the marker covers, so that is the ordinary case rather than a disagreement
+(`annotation-format.md`). Core-side, a marker found by lookahead with no matching state machine is
+handled as local activities already handle that case.
 
 ## What connects a row to a completion
 
