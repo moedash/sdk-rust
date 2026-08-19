@@ -139,6 +139,10 @@ the specification rather than reading for plausibility:
   fix, and was left rather than taken unilaterally.
 - Pre-existing lint debt in Python files this work touched (`E722`, `E731`) was
   left alone; `ruff format` is clean throughout.
+- **Not closed:** a producer stores an externally-stored payload with a store
+  context naming no target. Pre-existing, harmless to retrieval, and a
+  store-context question rather than a serialization-context one; stated in
+  `spec/python-runtime.md` and ADR-035 rather than fixed.
 - `verification-hazards.md` records two ways a test result in this repository
   can be confidently wrong. Both produced written defect reports against correct
   code before they were understood. A reviewer running anything should read it
@@ -166,14 +170,22 @@ contains no code-style findings. The already-documented activation-over-WFT-time
 
 **Status lines were added afterwards**, from Python `7e040b7e` onward; the
 reviewer's text under each is unchanged, including where a fix took a different
-shape from the proposed test. **All fifteen findings are fixed**, all of them
-Python-side; Core is unchanged since the review.
+shape from the proposed test. All fifteen are Python-side; Core is unchanged
+since the review.
+
+**A follow-up review then found seven of the fifteen only partially fixed** —
+principal paths repaired, adjacent failure modes still violating the same
+invariant. That review is [`follow-up-review.md`](follow-up-review.md), and the
+status lines below have been narrowed where it was right to. All seven are now
+closed. The summary is under *Follow-up review* at the end of this file.
 
 ### P0 — A park intent cannot be removed after a Worker handoff
 
 **Status:** Fixed — Python `0442dc4e`, *Reconcile an inherited park intent, and make parking match
-Core's wait set*. Registration is now the second enforcement point: a Worker that finds an intent
-for a wait it is registering, having installed none itself, removes it (`spec/wft-lifecycle.md`).
+Core's wait set*, completed after the follow-up review found the removal itself unretried.
+Registration reads the intent and records it as a removal this Run owes, which the Run's next park,
+resolve, registration or eviction drains — so the removal outlives the subscription, the Worker's
+mirror, and the reconciliation attempt that failed (ADR-031, `spec/wft-lifecycle.md`).
 
 **Code:** `sdk-python/temporalio/worker/_workflow.py:874-883` and
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:684-735`
@@ -228,10 +240,12 @@ lease later expires.
 ### P0 — Replay never verifies that recorded waits match Workflow subscriptions
 
 **Status:** Fixed — Python `a9c03eca`, *Bind each wait to its own backend, and stop reporting unsent
-wakes as sent*. The binding is verified at registration and at the start of replay, and a replay
-that ends holding an unconsumed recorded delivery fails; both are reported as nondeterminism rather
-than integrity loss. Only the stream *name* is compared, because a replay harness supplies its own
-namespace and Run ids.
+wakes as sent*, completed after the follow-up review found a recorded wait with no deliveries
+unchecked. The binding is verified at registration and at the start of replay, a replay that ends
+holding an unconsumed recorded delivery fails, and the end of replay requires every wait the marker
+*bound* to have been recreated — one-directionally, since replay legitimately runs past the marker's
+Workflow Task (ADR-033). All are reported as nondeterminism rather than integrity loss. Only the
+stream *name* is compared, because a replay harness supplies its own namespace and Run ids.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:737-771`,
@@ -335,9 +349,11 @@ and the watcher blocks after the buffered record.
 ### P1 — Wake and readiness failures have no working retry path
 
 **Status:** Fixed — Python `0c92c99f`, *Make readiness reporting total, and stop dropping a stale
-answer*. The Worker's wake callback now raises, the watcher guards its own call to it, a raising
-notifier is treated as the sixth answer the five do not name, and the sweep's retries and
-`external_stream_shutdown_wake_failed` are reached.
+answer*, completed after the follow-up review found the live path still making one attempt. The
+Worker's wake callback now raises, the watcher guards its own call to it, a raising notifier is
+treated as the sixth answer the five do not name, and both the live path and the sweep send through
+the same bounded retry — counting the wake once so every attempt derives the same request ID
+(`spec/wake-signal.md`) and the server deduplicates one that did arrive.
 
 **Code:** `sdk-python/temporalio/worker/_workflow.py:1024-1086` and
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:553-635`
@@ -390,8 +406,9 @@ and the legitimate park is aborted.
 ### P1 — A failed multi-wait park leaves a partial externally visible park
 
 **Status:** Fixed — Python `0442dc4e`, *Reconcile an inherited park intent, and make parking match
-Core's wait set*. Every intent an attempt installed is withdrawn on any failure, and the original
-storage error propagates.
+Core's wait set*, completed after the follow-up review found cancellation bypassing the rollback.
+Every intent an attempt installed is withdrawn on any failure *and on cancellation*, deliberately
+unshielded (ADR-032), and the original storage error propagates.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_manager.py:639-682`
@@ -449,7 +466,12 @@ the Worker's loop — in the watcher before buffering, and over the replay plan'
 Workflow thread runs only the synchronous `from_payloads` that needs the topic's type (ADR-028,
 `spec/python-runtime.md`). A record that arrives unprepared under a converter with a codec or
 external storage is refused rather than decoded late. (`0c92c99f` had changed the order of decode and
-consumption, not where decoding happens.)
+consumption, not where decoding happens.) Completed after the follow-up review found both halves
+built from the Worker's *context-free* converter: the runtime is now built with one bound to
+`WorkflowSerializationContext(namespace, workflow_id)`, the manager derives that context per record
+from the record's own stream key, and **the producer binds the same context** — the fix is symmetric
+because the two context-free sides were consistent, so a consumer-only fix would have broken every
+working per-Workflow-key deployment (ADR-035).
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_api.py:426-439`
@@ -502,7 +524,9 @@ decodes*, completed by `88c3578d`, *Finish close(): stop the watcher and take ba
 A subscription nobody has iterated is not blocked, a cancelled wait leaves the blocked set, and
 `close()` ends the iteration. The Worker-side teardown the proposed test also asks for is now part of
 it: closing hops onto the manager's loop, which removes the wait's park intent and then stops its
-watcher (ADR-029, ADR-030). What closing keeps is the wait's recorded state, which replay and a
+watcher (ADR-029, ADR-030). A removal the backend refuses is not dropped with the subscription — the
+follow-up review's finding — but owed by the Run and retried by its next park, resolve, registration
+or eviction (ADR-031). What closing keeps is the wait's recorded state, which replay and a
 Continue-As-New successor both still read.
 
 **Code:**
@@ -530,8 +554,12 @@ wait in both cases and no API path performs the teardown.
 ### P1 — `merge()` can starve every stream except the lowest wait ID
 
 **Status:** Fixed — Python `03969dbf`, *Make merge fair, and stop consuming a record before it
-decodes*. Each pass takes at most one record per subscription, which bounds the skew between two
-streams at a single record without a rotating start position that replay would have to reproduce.
+decodes*, completed after the follow-up review found the fairness bounded only within a pass. Each
+pass takes at most one record per subscription *and resumes after the subscription that last took
+one*, which is what bounds the skew at a single record across activations as well; a pass that
+always restarted at the lowest wait id was cut in the same place every activation (ADR-034). The
+cursor is generator-local and reproduces nothing: ask order provably cannot change what a replayed
+segment yields.
 
 **Code:**
 `sdk-python/temporalio/contrib/external_workflow_streams/_api.py:338-351`
@@ -572,3 +600,49 @@ stream name containing `?`, `*`, or `[` can enumerate another stream's intents.
 each and verify isolated reads. The first assertion currently fails. Add a
 parameterized stream name containing each Redis glob metacharacter and assert
 `parked_wait_ids()` returns only intents for the exact logical stream.
+
+## Follow-up review — 2026-08-18, statuses as of 2026-08-19
+
+[`follow-up-review.md`](follow-up-review.md) re-read the fifteen fixes above and
+filed seven findings where the principal path was repaired and an adjacent
+failure mode still violated the same invariant. All seven were reproduced before
+anything was changed.
+
+| Follow-up finding | Status | Where the design now is |
+|---|---|---|
+| Inherited park-intent reconciliation is attempted only once | Fixed | ADR-031, `spec/wft-lifecycle.md` |
+| Replay does not require an empty recorded subscription to be recreated | Fixed | ADR-033, `spec/annotation-format.md` |
+| A failed live wake is not retried while the Worker remains running | Fixed | `spec/wft-lifecycle.md`, `spec/wake-signal.md` |
+| Cancellation bypasses park rollback | Fixed | ADR-032, `spec/wft-lifecycle.md` |
+| Closing a subscription can permanently abandon its park intent | Fixed | ADR-031, ADR-030 |
+| `merge()` starves waits beyond one activation's budget | Fixed | ADR-034, `spec/python-runtime.md` |
+| Off-thread decoding drops Workflow serialization context | Fixed | ADR-035, `spec/python-runtime.md` |
+
+Two of the rows are one fix, and it closes a third failure mode neither of them
+named: a close following a failed reconciliation attempted no removal at all,
+because the mirror it keyed on was empty. All three follow from a removal being
+owed by the **Run** rather than recorded on the `Subscription` that every
+removal path happened to reach it through.
+
+The serialization-context fix moved **both** sides. Producer and consumer were
+context-free together, which is self-consistent and works, so binding only the
+consumer would have broken every working deployment whose codec keys on the
+Workflow — encrypt with no context, decrypt with a Workflow-derived key.
+
+Three things are known and not closed, and are recorded where a reader will meet
+them rather than only here:
+
+- The ledger is drained by Workflow and Core events — a park, a resolve, a
+  registration, an eviction — and by nothing else. A backend unavailable across
+  the whole bounded retry window that recovers into an idle cached Run is not
+  retried until one of those happens. ADR-031 records why an autonomous retry
+  task was deferred rather than rejected.
+- A drain re-reads the intent and removes it only if the recorded park
+  generation and Run ID both still match, which narrows the window against a
+  Continue-As-New successor's live intent to a single round trip but does not
+  close it across Runs. Closing it needs a conditional delete in the provider
+  contract.
+- A producer's externally-stored payloads are stored with a store context naming
+  no target. Pre-existing, unrelated to the serialization context, and left
+  because choosing a target for an Activity-hosted producer would change where
+  blobs land (ADR-035).

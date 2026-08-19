@@ -258,3 +258,179 @@ The following original findings appear fully addressed by static inspection:
 
 The seven sections above require additional work before the original review can
 accurately state that all fifteen findings are fixed.
+
+## Re-audit and implementation handoff — 2026-08-19
+
+**The per-finding statuses above are the reviewer's own and are left as
+written.** This section and the one after it supersede them; the table below is
+the current one.
+
+This section supersedes the statuses above for the current `sdk-python` working
+tree. It is a static code review only; no build or test was run. Some fixes
+described here are still uncommitted, so the next agent should preserve and
+review the existing working-tree changes rather than rebuilding them from
+scratch.
+
+Current status, updated 2026-08-19 once the owed-removal ledger landed:
+
+| Follow-up finding | Status | Design record |
+|---|---|---|
+| Inherited park-intent reconciliation is attempted only once | Fixed | ADR-031, `spec/wft-lifecycle.md` |
+| Replay does not require an empty recorded subscription to be recreated | Fixed | ADR-033, `spec/annotation-format.md` |
+| A failed live wake is not retried while the Worker remains running | Fixed | `spec/wft-lifecycle.md` |
+| Cancellation bypasses park rollback | Fixed | ADR-032, `spec/wft-lifecycle.md` |
+| Off-thread decoding drops Workflow serialization context | Fixed | ADR-035, `spec/python-runtime.md` |
+| Closing a subscription can permanently abandon its park intent | Fixed | ADR-031, ADR-030 |
+| `merge()` still starves waits beyond one activation's budget | Fixed | ADR-034, `spec/python-runtime.md` |
+
+The first, the sixth, and the second door under the sixth — a close after a
+failed reconciliation, which attempted no removal at all because the Worker's
+mirror was empty — are one fix: a removal is owed by the **Run**, not recorded
+on the `Subscription` every removal path happened to reach it through.
+
+The replay fix now checks, after the final segment, that every wait bound by the
+marker was recreated. The live wake path uses bounded retries. Park rollback
+catches `BaseException`, so the first cancellation still withdraws the intents
+already installed. `merge()` retains a deterministic cursor and resumes after
+the last wait that took a record, bounding skew across activation-budget resets.
+Each of these four changes has focused regression coverage in the working tree.
+
+Three pieces of work remained when this was written. The third has since
+landed; the two owed-removal items below are open, with dated status lines.
+
+### P0 — Owed-removal cleanup can delete a successor Run's live intent
+
+**Status (2026-08-19):** Open, and narrowed. The drain reads the intent and
+removes it only when the recorded park generation *and* Run ID both still match,
+so a replacement that is already in place when the drain reads is forgotten
+rather than removed. A replacement installed between that read and the delete is
+still removed. The residual window and what closing it needs — a conditional
+delete as a provider obligation — are recorded in ADR-031 and in
+`spec/wft-lifecycle.md`.
+
+The new owed-removal ledger correctly preserves cleanup responsibility after a
+subscription is dropped. Its drain is not atomic, however:
+
+1. `_drain_owed_removals()` reads `park_intent(stream_key, wait_id)` and checks
+   the recorded park generation and Run ID.
+2. It later calls the unconditional
+   `remove_park_intent(stream_key, wait_id)`.
+
+A Continue-As-New successor reuses the same stream key and starts wait IDs at
+1. Between those two backend calls, the successor can overwrite the old intent
+with its own newly confirmed park. The predecessor's drain then removes the
+successor's intent. Per-Run `_park_lock` instances do not close this race: the
+two Runs have different locks, and they may be held by different Workers.
+
+The existing `test_a_drain_never_removes_the_intent_of_a_park_that_replaced_it`
+checks only replacement **before** the read. It does not exercise replacement
+between the read and delete.
+
+**Code:**
+`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
+`StreamSubscriptionManager._drain_owed_removals`.
+
+**Required design change:** Make removal conditional on the intent still
+matching the recorded generation and Run ID at deletion time. This likely
+requires an atomic compare-and-delete backend operation and a corresponding
+backend-contract/conformance obligation. A process-local or per-Run lock cannot
+provide the required cross-Worker exclusion.
+
+**Proposed unit test:** Use a backend that lets `park_intent()` return Run A's
+intent and then pauses the drain before deletion. While paused, install Run B's
+intent at the same `(stream key, wait_id)`, then resume Run A's cleanup. Assert
+that Run B's intent remains installed. The current read-then-unconditional-delete
+implementation removes it.
+
+### P1 — The owed-removal ledger has no autonomous retry
+
+**Status (2026-08-19):** Open, and deliberate for now. ADR-031 records the
+background retry task as deferred rather than rejected, with the two things it
+needs first: an owner that teardown awaits, and the conditional delete above —
+an autonomous retry has the widest read-to-delete window of any drain.
+
+Inherited reconciliation and `cancel()` now retry removal three times and keep
+a per-Run ledger when all attempts fail. That fixes a one-blip reproducer and
+prevents cleanup responsibility from dying with the `Subscription` object.
+The ledger is drained only by another park, resolve, registration, or eviction.
+
+If the backend remains unavailable for the bounded retry window and recovers
+afterwards while the Run stays cached and idle, none of those events is
+guaranteed to occur. The stale intent therefore still can remain indefinitely.
+This affects both the inherited-intent and close findings. A stale intent keeps
+`parked_wait_ids()` non-empty; producers omit the unparked fallback, send only a
+wake naming the dead generation, and Core discards it as stale.
+
+**Code:**
+`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
+`StreamSubscriptionManager._reconcile_inherited_park`, `cancel`, and
+`_drain_owed_removals`.
+
+**Required design change:** Give ledger entries an eventual retry mechanism
+that does not depend on another Workflow/Core lifecycle event. A bounded
+background retry task may be appropriate, provided teardown owns and awaits it
+and retries remain generation-safe through the atomic operation described
+above. Another possible trigger is the live readiness/wake path, but that alone
+does not clean an idle stream on which no record arrives.
+
+**Proposed unit test:** Make every immediate removal attempt fail, wait until the
+retry budget is exhausted, then recover the backend without invoking park,
+resolve, registration, eviction, or shutdown. Assert that the intent is
+eventually removed. For the inherited case, append after recovery and assert
+the resulting wake is unparked rather than naming the old generation. The
+current passive ledger makes no further removal attempt.
+
+### P1 — External-stream decoding still ignores serialization context
+
+**Status (2026-08-19):** Fixed, symmetrically. The runtime is built on the
+Worker's side with a converter bound to
+`WorkflowSerializationContext(namespace, workflow_id)`; the manager, which is
+shared across Runs, derives that context **per record** from the record's own
+stream key — the subscription's on the live path, the annotation header's on
+replay, since the Workflow has not re-subscribed yet; and the producer binds the
+same context once at construction. All three key on `workflow_id`, because a
+stream spans the Continue-As-New chain.
+
+The producer half is the part this finding did not name and the part that makes
+the fix safe to ship: producer and consumer were context-free **together**, so
+binding only the consumer would have broken every working deployment whose codec
+keys on the Workflow. `with_context` is used rather than `_with_contexts`; the
+store context and the one gap left open are recorded in ADR-035 and
+`spec/python-runtime.md`.
+
+This finding is unchanged. The Worker's manager and each
+`WorkflowStreamRuntime` receive the context-free `DataConverter`.
+`StreamSubscriptionManager._prepare()` runs external retrieval and the payload
+codec from that converter, and `WorkflowStreamRuntime.codec_for()` uses it for
+the synchronous payload-converter half. Neither applies the
+`WorkflowSerializationContext(namespace, workflow_id)` that ordinary Workflow
+payload decoding supplies.
+
+Consequently, a payload codec or payload converter implementing
+`WithSerializationContext` sees its context-free instance for external-stream
+records even though it sees a bound instance for every other payload delivered
+to the same Workflow.
+
+**Code:**
+`sdk-python/temporalio/worker/_workflow.py`,
+`_WorkflowWorker._stream_manager` and `_create_external_stream_runtime`;
+`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
+`StreamSubscriptionManager._prepare`; and
+`sdk-python/temporalio/contrib/external_workflow_streams/_runtime.py`,
+`WorkflowStreamRuntime.codec_for`.
+
+**Required design change:** Bind the converter to the target Workflow's
+serialization context before either decode half runs. Because the manager is
+shared across Runs, storing one context-bound converter on the manager is not
+sufficient; preparation needs the converter or context belonging to the
+specific subscription/Run. The synchronous half must use the same bound
+converter so codec and payload-converter behavior match ordinary activation
+payload decoding.
+
+**Proposed unit test:** Configure a payload codec implementing
+`WithSerializationContext`. Its context-free `decode()` should fail, while the
+copy returned by `with_context()` records the context and succeeds. Deliver one
+external-stream record through a real Worker and assert that both live and
+replay decoding receive a `WorkflowSerializationContext` with the correct
+namespace and Workflow ID. Also cover a context-aware payload converter for the
+synchronous half. No such regression test exists in the current tree.
