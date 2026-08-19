@@ -180,8 +180,27 @@ One activation hands Workflow code at most `MAX_RECORDS_PER_ACTIVATION` records,
 subscription then blocks **even though records are still buffered** — that block is what ends the
 activation, because the watcher refills from the Worker's loop while the Workflow thread drains
 (ADR-026). Without it the drain never finishes and the Workflow Task fails on the deadlock timeout
-on every attempt, so the Workflow is stuck permanently rather than merely slowed. Three consequences
-reach outside the runtime:
+on every attempt, so the Workflow is stuck permanently rather than merely slowed.
+
+**The budget is charged where records move, and an activation begins already charged for what it
+holds.** Both halves are what make the count a bound rather than a check, and each answers a
+schedule that got past the other:
+
+- *Charged at delivery*, the drain that moves a batch out of the manager's buffer and into a
+  subscription's ready list — not at the consumption of each record afterwards. A drain that read the
+  budget and charged nothing is a reservation nobody made: the next subscription's drain saw the same
+  room and took it too, so two subscriptions consumed by two independent coroutines took a whole
+  budget each and `n` of them took `n`. `merge()` hid it by filling one record at a time, which
+  charges and checks in the same place. Delivery is also what the annotation records, so a count
+  charged at consumption bounded a different quantity than the segment it exists to bound.
+- *Pre-charged with the carry-over*, because a batch is delivered whole and consumed one record at a
+  time. What a Workflow that stopped iterating part-way through leaves in its ready list is consumed
+  by the *next* activation with no drain, and so with no check of any kind — free, and it accumulates:
+  one subscription per activation can leave a nearly full list behind. Starting the count at what the
+  ready lists already hold makes what an activation may hand over — carried-over plus newly
+  delivered — one budget, whatever the schedule.
+
+Three consequences reach outside the runtime:
 
 - The segment that reaches the cap ends with `BATCH_LIMIT` in the annotation, so replay divides the
   same records into the same activations (`annotation-format.md`). A time-based bound would cut the
@@ -218,9 +237,9 @@ from Workflow code's own `subscribe()` order, so replay reconstructs the same to
 code, and the pass then depends only on which waits have a record ready — which replay reconstructs
 from the recorded segments.
 
-*At most one record*, because the budget above is charged per record handed to Workflow code over
-the merged set as a whole. Draining one subscription's ready list to the end lets the lowest
-`wait_id` spend the entire budget by itself, which is a priority order rather than a merge.
+*At most one record*, because the budget above covers the merged set as a whole. Draining one
+subscription's ready list to the end lets the lowest `wait_id` spend the entire budget by itself,
+which is a priority order rather than a merge.
 
 *Resuming after the last take*, because the budget covering the set means a pass can be cut anywhere
 inside it, and a pass that always restarted at the lowest `wait_id` is cut in the same place on
@@ -284,6 +303,26 @@ Everything else is keyed off it — the annotation header, the park intent, the 
 Core's wait set — so inserting, removing, or reordering a `subscribe()` call renumbers every later
 wait and is a nondeterminism hazard on the same footing as inserting a timer
 (`annotation-format.md`).
+
+## A subscription has one consumer
+
+`__aiter__` hands out a new generator on every call, and they are not independent views: the cursor,
+the readiness future, and the blocked flag belong to the subscription. The readiness future in
+particular is a single slot held in two places at once — on the subscription, where closing finds it,
+and in the runtime's pending map keyed by `wait_id`, where the readiness activation finds it.
+
+So a second coroutine blocking on the same subscription is **refused**, on the single-subscription
+path and inside `merge()` alike, with a non-retryable error raised on the Workflow thread. Without the
+refusal the second waiter replaces the first in both places: readiness resolves only the newer future,
+its cleanup removes the map entry, and the older one is left unreachable by the readiness activation
+and by closing — a coroutine stranded for the life of the Run, while the shared blocked flag can
+report that wait as not blocked at all, so Core is not even retaining a Workflow Task on its behalf.
+
+The refusal is on the *waiter* rather than on the iterator, which is what keeps ordinary sequential
+re-iteration working: breaking out of an `async for` leaves the generator suspended at its `yield`
+rather than closed, so an iterator-level claim could not tell that shape apart from two live consumers
+(ADR-037). Two consumers of one *stream* is a supported shape and the way to ask for it is a second
+`subscribe()` — delivery is a broadcast, so each wait gets every record and keeps its own cursor.
 
 ## Closing a subscription
 

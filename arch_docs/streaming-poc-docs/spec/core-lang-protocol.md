@@ -229,6 +229,15 @@ Signal for the last three (ADR-013):
 | `NoOpenWorkflowTask` | The Run is cached and its waits are registered, but no WFT is open | Send the wake Signal; **keep** the watcher | signal wakeup, unparked |
 | `RunNotFound` | The Run is absent from this Core worker's cache | Send the wake Signal, then tear the watcher down | signal wakeup, evicted |
 
+`Stale` is the one answer that is re-asked rather than acted on, and **the re-ask's answer is the
+one that counts**: a report can race a wait-generation change and be answered `Stale` while the Run
+is evicted before the delayed retry that follows, so the retries can legitimately end on a different
+row of this table than the first report did. Keeping the original `Stale` there sends the owed wake
+and skips the teardown the row it actually landed on requires — leaving a watcher, a buffer, a
+backend read loop and a Run-map entry alive for a Run this Worker no longer owns. `RunNotFound` also
+ends the retries rather than using them up: the Run cannot come back, and each further attempt only
+delays the wake the buffered record still needs.
+
 `NoOpenWorkflowTask` is the healthy state between Workflow Tasks after a command-producing
 completion or a rollover, and is not an error. The three signal-sending results are distinguished by
 what the watcher does *afterwards* and by what an operator should conclude, not by whether a Signal

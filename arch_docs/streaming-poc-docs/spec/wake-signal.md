@@ -117,10 +117,34 @@ Wake signaling is independently retryable and idempotent. Retrying the wake step
 obligation, not an automatic property; `publish()`'s acknowledged-wake contract (P6b) is what turns
 it into one.
 
+### The append itself has an acknowledgement window
+
+A backend commits on its own side and only then answers, so an `append()` that did not answer is not
+an `append()` that did not happen. The Redis provider runs its atomic script server-side and receives
+the result in a separate client-side step; a cancellation or a dropped connection between the two
+leaves a durable record whose offset nobody holds.
+
+That window is therefore a **third outcome**, `AppendNotAcknowledgedError`, and not a failure. It
+carries the exact record — byte-identical, still holding its `(session_id, sequence)`, offset unset —
+and `resolve_append()` re-appends *that* record. One call is right for both histories, because a
+repeat append of byte-identical content under a used key writes nothing and returns the original
+offset (ADR-020), while a key the backend never saw is appended now. Until it is settled the stream
+refuses further appends from that producer, because the caller's obvious next move — `publish()` again
+— draws a fresh sequence number and puts the value in the stream twice if the first attempt landed.
+For `finish_writing()` the duplicate is a second write fence, which reads back as a producer session
+that ended twice.
+
+`AppendConflictError` is the one exception and the only one the contract can support: it says the key
+was used with *different* bytes, so the record did not land and re-appending it would raise the
+identical error. Cancellation delivered before the backend is called at all — while the sequence is
+being drawn or the payload encoded — still propagates as cancellation, with nothing appended and
+nothing owed (ADR-038).
+
 ### All three steps after the append are inside the guarantee
 
-`publish()` distinguishes exactly two outcomes: the append failed, or the append succeeded and the
-wake did not. **Steps 2 and 3 both belong to the second**, not only step 3. A coordination call that
+Once the append is acknowledged, `publish()` distinguishes exactly two further outcomes: the append
+succeeded and the wake did not, or both did. **Steps 2 and 3 both belong to the first**, not only
+step 3. A coordination call that
 raises whatever the provider raises — a bare `ConnectionError` from observing the parked set or
 claiming a generation — passes straight through a caller watching for the durable-but-unacknowledged
 error, and takes the offset with it. The caller then has no statement about the record that already
@@ -133,6 +157,16 @@ The two failures differ in what recovers them, so the error says which:
 |---|---|---|
 | Step 3, the Signal | the wakes still owed | re-send them verbatim (`retry_wake`) |
 | Step 2, observe or claim | empty, `restart` set | call `wake()` again |
+
+**Cancellation after the append is one of these failures, not an exception to them.** It leaves the
+identical state — durable record, unsent wake — and gets the identical recovery, with a flag saying
+cancellation is what ended the attempt. `CancelledError` derives from `BaseException`, so a bare one
+escaping here carries no offset, no `pending` and no `restart`, and cannot be told apart from
+cancellation *before* the append: the caller can then neither wake the record nor safely re-publish
+the value, since a second `publish()` draws a new sequence number and appends it twice. Cancellation
+delivered before the backend is called still propagates as cancellation, because nothing was sent and
+there is nothing to recover; cancellation delivered *inside* the call is the unknown outcome above,
+not this one (ADR-036, ADR-038).
 
 `retry_wake` refuses an empty list rather than returning quietly, because a no-op there looks like
 recovery while the record stays durable and unannounced. Calling `wake()` again is safe: it

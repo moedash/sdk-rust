@@ -126,6 +126,14 @@ integrity loss does not. **Operators are expected to alert on the integrity metr
 - An unacknowledged shutdown wake is reported through the
   `temporal_external_stream_shutdown_wake_failed` metric rather than retried indefinitely or
   assumed delivered.
+- **Two errors sit deliberately outside the four rows**, because both describe Workflow code asking
+  for something the design does not offer rather than a stream or a converter behaving unexpectedly at
+  read time, and both are deterministic — so a Workflow Task failure would be retried into the
+  identical failure forever with nothing durable to show why. Each is a non-retryable
+  `ApplicationError` raised where the request is made: `ExternalStreamCapacityError` at `subscribe()`,
+  for a subscription set an annotation cannot carry (`annotation-format.md`), and
+  `ConcurrentStreamConsumerError` at the wait, for a second coroutine blocking on one subscription
+  (`python-runtime.md`).
 
 ## Metrics summary
 

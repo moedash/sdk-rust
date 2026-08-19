@@ -31,6 +31,12 @@ across retries.
 ## Consequences
 
 - Providers must store enough to compare content, not just the key.
+- **The producer side owes the key its stability**, and that is a constraint on when the sequence is
+  drawn, not only on where the session ID comes from: at the call, before the payload's encode is
+  awaited. Drawn afterwards, the number follows the codec's completion order, which is external I/O
+  and not reproducible across attempts — so under B two concurrent publishes that complete the other
+  way round on a retry hit exactly the "same key, different bytes" error this record makes an error,
+  and the producer that earns it was deterministic. `spec/backend-contract.md` carries the rule.
 - The conformance suite must include both directions: reusing a `(session_id, sequence)` pair with
   byte-identical content is a no-op returning the original offset; reusing it with different bytes is
   rejected as an error.

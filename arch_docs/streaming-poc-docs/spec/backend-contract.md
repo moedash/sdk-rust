@@ -191,6 +191,15 @@ A producer needs five things, none of which it can infer (ADR-019):
   retried attempt reuses it; plain processes must supply one, and the API requires it rather than
   defaulting to a fresh random value.
 
+  *Stable* is a claim about the sequence too, and it holds only because the number is drawn when the
+  call is made rather than when its payload finishes encoding. A codec may do real I/O — an external
+  payload store, a KMS round trip — and its completion order is not reproducible across attempts, so
+  a sequence drawn afterwards belongs to that order instead of to the call. Two concurrent publishes
+  then exchange keys whenever the store answers the other way round: on one stream the backend sees
+  a stable key reused with different bytes and raises the conflict below, and across topics, where
+  deduplication is per stream key, the swap appends duplicates and raises nothing. Either way a valid
+  concurrent Activity is made non-retryable, or silently doubled, by external timing.
+
 The stream name appears exactly once on the producer side, in `topic()`. `connect()` takes the
 Workflow *chain* key — namespace, Workflow ID, first execution Run ID — and `topic(name)`
 completes it into the full stream identity, so one connection serves several topics and no two
