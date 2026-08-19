@@ -15,8 +15,9 @@ Core-side defect at that confidence bar, and every finding is Python-side.
 fix and re-running it — step 4 of "before reporting a defect found by a test" in
 `verification-hazards.md`. Cases 72-76 of `required-tests/tests-m1.md` are those tests.
 
-Reviewing the fixes then found one more P1 in this round's own code, recorded below as "One defect the
-fixes themselves introduced"; case 77 is its test set.
+Reviewing the fixes then found one more P1 in this round's own code, and validating *that* fix found
+three more in its recovery path. Both are recorded below under "One defect the fixes themselves
+introduced"; cases 77 and 78 are their test sets.
 
 | Severity | Finding | Status |
 |---|---|---|
@@ -148,7 +149,8 @@ Spec: `spec/core-lang-protocol.md`, the readiness-result table.
 ## One defect the fixes themselves introduced
 
 The cancellation fix above was reviewed in turn, and left the boundary immediately before the one it
-closed still ambiguous. Case 77 is its test set.
+closed still ambiguous. Case 77 is its test set. Validating *that* fix then found three more, all in
+the recovery it added rather than in the outcome; they are the section after it, and case 78.
 
 ### P1 — An append that reports no outcome was read as an append that failed
 
@@ -184,6 +186,40 @@ have been asserting the defect.
 
 Spec: `spec/wake-signal.md`, "The append itself has an acknowledgement window". Decision: ADR-038,
 which also records why probing the backend and auto-resolving were rejected.
+
+### P1 ×3 — the recovery for that outcome was under-bound
+
+Validating the fix above found three more, all in the recovery rather than in the outcome. The
+diagnosis they share: the producer kept the unsettled *record* when what it owed was the unsettled
+*operation*, and `resolve_append()` checked the record's session id when the thing that makes a
+re-append a no-op is the whole of `(stream, session, sequence, bytes)`. Case 78 is their test set.
+
+**The refusal described the wrong call.** With an append unsettled, a later `publish("b", wake=False)`
+was refused with an error naming the older record but carrying the *refused* call's `wake` and
+`lease`, and `cancelled` defaulted back to `False`. A caller following that error's own instructions
+settled a record that owed a Signal with no wake at all: `records [(0, DATA)] signals 0`. Fixed by
+storing the operation — stream, record, wake, lease, cancelled — so the first raise and every later
+refusal report the same recovery. `resolve_append()`'s `wake` and `lease` now default to what the
+interrupted call was doing rather than to the method's own defaults, which is the same defect one
+level down: a `wake=False` fence must not acquire a Signal from its recovery.
+
+**The recovery was not bound to its stream.** A `StreamRecord` names its session and sequence but not
+its stream, and idempotency is scoped per stream, so `topic_b.resolve_append(error_from_a.record)`
+appended a second copy onto B — `tokens [(0, DATA)] events [(0, DATA)]` — while leaving A unsettled
+and therefore still blocked. Fixed by carrying `stream_key` on the error and resolving against *this*
+topic's outstanding entry, matched on the full record rather than on the idempotency key, so different
+bytes under that key are refused too and do not clear the entry.
+
+**The recovery was not bound to its producer.** The session check passed on a *replacement* producer
+built with the same stable session id, whose sequence and wake counters are back at zero. Its next
+publish reused sequence 0 (`AppendConflictError`), and its recovery wake re-derived the request ID an
+earlier, different unparked wake had already used — `request_ids_collide True` — so the server would
+deduplicate it away and leave the record unannounced. The contract is now inverted explicitly:
+recovery is in-process, for the instance that still owes the append. A producer that is gone recovers
+the way an Activity retry already does, re-running the same calls in the same order, which re-derives
+the same keys and advances the counters because the calls actually ran. The refusal says so.
+
+All three checks run before the backend is touched, and each names which binding failed.
 
 ## What this round did not change
 

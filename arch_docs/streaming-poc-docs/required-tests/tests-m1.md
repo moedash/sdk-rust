@@ -1,4 +1,4 @@
-# Milestone 1 required tests — 77 cases
+# Milestone 1 required tests — 78 cases
 
 One stream, end to end. Milestone 2's 12 cases are in `tests-m2.md`; the two partition the
 88 required cases exactly.
@@ -240,3 +240,12 @@ mapping. Each of these covers an invariant that was stated in a spec and held by
   is unsettled the stream refuses the `publish()` that would duplicate it, and accepts one again once
   it is settled. Settling an append that never landed appends it once, under the sequence the
   interrupted call drew. `AppendConflictError` stays a refusal, since re-appending cannot change it.
+
+- The unknown-outcome recovery is bound to the operation, the stream and the producer instance. A
+  refusal issued while an append is unsettled reports **that** append's wake, lease and cancellation
+  rather than the refused call's, and recovering by the refusal's own fields sends the one wake it
+  owed. `resolve_append()` refuses a record whose unsettled append is on another topic, refuses
+  different bytes under the outstanding key without clearing it, and refuses a replacement producer
+  that shares the session id — whose own recovery, re-running the same calls in the same order,
+  deduplicates the appends and leaves its sequence and unparked-wake request IDs correct. A recovery
+  given no wake policy uses the interrupted call's, so a `wake=False` fence gains no Signal.

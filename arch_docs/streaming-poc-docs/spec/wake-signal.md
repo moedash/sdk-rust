@@ -125,14 +125,24 @@ the result in a separate client-side step; a cancellation or a dropped connectio
 leaves a durable record whose offset nobody holds.
 
 That window is therefore a **third outcome**, `AppendNotAcknowledgedError`, and not a failure. It
-carries the exact record — byte-identical, still holding its `(session_id, sequence)`, offset unset —
-and `resolve_append()` re-appends *that* record. One call is right for both histories, because a
+carries the interrupted *operation* — the exact record, byte-identical and still holding its
+`(session_id, sequence)`, together with the stream it was for, the wake it owed and the lease it
+chose — and `resolve_append()` re-appends *that* record on *that* topic, defaulting to the wake the
+interrupted call was going to send. One call is right for both histories, because a
 repeat append of byte-identical content under a used key writes nothing and returns the original
 offset (ADR-020), while a key the backend never saw is appended now. Until it is settled the stream
 refuses further appends from that producer, because the caller's obvious next move — `publish()` again
 — draws a fresh sequence number and puts the value in the stream twice if the first attempt landed.
 For `finish_writing()` the duplicate is a second write fence, which reads back as a producer session
 that ended twice.
+
+The recovery is refused unless it is the producer instance, topic and exact bytes the outstanding
+append belongs to. Each binding stops a different duplicate: a record does not name its own stream and
+idempotency is scoped per stream, so another topic would append a second copy rather than deduplicate;
+and a replacement producer with the same session id has its sequence and wake counters back at zero,
+so settling there leaves its next publish reusing a sequence number and its next unparked wake reusing
+a request ID. A producer that is gone recovers the way an Activity retry already does — same session
+id, same calls, same order — which re-derives the keys and leaves the counters right (ADR-038).
 
 `AppendConflictError` is the one exception and the only one the contract can support: it says the key
 was used with *different* bytes, so the record did not land and re-appending it would raise the

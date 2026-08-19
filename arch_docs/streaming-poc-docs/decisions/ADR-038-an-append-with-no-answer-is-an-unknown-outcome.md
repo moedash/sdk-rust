@@ -63,6 +63,30 @@ still permits the duplicate — the failure is not that the caller lacked inform
 obvious next call is the wrong one. The refusal is checked at entry, so a concurrent publish already
 past that point completes; concurrent publishes have no defined order between them to preserve.
 
+**The recovery is bound to the operation, the stream, and the producer instance**, and each binding
+answers a distinct way the record could be duplicated or misrouted:
+
+- **The operation, not just the record.** What the interrupted call owed includes whether a wake was
+  due, under which lease, and whether cancellation is still to be honoured. The producer holds all of
+  it, and every raise about that append — the first one, and every later refusal — reports the same
+  thing. A refusal that described the *refused* call instead would make its own instructions wrong: a
+  caller following them settles with `wake=False` a record that owed a Signal, and the parked Workflow
+  stays parked on a durable record nobody announced.
+- **The stream.** A `StreamRecord` names its producer session and sequence but not its stream, and
+  idempotency is scoped per stream. On any other topic that key has never been used, so settling there
+  appends a second copy of the value onto a stream no consumer of it is watching, and leaves the real
+  stream blocked. `resolve_append` refuses a record that is not *this* topic's outstanding append, and
+  refuses one whose bytes differ from it, before touching the backend.
+- **The producer instance.** A replacement producer built with the same session id has its sequence
+  and wake counters back at zero, so settling there leaves both invalid: its next publish reuses a
+  sequence number the recovered record already holds, and its next unparked wake re-derives a request
+  ID an earlier and *different* wake already used — which the server deduplicates away, leaving a
+  durable record unannounced. The recovery for a producer that is gone is the one the Activity retry
+  already performs: rebuild with the same session id and re-run the same calls in the same order. That
+  re-derives the same sequences, so the appends deduplicate, and the counters advance correctly
+  because the calls actually ran. `resolve_append` is the in-process recovery for the instance that
+  still owes the append, and says so when refusing.
+
 **`AppendConflictError` is exempt**, and is the only exemption the contract can support: it says the
 key was used with *different* bytes, so this record did not land and re-appending it would raise the
 identical error. Treating it as unknown would send the caller to settle an append that has no
@@ -101,6 +125,12 @@ case a second type is for.
 - **An unsettled append blocks its stream.** That is deliberate: the alternative is a duplicate. A
   caller that cannot settle it — a dying Activity — drops the producer, and the retried attempt reuses
   the session id and re-derives the same key, so its own re-append is the same no-op.
+- **Recovery is in-process only.** `resolve_append` names the producer, the topic and the exact
+  record, and refuses anything else with a `ValueError` that says which of the three did not match.
+  Cross-process and cross-attempt recovery is the Activity retry, which needs no new mechanism.
+- The `.wake` and `.lease` of a recovery default to what the interrupted call was doing, rather than
+  to the method's own defaults. A recovery that chose its own policy would give a `wake=False` fence a
+  Signal and take one away from a `wake=True` publish.
 - Nothing changes for a backend that never loses an answer; the new outcome is unreachable when
   `append()` always returns or raises `AppendConflictError`.
 - A test must commit inside `append()` and *then* lose the answer, settle it, and find exactly one
