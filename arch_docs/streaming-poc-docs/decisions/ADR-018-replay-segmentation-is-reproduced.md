@@ -31,6 +31,13 @@ B would require Core to parse the annotation, which it is designed not to do.
 Under C the live run's *k* activations become *k* drains inside one replay activation, so coroutine
 scheduling and condition evaluation match.
 
+*k*, and not *k + 1*. The replay driver is not the only thing that drains: the job lands in the
+non-query job set, so the activation runs one `_run_once` of its own for that set whatever the driver
+did. The driver therefore drains the first *k - 1* segments and arms the last, leaving that one drain
+to the activation -- which is also what the live run did, where each activation's single trailing drain
+served the records it had just been handed. Closing the replay moves to after that drain, in the
+activation's own `finally`.
+
 ## Consequences
 
 - The annotation grammar carries `segment*`, one per original activation, each with its own
@@ -47,3 +54,9 @@ scheduling and condition evaluation match.
 - Core stays annotation-blind.
 - The test list requires a `wait_condition` registered mid-stream to fire on the same delivery under
   replay as it did live, for a marker spanning several activations.
+- A test that drives only the replay driver cannot see the count: the drain it misses is the
+  activation's. The drain count is asserted across the whole activation, driver plus trailing
+  `_run_once`, or it is not asserted at all.
+- **A zero-segment marker is the exception and closes before that drain**, because with no segment to
+  serve the drain is a live one and a reposition after it would retract records it had just delivered.
+  See `spec/annotation-format.md`.

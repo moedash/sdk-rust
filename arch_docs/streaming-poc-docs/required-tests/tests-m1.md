@@ -1,7 +1,7 @@
-# Milestone 1 required tests — 55 cases
+# Milestone 1 required tests — 71 cases
 
 One stream, end to end. Milestone 2's 12 cases are in `tests-m2.md`; the two partition the
-67 required cases exactly.
+83 required cases exactly.
 
 This list is read at test time, not by a human: `tests/contrib/external_workflow_streams/
 m1_gate.py` parses the count in the heading and every bullet below it, and maps each case
@@ -145,3 +145,66 @@ gate checks that the two agree.
   before any Workflow can name it, rather than failing later at replay.
 - A trimmed range (Redis `XTRIM`/`MAXLEN` removing the head of a recorded range) and a deleted
   write fence both fail as `StreamIntegrityError`, distinctly from an unreachable backend.
+
+## Boundaries an implementation review found unprotected
+
+New cases are appended here rather than filed under the sections they belong to, because the gate
+maps cases by position: inserting one renumbers every case after it and silently repoints every
+mapping. Each of these covers an invariant that was stated in a spec and held by nothing.
+
+- The first live drain after a replay sees only records past the marker's boundary **with no
+  event-loop turn in between**: the reposition has to have happened by the time the replay returns,
+  not merely be scheduled onto the manager's loop. A test that yields before draining passes either
+  way and proves only that the loop won a race.
+- A marker with *k* segments produces exactly *k* condition-checking drains **counted across the
+  whole activation**, driver plus the trailing `_run_once` the job set always runs, with one empty
+  segment among the *k*. Counted inside the replay driver alone the number was always right and the
+  extra drain was invisible.
+- The completion carrying the segment that crosses the byte-budget high-water mark is the one that
+  requests rollover, and it carries a decodable terminal — the flag is read after the segment is
+  closed, not before.
+- A frame larger than the slack a fractional high-water mark leaves ends the activation with
+  `BUDGET_ROLLOVER` and requests rollover, rather than raising; the annotation still closes with a
+  terminal. A subscription set whose header and terminal alone cannot fit an empty annotation is
+  refused at `subscribe()`, leaving no half-registered wait behind.
+- Every coordination step after a durable append is inside `publish()`'s acknowledged-wake contract:
+  a provider failure in the parked-set read, the generation read, or the claim raises the
+  durable-but-unacknowledged error carrying the offset and an explicit recovery, and recovering the
+  wake alone leaves exactly one record — and, for `finish_writing()`, exactly one fence.
+- A shutdown grace period that expires inside a hanging wake counts **every** subscription it
+  abandoned, including those the serial loop never reached, and a Run whose status probe cannot
+  answer is counted rather than passed over; a Run that is parked or has an open Workflow Task is
+  not counted, or the metric fires on every clean shutdown.
+- An external payload store that cannot be reached is row one, not row three, on both delivery
+  paths: a storage driver whose `retrieve()` raises an ordinary provider exception reaches the
+  consumer as `StreamStorageError` rather than as a converter mismatch, and the classification rule
+  leaves it alone rather than relabelling it.
+- An activation the annotation byte budget stopped is followed by one that can deliver again: the
+  same completion requests rollover and carries a terminal, with a frame larger than the slack the
+  fractional high-water mark leaves but not large enough to reach the mark, so the mark cannot stand
+  in for the condition. Stopping without asking wedges the Workflow permanently.
+- A manager with no run-status probe wired reports no abandoned wakes at shutdown, since it has no
+  sweep obligation to have failed at; a metric that fires where the mechanism is unconfigured is not
+  alertable.
+- A marker with **no segments**, replayed on a Run whose watcher has already buffered records
+  published while it was evicted, closes before the activation's own drain: that drain hands nothing
+  over, the cursor sits at the marker's boundary, and the records arrive on the activation the
+  watcher's re-read announces rather than twice.
+- A record is priced by the largest run the **annotation** has encoded, not the largest in the open
+  segment: the measurement survives the segment being closed, so the first record of an activation is
+  not priced at the bare floor and then found unrecordable.
+- A run larger than the spill margin is refused as a capacity limit naming the provider's offsets,
+  non-retryably, rather than surfacing as an internal byte-budget error.
+- The `subscribe()` capacity floor covers everything an empty annotation carries -- header, terminal,
+  one segment frame, and the margin -- so a set that clears header-plus-terminal alone is still
+  refused rather than failing on its first completion.
+- Abandoning a replay leaves replay mode without running the consumed check or the cursor move, so a
+  failing activation reports its own error rather than a nondeterminism error blaming a `subscribe()`
+  nobody touched, and commits nothing.
+- An append carrying a prefetch epoch a reposition has retracted is refused rather than buffered, so
+  a watcher read that began before the reposition cannot undo it -- asserted as a contract, because a
+  single-threaded loop cannot place the reposition between a check and an append with no await
+  between them.
+- A replay activation delivers nothing the annotation does not name, with a poison record already in
+  the live buffer and pending waits resolved on every drain as a coalesced readiness job resolves
+  them, and records no run of its own.

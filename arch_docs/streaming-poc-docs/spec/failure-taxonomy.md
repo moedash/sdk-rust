@@ -78,6 +78,22 @@ validated, so the rule above resolves to a decode failure. A cause that is *alre
 error types keeps its own row rather than being relabelled — a storage failure surfacing out of
 external payload retrieval is row one, not the consumer's converter mismatch.
 
+### An unreachable external payload store is row one
+
+That last sentence is a rule about causes that arrive already labelled, and **nothing labels the one
+case it names unless the preparation step does it.** With external storage configured, a record's
+bytes are a *reference*: the stream holds a claim and the value does not exist until the payload store
+hands it over. A driver that cannot reach the store raises whatever its client raises — an ordinary
+`ConnectionError` — and the `DataConverter` does not wrap it. The consumer then sees an unclassified
+exception on a record whose range validated, and the rule above turns it into row three: an operator
+is told to align a converter that was never wrong, during a transient outage that clears itself.
+
+So the label is applied where the knowledge is, at the retrieval call inside the preparation step,
+and only around that call — the user's `PayloadCodec`, which runs immediately after it, keeps row
+three, because a codec that rejects intact bytes *is* the configuration mismatch. Fetching a
+reference is as much a stream read as reading the stream is; both are transient and both clear when
+the thing behind them recovers.
+
 ## Integrity loss blocks the Workflow
 
 The externally visible result of integrity loss is a **blocked Workflow**:

@@ -20,6 +20,8 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | Implement a backend provider | [`spec/backend-contract.md`](spec/backend-contract.md) |
 | Trust a test result before acting on it | [`verification-hazards.md`](verification-hazards.md) |
 | Review the feature, or know which commits it is | [`review-guide.md`](review-guide.md) — a dated snapshot, not design |
+| Know what past reviews found and what was done | [`follow-up-review.md`](follow-up-review.md), then [`third-review.md`](third-review.md) — review records, not design |
+| Chase the empty-stream replay flake | [`empty-stream-replay-flake-handoff.md`](empty-stream-replay-flake-handoff.md) — a resolved investigation, with what it got wrong |
 
 ## Specs — one subsystem per file
 
@@ -27,9 +29,9 @@ narrative, and where an alternative was considered and rejected the reasoning is
 |---|---|
 | [`spec/backend-contract.md`](spec/backend-contract.md) | What a provider must implement, cursor semantics, the immutability precondition, producer binding, park intents, write fences, retention |
 | [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) | When a Workflow Task is retained and when its wait set is merely registered, the idle timeout, rollover, parking, the three generations, shutdown and eviction, the durability boundary |
-| [`spec/annotation-format.md`](spec/annotation-format.md) | The replay annotation grammar, runs, segments, the byte budget, replay validation, cursor origin |
+| [`spec/annotation-format.md`](spec/annotation-format.md) | The replay annotation grammar, runs, segments, the byte budget and the four rules that make it a bound, replay validation, cursor origin |
 | [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md) | Every proto message, activation job, readiness call, and piece of Core state |
-| [`spec/python-runtime.md`](spec/python-runtime.md) | The out-of-sandbox manager, the split decode path and the serialization context both halves carry, the four cursor positions, the delivery budget, how `merge()` stays fair across activations, what closing a subscription ends and what it keeps, which side answers which activation job |
+| [`spec/python-runtime.md`](spec/python-runtime.md) | The out-of-sandbox manager, the split decode path and the serialization context both halves carry, the four cursor positions, why the reposition after a replay is synchronous, the two delivery budgets, how `merge()` stays fair across activations, what closing a subscription ends and what it keeps, which side answers which activation job |
 | [`spec/wake-signal.md`](spec/wake-signal.md) | The reserved Signal's name, envelope, request-ID derivation, and interception |
 | [`spec/failure-taxonomy.md`](spec/failure-taxonomy.md) | The four failure classes, their error types, metrics, and operator responses |
 

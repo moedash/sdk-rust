@@ -140,6 +140,33 @@ restarts from `committed` — which is exactly what makes "no cursor advances un
 commits" safe to state. The manager may reposition `prefetch` *backwards* to `committed`, never
 forwards past what a marker has committed, so a speculative read can never be mistaken for progress.
 
+### The reposition after a replay is synchronous
+
+While replay hands Workflow code the records a marker recorded, the watcher has been independently
+reading those same records from the subscription's start cursor into the live buffer — nothing out
+there knows the marker exists. So the end of a replay moves `committed` to the marker's terminal and
+retracts the buffer to it, or the first live drain hands every replayed record over a second time.
+Observed end-to-end as a Workflow that received `['alpha', 'alpha', 'beta']`.
+
+**That retraction has to have happened by the time the replay returns, not merely be scheduled.** The
+drain that follows a replay is on the Workflow thread, and so is the replay itself; hopping the
+retraction onto the manager's loop — as readiness re-arming legitimately does, because that only has
+to happen eventually — orders it against nothing at all. One ordinary scheduler pass is enough for
+Workflow code to drain first, and the fix then depends on the manager loop winning a race.
+
+Two things make the synchronous path safe from the Workflow thread:
+
+- **Only the watcher's wakeup is hopped.** Retracting touches the buffer, the three uncommitted
+  cursors, and the prefetch epoch, all under the subscription's lock and none of them an `asyncio`
+  primitive. The one asynchronous consequence — a watcher parked on backpressure now having room — is
+  an `asyncio.Event`, which may not be set from another thread, so that alone is posted to the loop.
+- **The epoch check moved inside the append**, under the same lock the retraction takes. A watcher
+  compares the epoch it captured before its read against the one at append time, and with the
+  retraction now landing on another thread a check made outside the lock could pass and *then* have
+  the retraction land — putting the retracted records straight back into the buffer and re-advancing
+  `prefetch` past them. Under the lock, an append is either cleared by the retraction or rejected by
+  it, and there is no third interleaving.
+
 `delivery` and `consumption` differ by whatever a drained batch left unread: a Workflow that stops
 iterating part-way through a batch was delivered the whole batch and consumed only its prefix. The
 annotation records `delivery`, because that is the schedule replay must reproduce; the
@@ -147,7 +174,7 @@ Continue-As-New continuation carries `consumption`, because the buffer holding t
 with the Run and a successor resuming from `delivery` would step silently over records Workflow code
 never saw.
 
-## Delivery within one activation is bounded by a record count
+## Delivery within one activation is bounded by a record count, and by annotation bytes
 
 One activation hands Workflow code at most `MAX_RECORDS_PER_ACTIVATION` records, and the
 subscription then blocks **even though records are still buffered** — that block is what ends the
@@ -168,6 +195,15 @@ reach outside the runtime:
 
 The budget does not apply during replay, where delivery comes from the recorded segments, which
 already fix how many records each activation received.
+
+A **second** budget sits beside it and the smaller of the two wins: how many more records this
+Workflow Task's annotation can afford to record (`annotation-format.md`). It belongs here for the same
+reason the record cap does — a record handed to Workflow code has to be recorded, a segment frame that
+no longer fits cannot be moved to the next annotation, and there is no third option — so it is spent
+before the record is delivered rather than discovered after the segment is built. Its three
+consequences are the record cap's, with one difference each: the segment ends with `BUDGET_ROLLOVER`
+rather than `BATCH_LIMIT`, and the same completion asks Core to end the Workflow Task rather than
+merely the activation. Re-arming readiness and withholding immediate parkability are identical.
 
 ## Merging several subscriptions
 

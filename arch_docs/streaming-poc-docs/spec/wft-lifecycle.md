@@ -327,6 +327,33 @@ A wake still unacknowledged when the grace period expires is counted on a distin
 the derived request ID and deduplicate server-side; past it, the Run falls back to the durability
 boundary below rather than blocking shutdown or pretending the wake happened.
 
+**Every subscription the sweep does not resolve is counted, not only the wakes it attempted.** The
+sweep starts by treating each subscription as unaccounted for and resolves it exactly once: when its
+Run's status says nothing is owed, or when a wake has been attempted and its result recorded. Whatever
+is left when the sweep stops is counted on the same metric. Three cases reach that point and all three
+are silent otherwise:
+
+- the grace period expiring **inside** a hanging wake send, which cancels the sweep where it stands;
+- every subscription **after** that one in the serial loop, which is never visited;
+- a Run whose **status probe could not answer**, which the sweep deliberately sends no wake for — it
+  might have an open Workflow Task — but which may equally be holding a buffered record with nowhere
+  to announce it. "We could not tell" is not "nothing was owed."
+
+Accounting only where the sweep reached reported `shutdown_wake_failures == 0` for a Worker that had
+just abandoned every one of its handoffs, which is exactly the silence the metric exists to break: a
+dropped wake looks identical to a producer with nothing to say.
+
+Three cases are deliberately *not* counted, because a metric that fires on a clean shutdown is not
+alertable. A Run reported `Parked` or `WftOpen` owes nothing — the first is woken by a producer's
+append through the ordinary path, the second is Core's to finish. A manager with **no status probe
+wired** has no sweep at all: the mechanism is defined in terms of what Core answers, so there is no
+obligation it could have failed to discharge. And a subscription the **live path removed** while the
+sweep ran has had its handoff made: readiness answered `RunNotFound` owes a wake, sends it, and drops
+the subscription only afterwards — a likely answer during shutdown, with watchers running for the whole
+grace window and awaits inside the sweep for them to interleave with. The sweep then reaches that Run,
+finds no subscriptions, and moves on; counting what it skipped there reports a loss that did not
+happen.
+
 ## The durability boundary, stated honestly
 
 Mechanisms (1) and (3) are **not durable**. Both depend on the consuming Worker being alive — (1) with
