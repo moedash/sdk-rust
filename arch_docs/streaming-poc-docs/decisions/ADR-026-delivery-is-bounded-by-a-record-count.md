@@ -54,10 +54,38 @@ notification is coming for them. A budget that blocked without re-arming would l
 waiting forever on data already in front of it — trading a deadlock timeout for a silent stall,
 which is worse, because the stall reports nothing.
 
+**The count is charged at delivery, and an activation begins already charged for what Workflow code
+is holding.** Both follow from the budget being a *reservation* rather than a check, and each closes a
+schedule that a plainer reading of "256 records per activation" let through.
+
+Charging at consumption — one record at a time, as each is handed over — reads the budget at the drain
+and takes nothing, so the next subscription's drain sees the same room and takes it as well. Two
+subscriptions consumed by two independent coroutines then take a whole budget each, and `n` of them
+take `n`; `merge()` was immune only because it fills one record at a time, which charges and checks in
+the same place. Charging at delivery also puts the count on the same quantity the annotation records,
+so the cap bounds the segment replay will divide by rather than a different number.
+
+Resetting the count to zero per activation leaves the other half open. A batch is delivered whole and
+consumed one record at a time, so a Workflow that stops iterating part-way through carries the
+remainder in its ready list — where the next activation takes it with no drain and no check. Free, and
+it accumulates: one subscription per activation can leave a nearly full list behind, so `n` of them
+arrive holding `n` budgets between them. Starting the count at what the ready lists already hold makes
+carried-over-plus-newly-delivered exactly one budget.
+
 ## Consequences
 
 - **One activation is bounded by construction**, independently of producer rate, backend speed, and
   buffer size. No workload can make an activation run to the deadlock timeout by volume.
+- **"The budget stopped delivery" is now a conservative signal**, and the two things that read it —
+  re-arming readiness, and withholding immediate parkability — are safe in that direction. An
+  activation pre-charged for a full ready list reports the budget spent without having tried to
+  deliver; the re-arm is then skipped by the manager for an empty buffer, and a wait withheld from
+  parking is retained for its idle timeout rather than parked. Under-reporting is what loses records,
+  since nothing else announces what a budget left behind.
+- **A record drained but never consumed still costs its slot.** It has been recorded in the
+  annotation, so it is delivery whatever the Workflow does with it, and the Run keeps it in hand.
+  Closing a subscription drops its ready list and gives the slots back, since those records can no
+  longer be consumed by anyone.
 - The segment that exhausts the budget ends with `BATCH_LIMIT`, which is what that
   `segment_end_reason` means and how replay reproduces the same split.
 - **The budget does not apply during replay.** Delivery comes from the recorded segments, which

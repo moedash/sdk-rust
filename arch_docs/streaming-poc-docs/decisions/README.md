@@ -44,6 +44,9 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [033](ADR-033-replay-checks-bound-waits-one-directionally.md) | Replay checks that every bound wait was recreated, in one direction only | `spec/annotation-format.md` |
 | [034](ADR-034-merge-rotates-its-start-position.md) | `merge()` rotates its start position across passes | `spec/python-runtime.md` |
 | [035](ADR-035-both-sides-bind-the-workflows-serialization-context.md) | Both sides of a stream bind the Workflow's serialization context | `spec/python-runtime.md` |
+| [036](ADR-036-cancellation-after-a-durable-append-is-an-unacknowledged-wake.md) | Cancellation after a durable append is reported as an unacknowledged wake | `spec/wake-signal.md` |
+| [037](ADR-037-a-subscription-has-one-consumer.md) | A subscription has one consumer, and the refusal is on the waiter | `spec/python-runtime.md` |
+| [038](ADR-038-an-append-with-no-answer-is-an-unknown-outcome.md) | An append that reports no outcome is unknown, not failed | `spec/wake-signal.md` |
 
 ## The decisions that constrain the most
 

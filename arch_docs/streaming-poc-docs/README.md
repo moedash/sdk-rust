@@ -20,7 +20,7 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | Implement a backend provider | [`spec/backend-contract.md`](spec/backend-contract.md) |
 | Trust a test result before acting on it | [`verification-hazards.md`](verification-hazards.md) |
 | Review the feature, or know which commits it is | [`review-guide.md`](review-guide.md) — a dated snapshot, not design |
-| Know what past reviews found and what was done | [`follow-up-review.md`](follow-up-review.md), then [`third-review.md`](third-review.md) — review records, not design |
+| Know what past reviews found and what was done | [`follow-up-review.md`](follow-up-review.md), then [`third-review.md`](third-review.md), then [`fourth-review.md`](fourth-review.md) — review records, not design |
 | Chase the empty-stream replay flake | [`empty-stream-replay-flake-handoff.md`](empty-stream-replay-flake-handoff.md) — a resolved investigation, with what it got wrong |
 
 ## Specs — one subsystem per file
@@ -37,7 +37,7 @@ narrative, and where an alternative was considered and rejected the reasoning is
 
 ## The rest of the set
 
-- [`decisions/`](decisions/README.md) — 35 records, one per decision, each with the alternatives that
+- [`decisions/`](decisions/README.md) — 38 records, one per decision, each with the alternatives that
   were rejected. A spec states what is true; a decision record states why the other shape was not
   taken.
 - [`required-tests/`](required-tests/) — the two required-test lists. These are not prose: the Python

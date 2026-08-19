@@ -1,7 +1,7 @@
-# Milestone 1 required tests — 71 cases
+# Milestone 1 required tests — 77 cases
 
 One stream, end to end. Milestone 2's 12 cases are in `tests-m2.md`; the two partition the
-83 required cases exactly.
+88 required cases exactly.
 
 This list is read at test time, not by a human: `tests/contrib/external_workflow_streams/
 m1_gate.py` parses the count in the heading and every bullet below it, and maps each case
@@ -208,3 +208,35 @@ mapping. Each of these covers an invariant that was stated in a spec and held by
 - A replay activation delivers nothing the annotation does not name, with a poison record already in
   the live buffer and pending waits resolved on every drain as a coalesced readiness job resolves
   them, and records no run of its own.
+
+- One activation hands Workflow code at most `MAX_RECORDS_PER_ACTIVATION` records **across
+  subscriptions consumed independently of each other**, with no `merge()` involved: two never-empty
+  subscriptions drained by two coroutines that yield after every value receive one budget between
+  them, both end blocked on a readiness future, and the segment records exactly what was handed over.
+  A ready list carried across an activation boundary is charged to the activation that inherits it, so
+  the carry-over plus what is newly delivered is still one budget.
+- Two concurrent publishes take their sequence numbers in **invocation** order, not in the order their
+  payload codecs finish: a retry that reuses the session id, makes the same calls in the same order,
+  and releases the encodes the other way round is idempotent and leaves two records — and the
+  cross-topic version, where the swapped key cannot collide and nothing would raise, appends no
+  duplicate on either topic.
+- Cancellation delivered after a durable append leaves `publish()` as the durable-but-unacknowledged
+  error carrying the offset and exactly one recovery, for each of the four post-append stages, and
+  performing that recovery leaves one record — one fence, for `finish_writing()`. Cancellation before
+  the backend is called at all — while the payload is still encoding — is still a cancellation, with
+  nothing appended, no Signal sent, and nothing left owed.
+- A second coroutine blocking on one subscription is refused deterministically, on the single-wait path
+  and inside `merge()` — which refuses before registering anything — while the consumer already
+  blocked still receives the next record and is left resolvable by `close()`. Iterating one
+  subscription again after breaking out of a previous `async for` is still allowed, and resumes.
+- A `Stale` readiness report whose retry discovers `RunNotFound` sends the owed wake exactly once
+  **and** tears the watcher down, with the retry position parameterized, and stops retrying at the
+  answer that cannot change.
+
+- An append interrupted **after the backend committed and before it answered** is an unknown outcome
+  carrying the exact record, not a failure and not a bare cancellation: settling it with
+  `resolve_append()` recovers the original offset and leaves one record — one fence, for
+  `finish_writing()` — and the same holds when a `ConnectionError` replaces the cancellation. While it
+  is unsettled the stream refuses the `publish()` that would duplicate it, and accepts one again once
+  it is settled. Settling an append that never landed appends it once, under the sequence the
+  interrupted call drew. `AppendConflictError` stays a refusal, since re-appending cannot change it.
