@@ -32,6 +32,37 @@ segments in order, performing one event-loop drain per segment. The live run's *
 become *k* drains inside one replay activation, so coroutine scheduling and condition evaluation
 match.
 
+*k*, and not *k + 1*. **The replay driver is not the only thing that drains.** The job lands in the
+non-query job set, so the activation runs one `_run_once` of its own for that set once every job in it
+has been applied — which happens whatever the driver did. So the driver drains the first *k - 1*
+segments and arms the last, leaving that drain to the activation. This also mirrors the live run,
+where each activation's single trailing drain served the records that activation had just been handed.
+
+Closing the replay therefore moves to after that drain: the check that nothing recorded was left
+undelivered, and the cursor reposition onto the marker's committed boundary, both belong after the
+final segment has actually been delivered.
+
+**A failing activation abandons the replay rather than closing it.** Leaving replay mode is
+unconditional — a Run stuck in it has every later drain return nothing at all — but the checks and the
+cursor move are skipped when an error is already propagating. The consumed check raises whenever a
+recorded delivery is still armed, and after a failed drain one always is, since the drain that would
+have taken it is the one that failed; an exception raised while another propagates **replaces** it, so
+closing from a bare `finally` reported every failing replay activation as a nondeterminism error
+blaming a `subscribe()` call nobody touched. That loses the diagnosis and the classification with it:
+a `FailureError` out of Workflow code fails the Workflow, while a nondeterminism error fails the
+Workflow Task and is retried. The cursor move has to be skipped in any case — an activation that
+failed committed nothing.
+
+**A marker with no segments at all defers nothing, and closes before that drain instead.** A Workflow
+Task that bound a wait and blocked with the stream never delivering writes a header and a terminal and
+no segment. There is then no recorded segment for the activation's drain to serve, which makes that
+drain a *live* one: records that arrived while the Run was evicted are already in the buffer and it
+would hand them over. Repositioning after it would retract exactly what it had just delivered — cursor
+back to the marker's boundary, buffer cleared — and the watcher would re-read and re-deliver records
+Workflow code already had. Closing first retracts the buffer *before* the drain, so the drain finds
+nothing and the watcher re-reads from the committed boundary; the records arrive on the activation that
+re-read announces.
+
 A segment's delivery list is the recorded **global** order across waits, not one list per wait: it
 is the order the runtime handed records over, which is the order Workflow code took them in. The
 segmentation reproduces how many drains an activation ran; the order within a segment reproduces
@@ -207,6 +238,81 @@ checked afterwards (ADR-007):
 An annotation can therefore never exceed the budget: the runtime rolls the Workflow Task over
 instead of growing the marker. Replay reassembles multi-marker batches in Workflow Task order,
 matching each marker to its Workflow Task rather than concatenating blindly.
+
+### The high-water mark alone is not a bound
+
+A high-water mark is a *fraction* of the budget, and it becomes true only once a frame that crossed it
+has been emitted. Frames are indivisible, and three of the four have no length this side chooses: a
+binding carries the namespace, Workflow ID, first-execution Run ID, stream name, backend name, and
+provider id; a run carries two provider-supplied offset strings. Any of them can be larger than the
+slack a fractional mark leaves, and the batch a frame records cannot be moved to the next annotation —
+its deliveries happened in *this* Workflow Task, and that task's marker is where replay has to find
+them. So "roll over at 75%" is a policy, not a guarantee, and three further rules are what make the
+guarantee hold for a frame of any size.
+
+**The closing frames are reserved, not checked.** The terminal, and a bindings frame for any wait
+registered since the header went out, are priced in advance and only they may spend that reservation.
+Segments are refused before it is gone. Neither may ever be refused, because both record something
+that already happened — and an annotation Core writes with no terminal is durable and cannot be
+decoded past the frame after it.
+
+**Delivery stops before a segment it could not record.** The annotation budget is a second delivery
+budget alongside the per-activation record cap, and the smaller one wins. It is spent *before* a
+record is handed to Workflow code — the only point at which stopping is still an option — priced per
+record by the largest run this annotation has actually encoded, floored so that the first record of an
+annotation is costed pessimistically rather than optimistically. The measurement belongs to the
+**annotation, not the segment**: the open segment is emptied at the end of every activation, so a
+per-segment maximum re-applies the bare floor to the first record of *every* activation, and a real
+run costs two provider-chosen offset strings. Delivering on that price hands over a record the closing
+segment then cannot record. The activation then ends with
+`BUDGET_ROLLOVER` and the same completion asks Core to roll over. Records the annotation budget left
+buffered have their readiness re-reported exactly as the record cap's do.
+
+**Stopping and asking are one mechanism, and either alone wedges the Workflow.** Stopping bounds the
+marker; the rollover is what gives the next Workflow Task a fresh annotation to deliver into. Stop
+without asking and the next activation begins against the same full annotation, is handed a delivery
+budget of zero, delivers nothing — and therefore *observes* nothing. So the condition may not be
+phrased in terms of what this activation observed: "the annotation can afford no more" is a property
+of the annotation, and one written as a property of the activation stops being true the moment the
+completion path takes the delta, which is what clears the observed flag.
+
+**The rollover request rides the completion that crossed the line.** It is read *after* the
+activation's segment is closed, not before. Read before, the flag describes the annotation as it stood
+one activation ago: the segment that crossed the high-water mark went out with
+`request_rollover = false`, and the following activation was free to add another frame before Core had
+ever been asked to close anything. One activation of delay is the entire margin the mark exists to
+provide.
+
+**A subscription set whose header cannot fit is refused at `subscribe()`.** A rollover writes a
+*fresh* header, so an oversized header is not something rollover can fix — every annotation would be
+the same size, and the Workflow Task would fail identically on every retry with no marker ever
+written. The capacity question is therefore asked where the answer is still "do not make this
+subscription": inside the Workflow's own `subscribe()` call, priced against an empty annotation
+(header plus terminal, no segment), deterministic and so reproduced under replay.
+
+A price is not a proof, though: nothing has seen the offsets of the record it is pricing. Two things
+close that gap.
+
+**A margin absorbs a misprice and turns it into a rollover.** Behind the closing reserve sits a spill
+margin that a segment frame — and only a segment frame — may overrun into. Affordability is measured
+against the line *before* the margin, so a mispriced record lands in it rather than past the budget,
+the same completion asks Core to end the Workflow Task, and the terminal is still reserved behind it.
+The margin also fixes the floor `subscribe()` checks: a fresh annotation is guaranteed room for its
+header, its terminal, one segment frame, and the margin, which is what makes at least one record
+affordable in every annotation. Without that guarantee a Workflow can deliver nothing, observe
+nothing, and therefore never even ask for the rollover that was supposed to save it.
+
+**A run larger than the margin is a capacity limit, reported as one.** A provider whose offsets are
+far longer than anything measured can make a single run cost more than the whole budget has left, and
+no rollover helps — the next annotation has to carry the same run. That boundary is refused where the
+record has been drained but not yet handed to Workflow code, as the same non-retryable
+`ExternalStreamCapacityError` that `subscribe()` raises, naming the provider's offsets. It fails the
+Workflow, not the Workflow Task, so the encoding that cannot fit is not retried forever.
+
+`AnnotationBudgetExceeded` remains behind all of that as the encoder's own last line, and it is a
+**non-retryable application failure** for the same reason: the server retries Workflow Task failures
+regardless of cause, so a plain exception there is the permanent retry loop ADR-007 exists to rule
+out.
 
 ### What actually drives marker growth
 

@@ -116,3 +116,28 @@ a round trip, not a wakeup. What the claim is for, and what its lease buys, is i
 Wake signaling is independently retryable and idempotent. Retrying the wake step is a producer
 obligation, not an automatic property; `publish()`'s acknowledged-wake contract (P6b) is what turns
 it into one.
+
+### All three steps after the append are inside the guarantee
+
+`publish()` distinguishes exactly two outcomes: the append failed, or the append succeeded and the
+wake did not. **Steps 2 and 3 both belong to the second**, not only step 3. A coordination call that
+raises whatever the provider raises — a bare `ConnectionError` from observing the parked set or
+claiming a generation — passes straight through a caller watching for the durable-but-unacknowledged
+error, and takes the offset with it. The caller then has no statement about the record that already
+landed, and its obvious move, retrying `publish()`, appends a **second** record: the sequence number
+has advanced and the idempotency key with it.
+
+The two failures differ in what recovers them, so the error says which:
+
+| Failed at | `pending` | Recovery |
+|---|---|---|
+| Step 3, the Signal | the wakes still owed | re-send them verbatim (`retry_wake`) |
+| Step 2, observe or claim | empty, `restart` set | call `wake()` again |
+
+`retry_wake` refuses an empty list rather than returning quietly, because a no-op there looks like
+recovery while the record stays durable and unannounced. Calling `wake()` again is safe: it
+re-observes the parked set, and a parked wake's request ID is derived from the generation rather than
+the sender, so a wake another producer already sent deduplicates against it.
+
+`finish_writing()` carries the identical contract. The duplicate it prevents is a second write fence,
+which reads back as a producer session that ended twice.
