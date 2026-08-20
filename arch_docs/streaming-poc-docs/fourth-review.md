@@ -243,7 +243,19 @@ cancels the first recovery, verifies the next one's connection failure cannot er
 cancellation, checks the intervening refusal's recovery fields, resolves from that refusal with no
 overrides, and observes one record and exactly one Signal.
 
-Spec: `spec/wake-signal.md`, "The append itself has an acknowledgement window". Decision: ADR-038.
+The structural cause is worth separating from the symptom, because it is what made the defect
+survivable through the reviews before it: `_append` built a fresh operation and raised from **its own
+local object**, while `_remember` returned early whenever a matching record was already stored. The
+raised error and the retained state were two objects describing one operation, and only the retained
+one was ever read again. The fix is not a rule about which fields win — it is that `_remember` now
+returns the canonical operation and `_append` raises from *that*, so the two cannot disagree again.
+
+Case 79 was mutation-tested by monkeypatching `_remember` back to its pre-fix body rather than by
+reverting the file, and what that showed is the reason this class of defect is worth naming: pre-fix
+the raised error was internally consistent *with itself* and still wrong, because `resolve_append()`
+had already defaulted its `wake` from the stale entry before `_append` built the error out of those
+defaults. Checking one error against its own recovery instructions would have found nothing. Only
+following the operation across two interruptions shows it.
 
 ## What this round did not change
 
