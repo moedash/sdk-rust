@@ -21,7 +21,6 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | Trust a test result before acting on it | [`verification-hazards.md`](verification-hazards.md) |
 | Review the feature, or know which commits it is | [`review-guide.md`](review-guide.md) — a dated snapshot, not design |
 | Know what past reviews found and what was done | [`follow-up-review.md`](follow-up-review.md), then [`third-review.md`](third-review.md), then [`fourth-review.md`](fourth-review.md) — review records, not design |
-| Know how the last of those fixes was checked before it was trusted | [`repeated-recovery-fix-validation.md`](repeated-recovery-fix-validation.md) — one fix's validation record, not design |
 | Chase the empty-stream replay flake | [`empty-stream-replay-flake-handoff.md`](empty-stream-replay-flake-handoff.md) — a resolved investigation, with what it got wrong |
 
 ## Specs — one subsystem per file
@@ -44,8 +43,9 @@ narrative, and where an alternative was considered and rejected the reasoning is
 - [`required-tests/`](required-tests/) — the two required-test lists. These are not prose: the Python
   suite parses them, checks the declared case counts, and requires every case to map to a test that
   exists. Editing a bullet or a heading count changes what that gate demands.
-- [`verification-hazards.md`](verification-hazards.md) — two ways a test result here can be
-  confidently wrong, both of which produced a written defect report against correct code.
+- [`verification-hazards.md`](verification-hazards.md) — three ways a test result here can be
+  confidently wrong: two that produced a written defect report against correct code, and one that
+  lets a required-test gate pass while checking nothing.
 
 ## Conventions these documents hold to
 
