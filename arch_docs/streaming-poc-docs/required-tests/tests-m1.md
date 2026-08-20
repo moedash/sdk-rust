@@ -1,7 +1,7 @@
-# Milestone 1 required tests — 78 cases
+# Milestone 1 required tests — 79 cases
 
 One stream, end to end. Milestone 2's 12 cases are in `tests-m2.md`; the two partition the
-88 required cases exactly.
+91 required cases exactly.
 
 This list is read at test time, not by a human: `tests/contrib/external_workflow_streams/
 m1_gate.py` parses the count in the heading and every bullet below it, and maps each case
@@ -249,3 +249,8 @@ mapping. Each of these covers an invariant that was stated in a spec and held by
   that shares the session id — whose own recovery, re-running the same calls in the same order,
   deduplicates the appends and leaves its sequence and unparked-wake request IDs correct. A recovery
   given no wake policy uses the interrupted call's, so a `wake=False` fence gains no Signal.
+
+- If `resolve_append()` itself commits and loses its response, the retained operation and the newly
+  raised error remain one state: deliberate wake and lease overrides become the next recovery's
+  defaults, while cancellation delivered on any attempt remains set. Resolving from the later error
+  sends the owed wake and leaves one record.

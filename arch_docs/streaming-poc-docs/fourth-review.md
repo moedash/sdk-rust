@@ -16,8 +16,9 @@ fix and re-running it — step 4 of "before reporting a defect found by a test" 
 `verification-hazards.md`. Cases 72-76 of `required-tests/tests-m1.md` are those tests.
 
 Reviewing the fixes then found one more P1 in this round's own code, and validating *that* fix found
-three more in its recovery path. Both are recorded below under "One defect the fixes themselves
-introduced"; cases 77 and 78 are their test sets.
+three more in its recovery path. Validating those fixes found one final P1 in repeated recovery. All
+three rounds are recorded below under "Defects the fixes themselves introduced"; cases 77-79 are
+their test sets.
 
 | Severity | Finding | Status |
 |---|---|---|
@@ -146,11 +147,13 @@ wake the buffered record still needs.
 
 Spec: `spec/core-lang-protocol.md`, the readiness-result table.
 
-## One defect the fixes themselves introduced
+## Defects the fixes themselves introduced
 
 The cancellation fix above was reviewed in turn, and left the boundary immediately before the one it
 closed still ambiguous. Case 77 is its test set. Validating *that* fix then found three more, all in
 the recovery it added rather than in the outcome; they are the section after it, and case 78.
+Validating those corrections followed the operation through one more interrupted recovery and found
+the final defect below; case 79 is its test.
 
 ### P1 — An append that reports no outcome was read as an append that failed
 
@@ -199,9 +202,9 @@ was refused with an error naming the older record but carrying the *refused* cal
 `lease`, and `cancelled` defaulted back to `False`. A caller following that error's own instructions
 settled a record that owed a Signal with no wake at all: `records [(0, DATA)] signals 0`. Fixed by
 storing the operation — stream, record, wake, lease, cancelled — so the first raise and every later
-refusal report the same recovery. `resolve_append()`'s `wake` and `lease` now default to what the
-interrupted call was doing rather than to the method's own defaults, which is the same defect one
-level down: a `wake=False` fence must not acquire a Signal from its recovery.
+refusal report the same canonical recovery. `resolve_append()`'s `wake` and `lease` now default to
+what the interrupted call was doing rather than to the method's own defaults, which is the same
+defect one level down: a `wake=False` fence must not acquire a Signal from its recovery.
 
 **The recovery was not bound to its stream.** A `StreamRecord` names its session and sequence but not
 its stream, and idempotency is scoped per stream, so `topic_b.resolve_append(error_from_a.record)`
@@ -220,6 +223,27 @@ the way an Activity retry already does, re-running the same calls in the same or
 the same keys and advances the counters because the calls actually ran. The refusal says so.
 
 All three checks run before the backend is touched, and each names which binding failed.
+
+### P1 — a re-interrupted recovery kept two contradictory operations
+
+**Confirmed, as one durable DATA record and no Signal.** The first `publish()` used `wake=False`,
+committed and lost its response. Its `resolve_append()` deliberately changed the recovery to
+`wake=True` with a new lease, then also committed and was cancelled before answering. The second
+error correctly reported the recovery attempt's wake, lease and cancellation, but the producer's
+retained entry was still the original publish. A later refusal therefore described the newer state
+while a defaulted `resolve_append()` silently read the older one and returned success without the
+Signal it owed: `records [(0, DATA)] signals 0`.
+
+**Fixed by making replacement return the canonical operation used for both storage and the raised
+error.** A repeated unknown outcome replaces the matching entry with the newest attempt's effective
+wake and lease. Cancellation is combined with the earlier state rather than replaced, because once
+delivered it remains for the caller to honour after settlement. Every later refusal and defaulted
+recovery now observes that same object. Case 79 commits the initial append and two recovery attempts,
+cancels the first recovery, verifies the next one's connection failure cannot erase that
+cancellation, checks the intervening refusal's recovery fields, resolves from that refusal with no
+overrides, and observes one record and exactly one Signal.
+
+Spec: `spec/wake-signal.md`, "The append itself has an acknowledgement window". Decision: ADR-038.
 
 ## What this round did not change
 

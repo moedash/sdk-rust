@@ -21,6 +21,7 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | Trust a test result before acting on it | [`verification-hazards.md`](verification-hazards.md) |
 | Review the feature, or know which commits it is | [`review-guide.md`](review-guide.md) — a dated snapshot, not design |
 | Know what past reviews found and what was done | [`follow-up-review.md`](follow-up-review.md), then [`third-review.md`](third-review.md), then [`fourth-review.md`](fourth-review.md) — review records, not design |
+| Know how the last of those fixes was checked before it was trusted | [`repeated-recovery-fix-validation.md`](repeated-recovery-fix-validation.md) — one fix's validation record, not design |
 | Chase the empty-stream replay flake | [`empty-stream-replay-flake-handoff.md`](empty-stream-replay-flake-handoff.md) — a resolved investigation, with what it got wrong |
 
 ## Specs — one subsystem per file
