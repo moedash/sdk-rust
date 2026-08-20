@@ -1,6 +1,7 @@
 # Milestone 2 required tests — 12 cases
 
-Multiple streams, `merge`, same-stream subscriptions, and Continue-As-New. Together with `tests-m1.md`'s 76 cases it partitions the 88 required cases exactly.
+Multiple streams, `merge`, same-stream subscriptions, and Continue-As-New. Together with
+`tests-m1.md`'s 79 cases it partitions the 91 required cases exactly.
 
 Every bullet is one case. If you add or remove one, update the count in this heading; the
 gate checks that the two agree.

@@ -68,10 +68,14 @@ answers a distinct way the record could be duplicated or misrouted:
 
 - **The operation, not just the record.** What the interrupted call owed includes whether a wake was
   due, under which lease, and whether cancellation is still to be honoured. The producer holds all of
-  it, and every raise about that append — the first one, and every later refusal — reports the same
-  thing. A refusal that described the *refused* call instead would make its own instructions wrong: a
-  caller following them settles with `wake=False` a record that owed a Signal, and the parked Workflow
-  stays parked on a durable record nobody announced.
+  it, and every raise about that append reports the producer's current canonical state for the
+  operation. A refusal that described the *refused* call instead would make its own instructions
+  wrong: a caller following them settles with `wake=False` a record that owed a Signal, and the parked
+  Workflow stays parked on a durable record nobody announced. If `resolve_append()` itself is
+  interrupted, its effective wake and lease replace the earlier attempt's: it is now the call whose
+  outcome is unknown. Cancellation is cumulative rather than replaceable, because once delivered it
+  remains for the caller to honour after settlement. The retained state and the newly raised error
+  are therefore produced from that same updated operation.
 - **The stream.** A `StreamRecord` names its producer session and sequence but not its stream, and
   idempotency is scoped per stream. On any other topic that key has never been used, so settling there
   appends a second copy of the value onto a stream no consumer of it is watching, and leaves the real
@@ -128,6 +132,10 @@ case a second type is for.
 - **Recovery is in-process only.** `resolve_append` names the producer, the topic and the exact
   record, and refuses anything else with a `ValueError` that says which of the three did not match.
   Cross-process and cross-attempt recovery is the Activity retry, which needs no new mechanism.
+- **Repeated recovery updates one operation rather than creating a parallel version of it.** A
+  re-interrupted `resolve_append()` makes its effective wake and lease the defaults for the next
+  attempt, and cancellation stays set if any attempt received it. Later refusals and recovery errors
+  report exactly that retained state.
 - The `.wake` and `.lease` of a recovery default to what the interrupted call was doing, rather than
   to the method's own defaults. A recovery that chose its own policy would give a `wake=False` fence a
   Signal and take one away from a `wake=True` publish.

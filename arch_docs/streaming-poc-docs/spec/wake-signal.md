@@ -144,6 +144,13 @@ so settling there leaves its next publish reusing a sequence number and its next
 a request ID. A producer that is gone recovers the way an Activity retry already does — same session
 id, same calls, same order — which re-derives the keys and leaves the counters right (ADR-038).
 
+If `resolve_append()` itself is interrupted after calling the backend, its effective wake and lease
+replace the previous attempt's in the one retained operation before the new
+`AppendNotAcknowledgedError` is raised. Those values are therefore the next recovery's defaults.
+Cancellation is sticky instead: once any attempt receives it, later transport failures do not erase
+the caller's obligation to honour it after settling the append. A later refusal reports this same
+canonical state, so its error cannot direct recovery with older wake or lease instructions.
+
 `AppendConflictError` is the one exception and the only one the contract can support: it says the key
 was used with *different* bytes, so the record did not land and re-appending it would raise the
 identical error. Cancellation delivered before the backend is called at all — while the sequence is
