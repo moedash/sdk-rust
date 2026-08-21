@@ -95,6 +95,20 @@ Where the binding happens differs by holder, and follows from what each holder i
   runtime crosses into the sandbox while `with_context` runs user code to clone the component
   converters — work that belongs on the Worker's side of the boundary, and that a per-Run handle
   need do only once.
+
+  **Except for a wait a marker bound**, which is handed a converter built from that wait's *recorded*
+  binding instead. The two halves would otherwise disagree about which Workflow the record belongs
+  to: the manager prepares a replayed record under the annotation's stream key, for the reason the
+  next bullet gives, while the runtime's own converter names the Run this Worker is executing. Those
+  are the same identity on a live Worker and are **not** the same under an offline `Replayer`, which
+  runs under its own placeholder namespace by default — so a converter keyed on the namespace decodes
+  a valid history to a different value, or refuses it outright. This is the accommodation
+  `_verify_binding` already makes for a replay harness's namespace, applied to conversion.
+
+  Built on the Worker's loop before the replay job crosses the boundary, for the same reason as
+  above, and **not** discarded when the replay ends: delivery is not consumption, so a batch drained
+  during replay can be consumed over several later activations, and a record's context is a property
+  of where it was recorded rather than of the marker that happened to still be open.
 - **The manager is per Worker** and prepares records for every Run at once, so a converter bound at
   construction would be bound to nothing in particular. It derives the context per record from that
   record's **own stream key**: the live path from the subscription's, replay from the annotation

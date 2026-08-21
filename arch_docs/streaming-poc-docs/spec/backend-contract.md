@@ -227,6 +227,48 @@ all producers are finished. A fence on one stream only marks that stream parkabl
 Task parks early only when every active subscription is immediately parkable; otherwise the idle
 timeout remains authoritative.
 
+### The claim has to be enforced, not just documented
+
+**A fence is appended only after every `publish()` invoked earlier on that stream has reached a
+durable append** — earlier by invocation order, across every handle `topic()` has returned for the
+name, since the stream is one thing and the handle is not. Without that hold the claim is simply
+false: a publish draws its sequence *before* awaiting the payload codec (see "Producer binding"), so
+one invoked first can still be encoding when the fence is called, and a fence that overtook it parks
+a consumer in front of data that has not been written. In a `wake=False` batch it is worse than
+early — the fence carries the batch's only wake, so it spends it on records that do not exist yet.
+
+**The order holds fences behind data writes and behind nothing else.** Two concurrent fences make
+independent claims about the publishes each of them was invoked after, and neither is inside the
+other's claim, so they are unordered with respect to each other. Ordering them would only let a
+fence that never reached the backend — cancelled while waiting, or refused — stand in for a data
+write that went missing, and refuse a fence with every write it claims already durable (ADR-040).
+
+What an earlier publish's outcome does to the fence follows the three outcomes an append has
+(`wake-signal.md`):
+
+| Earlier publish | The fence |
+|---|---|
+| Durable | Appended behind it |
+| Failed — no record, and none coming | Refused with `PrecedingWriteFailedError`, nothing appended |
+| Unknown — the acknowledgement window | Refused with **that** operation's `AppendNotAcknowledgedError` (ADR-038) |
+
+A fence appended over the second row's hole tells a consumer the batch is complete when it is short
+a record; the caller chooses between publishing the value again — which draws a new sequence number
+and lands ahead of a later fence — and accepting the batch without it, and either way the next
+`finish_writing()` appends a fence because the failed write is no longer outstanding.
+
+The third row is a refusal on the operation's own terms and not on the fence's, because the stream
+takes no further append at all until it is settled, and the record may well be durable and belong in
+front of the fence. **`resolve_append()` is therefore what decides which of the first two rows the
+fence lands in**, and a fence must read that decision rather than infer it: a durable resolution
+puts the record ahead of the fence, and an `AppendConflictError` proves it absent and makes the
+fence's answer the second row, chained from that conflict. The two are indistinguishable from
+whether the record is still outstanding, since resolving it either way stops it being outstanding.
+
+Where both an unresolved and a definitely-failed write precede one fence, the unresolved one is
+reported, because it is the one that blocks the other's recovery: republishing a failed value is
+itself refused while an append on that stream is unsettled.
+
 ## Retention
 
 Records and control metadata must remain available and immutable for as long as any retained Run
