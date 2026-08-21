@@ -47,6 +47,8 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [036](ADR-036-cancellation-after-a-durable-append-is-an-unacknowledged-wake.md) | Cancellation after a durable append is reported as an unacknowledged wake | `spec/wake-signal.md` |
 | [037](ADR-037-a-subscription-has-one-consumer.md) | A subscription has one consumer, and the refusal is on the waiter | `spec/python-runtime.md` |
 | [038](ADR-038-an-append-with-no-answer-is-an-unknown-outcome.md) | An append that reports no outcome is unknown, not failed | `spec/wake-signal.md` |
+| [039](ADR-039-the-continuation-carries-the-binding-and-it-is-must-understand.md) | The continuation carries the whole binding, and it is must-understand | `spec/annotation-format.md` |
+| [040](ADR-040-a-fence-is-ordered-behind-data-writes-only.md) | A fence is ordered behind data writes, and behind nothing else | `spec/backend-contract.md` |
 
 ## The decisions that constrain the most
 

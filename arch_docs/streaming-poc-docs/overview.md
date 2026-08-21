@@ -32,8 +32,9 @@ exist today.
   name)`. The first execution Run ID prevents collisions after Workflow ID reuse while remaining
   stable across a Continue-As-New chain.
 - The stream spans the full Continue-As-New chain. A new Run continues from the cursor committed
-  by the preceding Run, restored from a reserved internal header on the Continue-As-New command
-  rather than from mutable backend state (ADR-022).
+  by the preceding Run — together with the binding that cursor is a position in — restored from a
+  reserved internal header on the Continue-As-New command rather than from mutable backend state
+  (ADR-022, ADR-039).
 - A stream remains open across producer calls and producer failures. Independent stream
   identities and lifecycles are future work.
 
@@ -73,8 +74,9 @@ await tokens.finish_writing()
 ```
 
 `subscribe()` exists only on the consumer handle; `publish()` and `finish_writing()` exist only on
-the producer handle. `finish_writing()` appends an ordered write-fence control record; it does not
-close the stream.
+the producer handle. `finish_writing()` appends a write-fence control record behind every publish
+invoked before it on that stream, so its claim holds for concurrent callers too (ADR-040); it does
+not close the stream.
 
 Multiple streams use normal Workflow concurrency or merge/select APIs:
 

@@ -372,6 +372,92 @@ A cursor is never derived from mutable backend state, on any Run.
 Both paths populate the same binding field, so replay reads an explicit starting boundary in every
 case, including the case where the stream was empty for the subscription's entire life.
 
+### The continuation header carries the whole binding
+
+Keyed by `wait_id`, and carrying per wait what a binding above carries: the cursor, the stream name,
+the backend name, and the provider identity — `provider_id` and `provider_format_version`. The cursor
+alone cannot say *what it is a position in*, and an offset means nothing outside the store that
+produced it, so a successor that resumed on the wait number alone would hand a predecessor's offset
+to a store that never held those records — which the backend accepts, and which skips everything
+before that boundary silently.
+
+Marker replay makes the same comparison for every recorded range it reads. **A successor Run's first
+live read happens before it has written a marker that could make it**, which is the whole reason the
+continuation carries the binding rather than leaving it to replay (ADR-039).
+
+Which half disagrees decides how it is reported, and it is the same split the binding table uses:
+
+| Disagreement | Reported as |
+|---|---|
+| Stream name, or backend name | Row four of `failure-taxonomy.md` — Workflow code moved |
+| `provider_id`, or `provider_format_version` | Row one — a deployment mapped the name elsewhere |
+
+Both are raised where the subscription is registered, before the cursor reaches the manager, so no
+backend ever reads at a boundary that was not produced against it.
+
+**A recorded format version is compared by presence, not by truthiness.** Nothing in the provider
+contract reserves zero, so it is a version a provider may declare and the encoding represents it
+exactly; treating it as a "nothing was recorded" sentinel skipped the comparison for that one value
+and made Continue-As-New less safe than replay for the identical binding. A header that recorded no
+version has no entry at all, and that is what skips the check.
+
+### The continuation is snapshotted where no Workflow code can still run
+
+Creating the Continue-As-New command does not end the activation: the Workflow's event loop keeps
+draining ready tasks after a terminal command is added, so a stream consumer scheduled or unblocked
+after that point still advances the consumption cursor. Those consumptions do reach the
+predecessor's final marker, which is closed on the way out, so a header serialised at command
+creation names an earlier boundary than History does and the successor is handed a record a second
+time.
+
+Every Continue-As-New command on the completion is therefore re-serialised at the point the
+activation emits its stream commands — the same place the observation delta that commits this
+boundary is emitted, and the first point at which the boundary has stopped moving. Every command
+rather than the last, because two top-level coroutines can each raise one and only Core decides
+which terminal survives.
+
+Neither this nor anything about the header's content needs an SDK internal flag. Core matches a
+Continue-As-New command to its `WorkflowExecutionContinuedAsNew` event by command type alone and
+never compares the command's headers against the recorded ones, so a replay that regenerates the
+header at the later boundary cannot disagree with a History written at the earlier one. What the
+successor resumes from is the copy in its own `WorkflowExecutionStarted`, which is durable and which
+replaying the predecessor does not rewrite.
+
+### The binding is must-understand, and the schema version is what enforces it
+
+The header's reader is the **successor's** Worker, which is what makes its wire compatibility a
+different problem from the annotation's. An annotation is written and read by one deploy's Workers;
+this header is written by one Run and read by the next Run's Worker, and on an unversioned task queue
+that can be an *older* one. It is read while the successor's runtime is built, before any Workflow
+code runs.
+
+**A Worker that cannot validate the binding must not start the Run**, and a schema version it
+refuses is the only thing that makes it one. Nothing about the byte layout can help here: syntactic
+compatibility is not semantic compatibility, and an old Worker that *parses* the header does not
+thereby acquire the check — it runs the restoration it shipped with, compares the stream name, and
+accepts a cursor it cannot vouch for. If its registry resolves that backend name to another store,
+every record below the boundary is skipped in silence, which is the exact failure the binding exists
+to prevent. So the binding is encoded **inline in each entry** rather than appended after the entries
+an older reader consumes: a trailing block is what an unknowing reader steps over, and stepping over
+this is the one thing no reader may do (ADR-039).
+
+What that costs is stated rather than designed away. An old Worker fails the successor's first
+Workflow Task, and every identical retry, until a binding-aware Worker picks it up; a rollback to
+only old Workers blocks that Run until it is rolled forward. That is a blocked Run rather than a
+wrong one, which is the direction ADR-014 and `failure-taxonomy.md` take throughout — an explicit,
+retryable incompatibility in place of possible silent data loss.
+
+Two things follow for anyone changing this:
+
+- **Moving the emitted version is a staged deployment step.** Every Worker must *decode* the new
+  version before any Worker *writes* it, and the version carried on the value rather than fixed in
+  the encoder is what lets a writer be pinned behind its readers while that is arranged. A
+  deployment that cannot tolerate the stall at all needs Worker Versioning or build routing to keep
+  the successor on a binding-aware build — a deployment mechanism, not something the SDK provides.
+- **An older version stays decodable**, and accepting it restores a cursor with the binding checks
+  skipped. That is the same outcome an old Worker reaches and not the same fault: a check that was
+  never recorded cannot be made, while a check that *was* recorded must never be discarded.
+
 ## Subscription numbering is a nondeterminism hazard
 
 `wait_id` is allocated from a per-Run counter in `subscribe()` call order, which puts it in the same

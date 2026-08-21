@@ -12,20 +12,24 @@ branch `task/python-sdk-streaming`.
 
 | | Repository | Base | Head at writing |
 |---|---|---|---|
-| Python SDK | `temporalio/sdk-python` (fork `mfateev/sdk-python`) | `680a6b4f` | `62b3ff12` |
-| Core | `temporalio/sdk-rust` (fork `mfateev/sdk-core`) | `6e90e6d5` | `3abd2a46` |
+| Python SDK | `temporalio/sdk-python` (fork `mfateev/sdk-python`) | `680a6b4f` | `5ab10ac5` |
+| Core | `temporalio/sdk-rust` (fork `mfateev/sdk-core`) | `6e90e6d5` | `7e9d8ac8` |
 
 Core is vendored at `sdk-python/temporalio/bridge/sdk-core` and pinned to
-`3abd2a46`, so reviewing the Python repository at its head reviews both. These
+`7e9d8ac8`, so reviewing the Python repository at its head reviews both. These
 documents live in the Core repository, which is why the submodule carries them.
 
 **Change surface**, excluding the vendored copy from the Python totals:
 
 | | Commits | Files | Lines |
 |---|---|---|---|
-| Python | 34 | 75 | +21,918 / −146 |
-| Core | 18 | 62 | +12,224 / −119 |
+| Python | 61 | 76 | +34,489 / −169 |
+| Core | 30 | 79 | +16,061 / −119 |
 | Core, excluding these documents | | 23 | +9,110 / −119 |
+
+Every Core line since the stamp above is documentation: the implementation has
+not moved since `08a3c8bc`, and the "excluding these documents" row is unchanged
+because of it. Every defect the reviews found after that point was Python-side.
 
 ## Where everything is
 
@@ -49,7 +53,7 @@ these lists from.
 3. [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) and
    [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md) — the contract
    between Core and lang, which is where most of the difficulty lives.
-4. [`decisions/README.md`](decisions/README.md) — 30 records, one per decision,
+4. [`decisions/README.md`](decisions/README.md) — 40 records, one per decision,
    each with the alternatives that were rejected. Code comments say why the code
    is as it is; only these say why the other option was not taken.
 5. [`verification-hazards.md`](verification-hazards.md) — before running
@@ -83,6 +87,16 @@ more defects · `93f03068` the deadlock closed · `8d5ee1f1` the last case ·
 `62b3ff12` these documents' new home. Submodule bumps: `d6ed30ac`, `d191bbde`,
 `08f1206f`.
 
+**The review rounds, each closing the previous round's findings** — `a9c03eca`
+through `1e94c306` the first independent review's fourteen · `88c3578d`,
+`8c2ff85b`, `2763a25c` `close()` and the follow-up's seven · `8abb8eb8` the
+third's six and the seven its fixes introduced · `0836355d`, `bff3f449`,
+`e3c0571f` the fourth's five · `88e3af7b`, `48278359`, `065e7f5b` the
+append-recovery chain the fourth round's own fix opened · `5ab10ac5` the fifth
+round's first four findings, with the remaining five recorded in
+`fifth-review.md`.
+Submodule bumps: `cbb832a5`, `5a887335`, `bf33670b`, `6d7d193f`.
+
 ## Core commits
 
 **Design** — `67a15f15` introduced these documents.
@@ -99,7 +113,11 @@ Task's start · `a82ea4f0` queues the resolve job before the activation is built
 · `d4c59441` separates registering a wait set from retaining for it · `8d12894b`
 sender identity · `08a3c8bc` the delivery budget.
 
-**Documents** — `2631687a`, `e3044d7f`, `3abd2a46`.
+**Documents** — `2631687a`, `e3044d7f`, `3abd2a46`, and everything since, which
+is documentation only: `b4412c64`, `414c28a4` this guide · `9c8664f6`,
+`ea3b5271`, `2a05462a`, `48857bd3`, `49150bf6`, `620ef949`, `e71d591e` the
+review records and the specs each round rewrote · `0014f6c2`, `553dcc2e`,
+`7e9d8ac8` the append-recovery contract.
 
 ## Where to look hardest
 
@@ -127,12 +145,24 @@ the specification rather than reading for plausibility:
 
 ## Known state, including what is not finished
 
-- 463 Python tests pass with nothing skipped, marked, or expected to fail; 101
-  external-stream and 492 workspace tests in Core; clippy and `fmt` clean apart
-  from two warnings that predate this work in `crates/client/src/{dns,lib}.rs`.
-- Both required-test gates are met: Milestone 1 at 55/55, Milestone 2 at 12/12.
+- 625 external-stream Python tests pass with nothing skipped, marked, or expected
+  to fail; 101 external-stream and 492 workspace tests in Core; clippy and `fmt`
+  clean apart from two warnings that predate this work in
+  `crates/client/src/{dns,lib}.rs`.
+- Both required-test gates are met: Milestone 1 at 79/79, Milestone 2 at 12/12.
   **The gate checks that every case maps to a test that exists, not that it
   passes** — deliberately, since the suite already checks the latter.
+- **Not armed:** none of the fifth round's eight cases is in
+  `required-tests/tests-m1.md`, so the gate figure above does not cover them.
+  Arming one means editing that list, committing in Core, and moving the vendored
+  submodule pointer — hazard 3 of `verification-hazards.md`, which is exactly the
+  case where a green gate says nothing.
+- **One known flake**, documented in `empty-stream-replay-flake-handoff.md`:
+  `test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_cursor`. Its
+  rate rises with dev-server database size, which is worth knowing before reading
+  a long session's results. The diagnosis — Core answering `Accepted` on the
+  non-retaining path, where nothing then re-arms — is recorded and not acted on;
+  it is a Core change and needs its own required-test case.
 - **Not closed:** rollover bounds the Workflow Task, not an activation, so an
   activation that outlives the Workflow Task timeout still reaches a
   `dbg_panic` in Core. Making that non-fatal is a design decision, not a bug
