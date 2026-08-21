@@ -99,6 +99,21 @@ Worker(
 
 Backend instances live outside the Workflow sandbox. Workflow code may only name them.
 
+One further option exists, and it is a rollout control rather than a feature switch:
+
+```python
+Worker(
+    ...,
+    external_stream_continuation_schema_version=2,  # unset = the release's shipped stage
+)
+```
+
+It selects the schema version this Worker *writes* into a Continue-As-New cursor header, which is
+read by the successor Run's Worker and so must be a version that Worker can decode. Left unset it
+takes the stage the release ships in. Raising it is the writer half of the two-stage rollout ADR-039
+describes; it cannot be raised past what this Worker can itself read, and Worker construction fails
+rather than the first Continue-As-New if it is.
+
 ## Naming
 
 This feature coexists with the shipped `temporalio.contrib.workflow_streams` package rather than
