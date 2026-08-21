@@ -76,15 +76,38 @@ its first task up. Unless the capability also constrains or routes the successor
 and if it does constrain the successor it is B.
 
 What remains of D's goal — do not strand a chain gratuitously — is met by staging the reader: the
-decoder accepts the new version one release before any writer emits it, so the fleet can be upgraded
-and rolled back freely inside that window. That is a property of the release order, not of the bytes.
+decoder accepts the new version before any writer emits it, so the fleet can be upgraded and rolled
+back freely inside that window. That is a property of what a deployment writes, not of the bytes.
 
 ## Consequences
 
 - **Moving the emitted version is a staged deployment step**, not a code change that can ride any
-  release: every Worker must decode the new version before any Worker writes it.
-  `Continuation.schema_version` is what lets a writer be pinned behind its readers while that is
-  arranged, and is why the version lives on the value rather than in the encoder.
+  release: every Worker must decode the new version before any Worker writes it. Two separate
+  quantities therefore exist, and a release that conflates them cannot be the reader stage at all —
+  the SDK would be its own first v2 reader *and* an unconditional v2 writer, which is a rollout with
+  no safe first step:
+  - what the decoder accepts, which is every version the SDK knows; and
+  - what a live Worker writes, which is the deployment's choice among those.
+
+  The writer is selected per Worker, not per release, by the Worker setting
+  `external_stream_continuation_schema_version`; left unset it resolves to
+  `_DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION`, the stage the release ships in, which stays at
+  version 1 while version 1 is the newest thing a previously released Worker can read. Moving that
+  constant is the writer-stage release and is a decision of its own, so it is pinned by a test rather
+  than left to ride a refactor. `Continuation.schema_version` carries the choice on the value — which
+  is also why a decoded header re-encodes to the bytes it arrived as — but the field alone is not the
+  mechanism: unless a live runtime is given the deployment's selection, every live continuation takes
+  the field's default and the reader stage does not exist.
+- **A version-1 writer stage restores cursors with the binding checks skipped**, including between
+  Workers that could have validated one. That is the price of having a first step at all: the stage
+  exists precisely so a header written now is one the *previously* released Worker can read, and that
+  Worker has no binding to read. It is bounded by being the same exposure the feature had before the
+  binding existed, and it ends for a chain the moment a writer-stage Worker touches it.
+- **The two stages are ordered, and the second is not reversible per chain.** A Worker pinned to
+  version 1 that reads a version 2 header writes version 2 for its successor: rolling the fleet back
+  to the reader stage must not turn recorded binding proof into bytes an older Worker accepts without
+  it, which is the difference between a check that was never recorded and a check that was discarded
+  (below). Rollback past the reader stage entirely is the blocked-Run case A accepts.
 - The binding is encoded **inline in each entry**, not appended after them. A trailing block is
   precisely what an unknowing reader steps over, so the layout that makes D possible is the layout to
   avoid; interleaved, the bytes are unreadable to anything that has not been taught the version.
