@@ -281,6 +281,28 @@ budget, an early return once the budget is spent — would let a replayed segmen
 the live run never delivered — fairness bought with nondeterminism, which is the one currency it
 may not be paid for in.
 
+**A merged wait is one scoped operation, and the blocked set follows it in both directions.** Every
+member enters the blocked set when the group blocks, because the snapshot has to name the complete
+set; every member leaves it when the group's wait ends, whichever way it ended — a resolved future,
+the post-registration double-check finding a record, or cancellation. The asymmetry is the trap: a
+readiness activation resolves *every* pending future rather than only the waits it named, so the
+group always ends together, while at most one member comes out of it holding a record. Only that one
+is unblocked by taking it, so anything that unblocked members individually would leave the rest
+marked blocked with their futures already discarded — waits the snapshot still names, and Core
+retains and eventually parks a Workflow Task for. A caller that takes one value out of a merge and
+goes on to wait for an ordinary Signal or condition has that event delayed behind the phantom wait
+until the idle timeout, which is why this is not answerable by telling callers to keep consuming: a
+merge is closed by `aclose()` and that does not close the subscriptions passed to it, each of which
+may be consumed again sequentially.
+
+The next group wait re-enters the blocked state for every member and so advances every member's
+`wait_generation`, including members that were never handed a record. That is a real cost and it is
+paid for rather than avoided: a readiness report already in flight under the previous generation is
+answered `Stale`, and what covers it is `rearm_readiness()` running on **every** completion, which
+re-reports every non-empty buffer under the generation the runtime has by then already published to
+the manager. Suppressing the bump instead — leaving a member blocked so its generation stands — buys
+that coverage back by keeping the phantom wait.
+
 ## Which side answers which activation job
 
 Two of the four stream jobs are themselves backend operations, so the dispatch splits in
