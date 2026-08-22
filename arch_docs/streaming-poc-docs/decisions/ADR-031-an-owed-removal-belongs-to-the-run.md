@@ -23,8 +23,8 @@ disappearance is what made cleanup necessary.
 
 **A. Record the failure on the `Subscription`** and retry the next time that wait is registered.
 
-**B. A per-Run ledger of owed removals**, keyed `(stream key, wait_id)`, drained by that Run's next
-park, resolve, registration, or eviction.
+**B. A per-Run ledger of owed removals**, keyed `(stream key, wait_id)`, with lifecycle-triggered
+drains.
 
 **C. A background retry task** owned by the manager, retrying on its own schedule.
 
@@ -32,7 +32,7 @@ park, resolve, registration, or eviction.
 
 ## Decision
 
-**B.**
+**B and C, using provider-atomic compare-and-delete.**
 
 A is the shape that produced the defect. "The next registration" is a coincidence of eviction rather
 than a mechanism: registration happens once for the life of a cached Run, so a Run that stays cached
@@ -45,26 +45,23 @@ Continue-As-New successor while the stream key does not change, so an entry a pr
 behind can name the key of an intent a **successor** installed and is currently parked on. Deleting
 that unparks a Run whose park is real, whose producers therefore send nothing, and whose Workflow
 Task no wake will ever create. A leaked intent costs wakeups for one stream; this costs the Run. So
-a drain re-reads the intent and removes it only when the `park_generation` and Run ID it carries
-both still match what was recorded, and forgets the entry otherwise.
+the provider atomically removes an intent only when the `park_generation` and Run ID both still
+match what was recorded, and the manager forgets the entry on either a removal or a mismatch.
 
-C is deferred rather than rejected, and it is the honest completion of this decision: it is the only
-option that retries with no Workflow or Core event behind it, which is what a backend that is
-unavailable for the whole bounded retry window and recovers into an idle cached Run needs. It is not
-taken here for two reasons. It needs an owner that teardown awaits, or a Worker exits with a retry
-in flight and the "last chance on this Worker" property below stops being true. And an autonomous
-retry is the retry with the widest window between its read and its delete, which is the window the
-generation check narrows but does not close — so it wants a compare-and-delete in the provider
-contract first, not after.
+B alone was the original decision, with C deferred until cleanup had an owner that teardown awaits
+and the provider contract could close the read/delete race. Both prerequisites now exist. The
+manager strongly holds one retry task per Run, retries with bounded exponential backoff, and cancels
+and awaits those tasks during Worker shutdown. The conditional provider operation makes the
+autonomous retry safe across a Continue-As-New successor replacing the same key. Lifecycle drains
+remain eager fast paths, but another Workflow or Core event is no longer required: a backend that
+recovers while the Run stays cached and idle is enough to retire the stale intent.
 
 ## Consequences
 
 - **A ledger entry means "a removal was decided on and has not been confirmed", not "an intent
   exists".** That is what makes draining safe from any holder of the Run's park lock rather than
-  only from the path that recorded it, and it leans on removal being idempotent
-  (`spec/backend-contract.md`): a drain that repeats a removal that in fact succeeded costs a round
-  trip. The entry also retains nothing a teardown could invalidate — no watcher, no buffer, no
-  connection beyond the backend the removal must go through.
+  only from the path that recorded it. The entry also retains nothing a teardown could invalidate —
+  no watcher, no buffer, no connection beyond the backend the removal must go through.
 - **The entry is made before the backend call**, not when one fails. A call that never returns —
   the backend raised, the task was cancelled mid-await — owes the removal exactly as an error does,
   and the subscription it was reached through is frequently dropped in the same breath.
@@ -74,13 +71,12 @@ contract first, not after.
 - **A fresh install at the same key supersedes what is owed there**, or a removal recorded against a
   generation that has since been overwritten would be retried against the park now sitting behind
   it.
-- **Eviction is the last chance a Run gets on this Worker.** The ledger and the park lock both go
-  with the Run, so what is not retired then is left to the next Worker's registration-time
-  reconciliation — which is why that reconciliation must record what it reads.
-- **The read/delete window is narrowed, not closed, across Runs.** Two Runs of a chain hold
-  different park locks and may be held by different Workers, so nothing process-local orders a
-  predecessor's drain against a successor's install. Closing it requires a conditional delete —
-  remove only if the generation and Run ID still match — as a provider obligation.
-- A test must assert that a removal survives the close *and* the eviction of the subscription that
-  owed it, and separately that a drain meeting a replaced intent forgets the entry rather than
-  removing what it found.
+- **Eviction ends cache ownership, not cleanup ownership.** The manager retains the ledger, its
+  park lock and its retry task until the debt is retired. Shutdown cancels and awaits retry tasks
+  within its grace period.
+- **The provider closes the cross-Run race.** Two Runs of a chain hold different park locks and may
+  be held by different Workers, so nothing process-local orders a predecessor's drain against a
+  successor's install. `remove_park_intent_if_matches` compares and deletes atomically.
+- Tests assert autonomous recovery after both resolve-time and inherited-intent failures, cleanup
+  continuing after eviction, shutdown owning an in-flight retry, and a conditional removal leaving
+  a replacement intent intact.

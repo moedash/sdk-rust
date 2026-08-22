@@ -155,29 +155,30 @@ Three moments decide a removal:
   subscriptions the manager still holds, so neither of them ever reaches it (ADR-030).
 
 A removal that one of those decided on and the backend did not confirm is **owed**: recorded per
-Run against `(stream key, wait_id)`, and retried by the next park, resolve, registration or eviction
-of that Run, each of which drains what is owed under the Run's park lock before doing its own work. A
-ledger entry says *a removal was decided on and has not been confirmed*, not *an intent exists* —
-which is what makes draining it safe from any of those rather than only from the path that recorded
-it. Removal is idempotent (`backend-contract.md`), so a drain that duplicates a removal that
-succeeded costs a round trip, and the entry holds nothing that a teardown could invalidate: no
-watcher, no buffer, no connection beyond the backend the removal has to go through. The entry is
-made **before** the backend call, because a call that never comes back — the backend raised, the
-task was cancelled mid-await — owes the removal exactly as an error does, and the subscription it
-was reached through is usually dropped in the same breath. A fresh install at that key supersedes
-it, since retrying a removal recorded against a generation that has since been overwritten would
-take out the park now sitting behind it. Why the ledger is a Run's own state rather than a field on
-the subscription is ADR-031.
+Run against `(stream key, wait_id)` and retried autonomously with bounded exponential backoff.
+Parks, resolves, registrations and evictions still drain it eagerly under the Run's park lock, but
+backend recovery alone is sufficient for progress. A ledger entry says *a removal was decided on
+and has not been confirmed*, not *an intent exists* — which is what makes draining it safe from any
+of those paths rather than only from the one that recorded it. The entry holds nothing that a
+teardown could invalidate: no watcher, no buffer, no connection beyond the backend the removal has
+to go through. It is made **before** the backend call, because a call that never comes back — the
+backend raised, the task was cancelled mid-await — owes the removal exactly as an error does, and
+the subscription it was reached through is usually dropped in the same breath. A fresh install at
+that key supersedes it. Why the ledger is manager state rather than a field on the subscription is
+ADR-031.
 
-**A drain removes only the intent it recorded.** It re-reads the intent and removes it only if the
-`park_generation` and Run ID it carries both still match what was written down; anything else is
-forgotten rather than removed. The stream key is stable across a Continue-As-New chain while
-`wait_id` restarts at 1 in the successor, so an entry a predecessor Run left behind can name the key
-of a park a **successor** is sitting in, and taking that out is strictly worse than the leak the
-ledger exists to close: it unparks a Run whose park is real and whose producers have no reason to
-send anything. The read narrows the window to a single round trip, and the Run's park lock closes it
-for parks of that same Run; across Runs it is narrowed rather than closed, which would need a
-compare-and-delete the provider contract does not require.
+The retry task is strongly held per Run by the manager. Eviction drops the cached Run but not an
+owed-removal ledger or its task, so cleanup can finish while that Run remains absent. Worker
+shutdown cancels and awaits the manager-owned tasks within its shutdown grace period.
+
+**A drain removes only the intent it recorded.** The provider atomically compares the
+`park_generation` and Run ID and deletes only on a match; anything else is forgotten rather than
+removed. The stream key is stable across a Continue-As-New chain while `wait_id` restarts at 1 in
+the successor, so an entry a predecessor Run left behind can name the key of a park a **successor**
+is sitting in, and taking that out is strictly worse than the leak the ledger exists to close: it
+unparks a Run whose park is real and whose producers have no reason to send anything. A process-local
+park lock cannot close this cross-Run, cross-Worker race; the conditional backend operation does
+(`backend-contract.md`).
 
 What a left-behind intent costs is the invariant's whole point: `current_park_generation` keeps
 answering a generation Core has discarded, each producer wake names it and Core discards it as

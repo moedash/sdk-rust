@@ -111,13 +111,15 @@ The suite is the deliverable, not the interface. It must contain, at minimum:
 - a case that removes the same intent twice, and one that removes an intent that was never
   installed, both of which must succeed — a removal that failed is retried later against whatever
   the key holds by then, so a provider that raises on the second call turns a completed cleanup into
-  a permanent one; and
+  a permanent one;
+- a case that conditionally removes an intent by Run ID and park generation, refuses mismatches,
+  and leaves a replacement intent intact; and
 - a claim that never expires failing the leased-claim case.
 
 ## Parking operations
 
-`install_park_intent`, `remove_park_intent`, `park_intent`, `recheck`, `parked_wait_ids`,
-`claim_park_generation`, `current_park_generation`.
+`install_park_intent`, `remove_park_intent`, `remove_park_intent_if_matches`, `park_intent`,
+`recheck`, `parked_wait_ids`, `claim_park_generation`, `current_park_generation`.
 
 `parked_wait_ids` is enumeration rather than a new concept — the `wait_id` half of the intent key,
 for one stream — and it is what makes the other operations reachable from the producer side at all.
@@ -136,10 +138,11 @@ accumulating alongside it.
 The value must read back as it was written, because that is how a removal decided on earlier
 identifies what it is removing. `wait_id` restarts at 1 in a Continue-As-New successor while the
 stream key does not change, so a key alone does not distinguish a predecessor's abandoned intent
-from a successor's live one; the consumer compares the `park_generation` and Run ID it recorded
-before it deletes anything (`wft-lifecycle.md`). A provider that returned an intent with either
-field normalised, defaulted, or dropped would make every such comparison fail open or fail closed —
-a leaked intent in one direction, a legitimately parked Run unparked in the other.
+from a successor's live one. `remove_park_intent_if_matches` must compare the recorded
+`park_generation` and Run ID and remove the intent in one atomic backend operation
+(`wft-lifecycle.md`). It returns false, without changing either the intent or its claim, when the key
+is absent or either value differs. Splitting the comparison and removal across calls lets a
+successor replace the intent between them and lets the predecessor delete a live park.
 
 **An intent exists only while its park is outstanding.** The consumer holds up one half of that
 across three points — the resolve that ends a park the Run is sitting in, the reconciliation at

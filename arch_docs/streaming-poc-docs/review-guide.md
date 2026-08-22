@@ -631,12 +631,13 @@ each and verify isolated reads. The first assertion currently fails. Add a
 parameterized stream name containing each Redis glob metacharacter and assert
 `parked_wait_ids()` returns only intents for the exact logical stream.
 
-## Follow-up review — 2026-08-18, statuses as of 2026-08-19
+## Follow-up review — 2026-08-18, statuses as of 2026-08-22
 
 [`follow-up-review.md`](follow-up-review.md) re-read the fifteen fixes above and
 filed seven findings where the principal path was repaired and an adjacent
 failure mode still violated the same invariant. All seven were reproduced before
-anything was changed.
+anything was changed. A later re-audit added the two owed-removal findings in
+the table below.
 
 | Follow-up finding | Status | Where the design now is |
 |---|---|---|
@@ -645,6 +646,8 @@ anything was changed.
 | A failed live wake is not retried while the Worker remains running | Fixed | `spec/wft-lifecycle.md`, `spec/wake-signal.md` |
 | Cancellation bypasses park rollback | Fixed | ADR-032, `spec/wft-lifecycle.md` |
 | Closing a subscription can permanently abandon its park intent | Fixed | ADR-031, ADR-030 |
+| Owed-removal cleanup can delete a successor Run's live intent | Fixed | ADR-031, `spec/backend-contract.md` |
+| The owed-removal ledger has no autonomous retry | Fixed | ADR-031, `spec/wft-lifecycle.md` |
 | `merge()` starves waits beyond one activation's budget | Fixed | ADR-034, `spec/python-runtime.md` |
 | Off-thread decoding drops Workflow serialization context | Fixed | ADR-035, `spec/python-runtime.md` |
 
@@ -659,20 +662,8 @@ context-free together, which is self-consistent and works, so binding only the
 consumer would have broken every working deployment whose codec keys on the
 Workflow — encrypt with no context, decrypt with a Workflow-derived key.
 
-Three things are known and not closed, and are recorded where a reader will meet
-them rather than only here:
-
-- The ledger is drained by Workflow and Core events — a park, a resolve, a
-  registration, an eviction — and by nothing else. A backend unavailable across
-  the whole bounded retry window that recovers into an idle cached Run is not
-  retried until one of those happens. ADR-031 records why an autonomous retry
-  task was deferred rather than rejected.
-- A drain re-reads the intent and removes it only if the recorded park
-  generation and Run ID both still match, which narrows the window against a
-  Continue-As-New successor's live intent to a single round trip but does not
-  close it across Runs. Closing it needs a conditional delete in the provider
-  contract.
-- A producer's externally-stored payloads are stored with a store context naming
-  no target. Pre-existing, unrelated to the serialization context, and left
-  because choosing a target for an Activity-hosted producer would change where
-  blobs land (ADR-035).
+One thing is known and not closed, and is recorded where a reader will meet it
+rather than only here: a producer's externally-stored payloads are stored with
+a store context naming no target. It is pre-existing, unrelated to the
+serialization context, and left because choosing a target for an Activity-hosted
+producer would change where blobs land (ADR-035).
