@@ -271,7 +271,7 @@ described here are still uncommitted, so the next agent should preserve and
 review the existing working-tree changes rather than rebuilding them from
 scratch.
 
-Current status, updated 2026-08-19 once the owed-removal ledger landed:
+Current status, updated 2026-08-22 once autonomous conditional cleanup landed:
 
 | Follow-up finding | Status | Design record |
 |---|---|---|
@@ -281,6 +281,8 @@ Current status, updated 2026-08-19 once the owed-removal ledger landed:
 | Cancellation bypasses park rollback | Fixed | ADR-032, `spec/wft-lifecycle.md` |
 | Off-thread decoding drops Workflow serialization context | Fixed | ADR-035, `spec/python-runtime.md` |
 | Closing a subscription can permanently abandon its park intent | Fixed | ADR-031, ADR-030 |
+| Owed-removal cleanup can delete a successor Run's live intent | Fixed | ADR-031, `spec/backend-contract.md` |
+| The owed-removal ledger has no autonomous retry | Fixed | ADR-031, `spec/wft-lifecycle.md` |
 | `merge()` still starves waits beyond one activation's budget | Fixed | ADR-034, `spec/python-runtime.md` |
 
 The first, the sixth, and the second door under the sixth — a close after a
@@ -295,90 +297,29 @@ already installed. `merge()` retains a deterministic cursor and resumes after
 the last wait that took a record, bounding skew across activation-budget resets.
 Each of these four changes has focused regression coverage in the working tree.
 
-Three pieces of work remained when this was written. The third has since
-landed; the two owed-removal items below are open, with dated status lines.
+Three pieces of work remained when this was written. All three have since
+landed; the two owed-removal items have dated status lines below.
 
 ### P0 — Owed-removal cleanup can delete a successor Run's live intent
 
-**Status (2026-08-19):** Open, and narrowed. The drain reads the intent and
-removes it only when the recorded park generation *and* Run ID both still match,
-so a replacement that is already in place when the drain reads is forgotten
-rather than removed. A replacement installed between that read and the delete is
-still removed. The residual window and what closing it needs — a conditional
-delete as a provider obligation — are recorded in ADR-031 and in
-`spec/wft-lifecycle.md`.
-
-The new owed-removal ledger correctly preserves cleanup responsibility after a
-subscription is dropped. Its drain is not atomic, however:
-
-1. `_drain_owed_removals()` reads `park_intent(stream_key, wait_id)` and checks
-   the recorded park generation and Run ID.
-2. It later calls the unconditional
-   `remove_park_intent(stream_key, wait_id)`.
-
-A Continue-As-New successor reuses the same stream key and starts wait IDs at
-1. Between those two backend calls, the successor can overwrite the old intent
-with its own newly confirmed park. The predecessor's drain then removes the
-successor's intent. Per-Run `_park_lock` instances do not close this race: the
-two Runs have different locks, and they may be held by different Workers.
-
-The existing `test_a_drain_never_removes_the_intent_of_a_park_that_replaced_it`
-checks only replacement **before** the read. It does not exercise replacement
-between the read and delete.
-
-**Code:**
-`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
-`StreamSubscriptionManager._drain_owed_removals`.
-
-**Required design change:** Make removal conditional on the intent still
-matching the recorded generation and Run ID at deletion time. This likely
-requires an atomic compare-and-delete backend operation and a corresponding
-backend-contract/conformance obligation. A process-local or per-Run lock cannot
-provide the required cross-Worker exclusion.
-
-**Proposed unit test:** Use a backend that lets `park_intent()` return Run A's
-intent and then pauses the drain before deletion. While paused, install Run B's
-intent at the same `(stream key, wait_id)`, then resume Run A's cleanup. Assert
-that Run B's intent remains installed. The current read-then-unconditional-delete
-implementation removes it.
+**Status (2026-08-22):** Fixed. The backend contract now requires
+`remove_park_intent_if_matches`, which compares the recorded Run ID and park
+generation and deletes the intent and its claim atomically. Redis implements it
+as one Lua script. A missing or replaced intent retires the ledger entry without
+changing the replacement, so no process-local lock is asked to provide
+cross-Worker exclusion. The parking conformance suite exercises both mismatch
+dimensions, successful removal and the already-absent case.
 
 ### P1 — The owed-removal ledger has no autonomous retry
 
-**Status (2026-08-19):** Open, and deliberate for now. ADR-031 records the
-background retry task as deferred rather than rejected, with the two things it
-needs first: an owner that teardown awaits, and the conditional delete above —
-an autonomous retry has the widest read-to-delete window of any drain.
-
-Inherited reconciliation and `cancel()` now retry removal three times and keep
-a per-Run ledger when all attempts fail. That fixes a one-blip reproducer and
-prevents cleanup responsibility from dying with the `Subscription` object.
-The ledger is drained only by another park, resolve, registration, or eviction.
-
-If the backend remains unavailable for the bounded retry window and recovers
-afterwards while the Run stays cached and idle, none of those events is
-guaranteed to occur. The stale intent therefore still can remain indefinitely.
-This affects both the inherited-intent and close findings. A stale intent keeps
-`parked_wait_ids()` non-empty; producers omit the unparked fallback, send only a
-wake naming the dead generation, and Core discards it as stale.
-
-**Code:**
-`sdk-python/temporalio/contrib/external_workflow_streams/_manager.py`,
-`StreamSubscriptionManager._reconcile_inherited_park`, `cancel`, and
-`_drain_owed_removals`.
-
-**Required design change:** Give ledger entries an eventual retry mechanism
-that does not depend on another Workflow/Core lifecycle event. A bounded
-background retry task may be appropriate, provided teardown owns and awaits it
-and retries remain generation-safe through the atomic operation described
-above. Another possible trigger is the live readiness/wake path, but that alone
-does not clean an idle stream on which no record arrives.
-
-**Proposed unit test:** Make every immediate removal attempt fail, wait until the
-retry budget is exhausted, then recover the backend without invoking park,
-resolve, registration, eviction, or shutdown. Assert that the intent is
-eventually removed. For the inherited case, append after recovery and assert
-the resulting wake is unparked rather than naming the old generation. The
-current passive ledger makes no further removal attempt.
+**Status (2026-08-22):** Fixed. Each Run with owed removals has a strongly held,
+manager-owned retry task. It retries indefinitely with capped exponential
+backoff while lifecycle drains remain eager fast paths. Eviction drops cached
+subscriptions but retains the ledger, lock and task; Worker shutdown cancels and
+awaits the cleanup tasks within its grace period. Tests recover the backend
+after both an exhausted inherited-intent reconciliation and a failed resolve
+without invoking another park, resolve, registration or eviction, verify retry
+continues after eviction, and verify shutdown owns an in-flight retry.
 
 ### P1 — External-stream decoding still ignores serialization context
 
