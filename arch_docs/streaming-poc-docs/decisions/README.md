@@ -49,6 +49,7 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [038](ADR-038-an-append-with-no-answer-is-an-unknown-outcome.md) | An append that reports no outcome is unknown, not failed | `spec/wake-signal.md` |
 | [039](ADR-039-the-continuation-carries-the-binding-and-it-is-must-understand.md) | The continuation carries the whole binding, and it is must-understand | `spec/annotation-format.md` |
 | [040](ADR-040-a-fence-is-ordered-behind-data-writes-only.md) | A fence is ordered behind data writes, and behind nothing else | `spec/backend-contract.md` |
+| [041](ADR-041-a-reported-task-keeps-the-readiness-promise.md) | A task on its way to the server keeps the readiness promise it made | `spec/core-lang-protocol.md` |
 
 ## The decisions that constrain the most
 

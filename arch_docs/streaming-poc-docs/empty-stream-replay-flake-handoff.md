@@ -1,15 +1,75 @@
 # Empty-stream replay flake: root-cause handoff
 
-**Purpose:** focused handoff for the intermittent failure of
-`test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_cursor`.
+**Purpose:** the record of the intermittent failure of
+`test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_cursor`, from the two rounds that
+fixed real defects without fixing it to the one that found what it was.
 
-**Analysis date:** 2026-08-19  
-**Code analyzed:** `sdk-python` revision `5a887335`, `sdk-rust` revision `49150bf6`  
-**Verification status:** static analysis only; the failing test was not executed as part of this
-investigation. The workspace may contain uncommitted fixes for these findings, so compare against
-`5a887335` when reproducing the original behavior.
+**Root cause found:** 2026-08-22, against `sdk-python` `8a4680dc` with Core at `70df5472`, by
+reproducing the failure and measuring the fix. See the next section.
 
-## Resolution
+**Earlier analysis:** 2026-08-19, against `sdk-python` `5a887335` and `sdk-rust` `49150bf6`, by
+static reading with the failing test never executed. It found two real defects, fixed both, and did
+not fix this flake -- the shape of the interleaving it maps is still the best guide to the area, and
+"The earlier round" below is kept unchanged for it.
+
+## Root cause, and the fix
+
+**Found and fixed on 2026-08-22**, by running the failure rather than reading it. Everything below
+the next section is the earlier round of work: two real defects, both fixed, neither of them this
+flake -- which is why that round ends by recording that the test still failed at its own baseline.
+
+The stall is [ADR-041](decisions/ADR-041-a-reported-task-keeps-the-readiness-promise.md): Core
+answered a watcher `Accepted` -- the one result meaning "do nothing, Core will activate" -- for a
+readiness that arrived against a Workflow Task it was about to report. The completion that
+registered the wait set refused retention because the Run was still replaying, so it reported the
+task; nothing on that path turns pending readiness into a resolve job; and the watcher, told to do
+nothing, owed no wake Signal. The record stayed buffered behind a Run that Core believed it had
+already told.
+
+The resumed Run in this test walks straight into it. The records are published while it is evicted,
+so the watcher its replayed `subscribe()` starts finds them already in the stream and reports
+readiness during the very activation whose completion registers the wait set.
+
+The fix is in `prepare_complete_resp`, the single funnel every reported completion passes through:
+local delivery ends when the completion is prepared rather than when the server answers it, and a
+completion reported with readiness still pending asks for the replacement Workflow Task the resolve
+job is issued on.
+
+A second defect surfaced behind it, and both were needed. The unparked wake counter was held on the
+`Subscription`, so a rebuilt Run restarted it at 1 and re-derived the request ID its previous
+incarnation had used; the server deduplicated the wake and the Run stalled again. The counter is now
+drawn from the manager, which is what `spec/wake-signal.md` always said it was -- "a per-sender
+monotonic wake counter" -- and the sender is the Worker's manager, not the Run's subscription.
+
+### What the evidence was
+
+The failure is a stall with a fully diagnostic signature, which the test prints itself:
+`readiness calls: [(run, 1, 1, 'Accepted')]`, two Workflow Tasks, no task failures, the observation
+list empty, and the subscription holding `buffered=2 delivery=BEGINNING wakes_owed=0`. Readiness was
+accepted, so a Workflow Task was open; no third task exists, so no activation was ever produced for
+it; and `wakes_owed=0` says the watcher was told it need not signal. Tracing the activations from
+Python confirmed the Run received `[initialize_workflow, replay_external_streams]` and nothing
+afterwards, ever.
+
+Rates, all on `test_replay_end_to_end.py` run whole, which is what makes it fail -- the case passes
+8/8 on its own and 6/6 under CPU load:
+
+| Build | Runs | Failures |
+|---|---|---|
+| Neither fix | 3 + 3 | 2, then 1 |
+| Wake counter only | 8 | 3 |
+| Core fix only | 10 | 1, and a *different* one -- the wake-counter collision above |
+| Both | 12 | 0 |
+
+Core DEBUG logging suppresses it entirely (10 runs, 0 failures), which is worth knowing before
+reaching for logs: the window is small enough that the logger's own writes close it.
+
+Both fixes carry a regression test that fails without them:
+`readiness_accepted_against_a_reported_task_is_not_stranded` in Core, and
+`test_a_run_that_comes_back_does_not_reuse_its_last_wake_counter` in `test_manager.py`. Each was
+mutation-checked -- the fix removed, the test observed failing, the fix restored.
+
+## The earlier round
 
 **Addressed** in Python `8abb8eb8`. Findings 1 and 2 are fixed, all six required fix properties hold,
 and the secondary test-harness race is fixed too. What follows is what was done and what the analysis got right and

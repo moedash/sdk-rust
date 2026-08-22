@@ -243,6 +243,15 @@ completion or a rollover, and is not an error. The three signal-sending results 
 what the watcher does *afterwards* and by what an operator should conclude, not by whether a Signal
 is sent.
 
+`Accepted` is a promise, and it is the only result that leaves nobody but Core holding the record:
+the watcher does nothing further, and it will not report that record again. Core therefore stops
+answering `Accepted` the moment a completion is prepared for the server rather than retained --
+readiness from that instant is `NoOpenWorkflowTask` and the watcher signals for itself -- and a
+completion reported while readiness is still pending requests a replacement Workflow Task, which is
+where the resolve job for it is issued. Both halves are ADR-041. Without them a readiness accepted
+against a task that is about to be reported is stranded: no activation is issued for it, no Signal
+is owed for it, and the buffered record waits behind a Run that Core believes it has already told.
+
 The public entry point goes on `Worker`, following the shape of `record_activity_heartbeat`. Routing
 into the workflow stream follows `notify_local_result` → `notify_of_local_result`. Unlike
 `notify_local_result`, the stream call must return an acknowledgement rather than being
