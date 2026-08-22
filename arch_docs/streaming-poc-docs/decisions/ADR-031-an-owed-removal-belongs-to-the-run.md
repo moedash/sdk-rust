@@ -73,10 +73,37 @@ recovers while the Run stays cached and idle is enough to retire the stale inten
   it.
 - **Eviction ends cache ownership, not cleanup ownership.** The manager retains the ledger, its
   park lock and its retry task until the debt is retired. Shutdown cancels and awaits retry tasks
-  within its grace period.
+  within its grace period, and then makes one last bounded pass at what is still owed — a loop
+  cancelled during its backoff has an attempt left in it, and eviction stands aside while shutting
+  down rather than waiting on a lock a stuck loop may hold.
+- **An autonomous retry has to be bounded per call, not per attempt.** It is the only thing left
+  holding a removal once the inline attempts are spent, so a backend call that hangs rather than
+  raises does not cost one attempt — it ends the mechanism, silently, and holds the Run's park lock
+  while it does. Every park-lock hold outside an activation is therefore time-bounded, and a hold
+  that runs out of time is a failed attempt. Holds an activation takes are not, because that wait is
+  the backend exposure the park handshake already owns.
+- **Cleanup announces what the stale intent silenced.** Wakes sent while the intent was installed
+  named a generation Core discards, so removing it stops the suppression without delivering the
+  record it suppressed — which is buffered on this Worker, with its wake counted as sent. Every path
+  that retires an intent announces a wait that still holds records, the reconciliation's
+  first-time-success included: that is the *ordinary* path for an inherited intent, and the one that
+  never touches the ledger.
+- **The provider reports three outcomes, and two of them mean "gone".** A delete that commits and
+  loses its reply leaves a retry meeting a key it cleared itself, so *absent* and *mismatch* cannot
+  be one answer: the first ends the suppression and may owe an announcement, the second is a park to
+  leave alone. Collapsing them costs a record, not an intent.
+- **Discovery is retried like the removal, and bounded by the subscription.** The ledger holds an
+  identity, so a read that never succeeds records nothing at all — no entry, no task, no owner. The
+  reconciliation therefore keeps retrying its read with backoff while this Worker holds the
+  subscription, and hands over to the ledger as soon as one succeeds. It stops at cancellation
+  because the justification for removing what is at that key is holding the Run; without it, the
+  intent found there could be a park another Worker is in.
 - **The provider closes the cross-Run race.** Two Runs of a chain hold different park locks and may
   be held by different Workers, so nothing process-local orders a predecessor's drain against a
   successor's install. `remove_park_intent_if_matches` compares and deletes atomically.
 - Tests assert autonomous recovery after both resolve-time and inherited-intent failures, cleanup
   continuing after eviction, shutdown owning an in-flight retry, and a conditional removal leaving
-  a replacement intent intact.
+  a replacement intent intact. Three more cover the mechanism itself: a removal call that hangs
+  rather than raises does not end the retry loop or keep the park lock, shutdown makes an attempt a
+  cancelled backoff would have skipped, and a confirmed removal re-announces the record its intent
+  had silenced.
