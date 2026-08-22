@@ -71,6 +71,13 @@ there the sender is making a claim that turned out to be wrong.
   down at different times would derive the same request ID and the server would deduplicate the
   second wake away — turning a correct retry mechanism into silent loss.
 
+  The counter is the **sender's** sequence and not the subscription's, which matters because a
+  subscription does not outlive its Run: an evicted Run that comes back is rebuilt with a fresh one,
+  and a counter held there restarts at 1 and re-derives the request ID that Run's previous
+  incarnation already used. The server deduplicates it, no Workflow Task is created, and a Run
+  holding buffered records waits for a wake that was discarded as a duplicate. Drawn from the
+  manager, the value is never reused for as long as the sender identity it is paired with lasts.
+
   That sender identity is unique per sender **instance**, drawn once when the sender is constructed
   and held for its lifetime. The client identity is not enough: two Workers in one process share a
   `Client` and each one's counter restarts at 1, so their first unparked wakes would derive
