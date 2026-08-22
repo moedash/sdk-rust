@@ -169,7 +169,46 @@ ADR-031.
 
 The retry task is strongly held per Run by the manager. Eviction drops the cached Run but not an
 owed-removal ledger or its task, so cleanup can finish while that Run remains absent. Worker
-shutdown cancels and awaits the manager-owned tasks within its shutdown grace period.
+shutdown cancels and awaits the manager-owned tasks within its shutdown grace period, and then makes
+one last bounded pass over whatever is still owed: cancelling a loop that is sleeping out a backoff
+throws away an attempt the recovered backend would have answered, and eviction cannot make that
+attempt while shutting down without waiting on the very lock a stuck loop is holding. What survives
+that pass is logged, because an intent still installed as the process exits suppresses the unparked
+wake for whoever picks the Run up next.
+
+**Every hold of the park lock that is not inside an activation is time-bounded.** The lock serializes
+one Run's park work, and the paths that take it off the activation path -- the retry loop, the
+registration-time reconciliation, the close, the last pass at shutdown -- all reach a backend that
+can hang rather than raise. Counting attempts does not bound an attempt that never returns: the task
+stops retrying, and the lock the next park, resolve or eviction needs stops being available. A hold
+that runs out of time is released and treated as a failed attempt, which leaves the entry owed
+exactly as an error does. Holds taken *by* an activation are not bounded, because the wait they own
+is the backend exposure the park handshake already has.
+
+**Retiring an intent is not the same as delivering what it silenced.** Every wake sent while a stale
+intent was installed named the generation behind it, and Core discards a non-zero generation that is
+not the park it holds -- so a record that arrived in that window is buffered on the Worker with its
+wake already counted as sent, and the watcher will not report it again without a new append. Every
+path that retires an intent therefore re-announces a wait still holding records: the drain, and the
+registration-time reconciliation whose removal succeeds first time, which is the ordinary case and the
+one that never goes near the ledger. The reconciliation runs concurrently with the watcher it races,
+which is how the record gets silenced in the first place.
+
+Both provider outcomes that clear the key announce -- *removed* and *absent*. An absent key is
+cleanup that happened, including a delete this Worker committed and never got the reply to
+(`backend-contract.md`), and reading it as a mismatch would strand the record for good. A *mismatch*
+announces nothing: an intent is still installed, so the suppression has not ended, and it belongs to
+a park the entry knows nothing about. Narrow otherwise: only a non-empty buffer, and never during the
+sweep, which owns every wake from that point.
+
+**Discovery gets the same autonomous retry the removal does.** An owed removal is recorded from an
+intent's identity, so a read that never succeeds records nothing -- no ledger entry, no retry task, no
+owner. A reconciliation whose reads all fail therefore keeps retrying, with capped backoff, for as
+long as this Worker holds the subscription; once a read succeeds and only the removal fails, it hands
+the entry to the ledger rather than draining it twice. The subscription is what bounds it, and not
+only for tidiness: removing whatever is installed at that key is justified by this Worker holding the
+Run with this wait registered on it, and once the subscription is gone the intent found there could
+be a park another Worker is sitting in.
 
 **A drain removes only the intent it recorded.** The provider atomically compares the
 `park_generation` and Run ID and deletes only on a match; anything else is forgotten rather than

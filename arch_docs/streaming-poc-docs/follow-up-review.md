@@ -316,7 +316,11 @@ dimensions, successful removal and the already-absent case.
 manager-owned retry task. It retries indefinitely with capped exponential
 backoff while lifecycle drains remain eager fast paths. Eviction drops cached
 subscriptions but retains the ledger, lock and task; Worker shutdown cancels and
-awaits the cleanup tasks within its grace period. Tests recover the backend
+awaits the cleanup tasks within its grace period and then makes one last bounded
+pass at what is still owed. Every park-lock hold outside an activation is bounded
+in time, so a backend call that hangs rather than raises costs one attempt rather
+than the mechanism, and a confirmed removal re-announces the record the stale
+intent silenced. Tests recover the backend
 after both an exhausted inherited-intent reconciliation and a failed resolve
 without invoking another park, resolve, registration or eviction, verify retry
 continues after eviction, and verify shutdown owns an in-flight retry.

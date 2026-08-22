@@ -113,7 +113,8 @@ The suite is the deliverable, not the interface. It must contain, at minimum:
   the key holds by then, so a provider that raises on the second call turns a completed cleanup into
   a permanent one;
 - a case that conditionally removes an intent by Run ID and park generation, refuses mismatches,
-  and leaves a replacement intent intact; and
+  leaves a replacement intent intact, and reports an absent key as absent rather than as a
+  mismatch; and
 - a claim that never expires failing the leased-claim case.
 
 ## Parking operations
@@ -140,9 +141,16 @@ identifies what it is removing. `wait_id` restarts at 1 in a Continue-As-New suc
 stream key does not change, so a key alone does not distinguish a predecessor's abandoned intent
 from a successor's live one. `remove_park_intent_if_matches` must compare the recorded
 `park_generation` and Run ID and remove the intent in one atomic backend operation
-(`wft-lifecycle.md`). It returns false, without changing either the intent or its claim, when the key
-is absent or either value differs. Splitting the comparison and removal across calls lets a
-successor replace the intent between them and lets the predecessor delete a live park.
+(`wft-lifecycle.md`). Splitting the comparison and removal across calls lets a successor replace the
+intent between them and lets the predecessor delete a live park.
+
+**It answers with three outcomes, not two.** *Removed*, *absent*, and *mismatch* — and the last two
+may not be collapsed, even though neither changes anything. A provider can commit the delete and lose
+the connection before its reply arrives; the retry that follows meets a key it cleared itself. Told
+"absent", the consumer knows the intent it named is gone and that a record the intent silenced may
+need announcing again. Told "mismatch", it knows an intent it must leave alone is in the way and that
+the suppression has not ended. One answer for both makes the first case look like the second, which
+is a record left undelivered rather than an intent left installed.
 
 **An intent exists only while its park is outstanding.** The consumer holds up one half of that
 across three points — the resolve that ends a park the Run is sitting in, the reconciliation at
