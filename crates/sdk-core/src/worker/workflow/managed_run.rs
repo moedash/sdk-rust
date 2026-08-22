@@ -2253,6 +2253,28 @@ impl ManagedRun {
             force_new_wft = true;
         }
 
+        // Reporting the task ends local delivery, and it ends it *here* rather than at
+        // `mark_wft_complete`, which runs only once the server has answered. `Accepted` promises
+        // the watcher that Core will activate, and a task on its way to the server can no longer
+        // carry that activation: from this instant readiness is answered `NoOpenWorkflowTask`
+        // instead, which is the one answer that tells the watcher to send the wake Signal itself.
+        //
+        // Readiness already accepted against this task has no such fallback -- its watcher was
+        // told to do nothing and will not report again -- and the completion paths that reach
+        // here never turn it into a job: a snapshot that registers without retaining (a replaying
+        // completion, one carrying server-bound commands, or one answering a query) records the
+        // wait set and reports the task, and `_check_more_activations` is not on that path. So the
+        // replacement task is asked for explicitly, and `apply_new_wft` re-opens the wait set on
+        // it and issues the resolve job the pending readiness was promised. Without it the record
+        // stays buffered behind a Run that Core believes it has already told.
+        if should_respond || has_query_responses {
+            let waits = &mut self.waiting_on_local_work.external_wait_set;
+            waits.set_wft_open(false);
+            if waits.has_pending_readiness() {
+                force_new_wft = true;
+            }
+        }
+
         let outcome = if should_respond || has_query_responses {
             // If we broke there could be commands or messages in the pipe that we didn't
             // get a chance to handle properly during replay. Don't send them.

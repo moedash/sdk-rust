@@ -763,6 +763,69 @@ async fn a_server_bound_command_suppresses_retention_without_dropping_the_regist
     worker.drain_pollers_and_shutdown().await;
 }
 
+#[tokio::test]
+async fn readiness_accepted_against_a_reported_task_is_not_stranded() {
+    // `Accepted` is a promise that Core will activate, and a task on its way to the server cannot
+    // keep it. A completion that refuses retention -- one carrying a server-bound command, or a
+    // replaying one that registers its wait set without holding the task open -- reports the task
+    // and leaves the accepted readiness with nowhere to ride: the resolve job is never issued, and
+    // the watcher, told to do nothing, sends no wake Signal either. The record then waits for a
+    // Workflow Task that never comes, which is the deadlock this asks about.
+    //
+    // Requesting the replacement task is what keeps the promise for readiness already accepted.
+    // The other half of the fix -- ending local delivery with the report, so that readiness
+    // arriving after it is told `NoOpenWorkflowTask` and signals for itself rather than being
+    // accepted into the same dead end -- cannot be probed here, because completing the only task
+    // this mock has budget for evicts the Run; the Python end-to-end replay case covers it.
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    let saw_force_new_wft = Arc::new(AtomicBool::new(false));
+    let recorder = saw_force_new_wft.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            recorder.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+        });
+    });
+
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+
+    // A registered wait set with a record buffered against it while lang is still working: the
+    // shape a resumed Run has when the watcher its replayed `subscribe()` started finds records
+    // already in the stream.
+    worker
+        .seed_external_stream_waits(&run_id, vec![1], None, true)
+        .await;
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted,
+        "the seeded set holds an open task, so this readiness is Core's to deliver"
+    );
+
+    // The timer is server-bound, so this completion is reported rather than retained.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        saw_force_new_wft.load(Ordering::Relaxed),
+        "the accepted readiness was reported away with the task and nothing asked for the \
+         replacement task its resolve job could be issued on"
+    );
+    worker.drain_pollers_and_shutdown().await;
+}
+
 // --- readiness resolves the wait set (C7) ------------------------------------
 
 #[tokio::test]
