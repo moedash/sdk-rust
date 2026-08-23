@@ -189,17 +189,43 @@ is the backend exposure the park handshake already has.
 intent was installed named the generation behind it, and Core discards a non-zero generation that is
 not the park it holds -- so a record that arrived in that window is buffered on the Worker with its
 wake already counted as sent, and the watcher will not report it again without a new append. Every
-path that retires an intent therefore re-announces a wait still holding records: the drain, and the
-registration-time reconciliation whose removal succeeds first time, which is the ordinary case and the
-one that never goes near the ledger. The reconciliation runs concurrently with the watcher it races,
-which is how the record gets silenced in the first place.
+path that retires an intent therefore hands that record off, one of two ways.
 
-Both provider outcomes that clear the key announce -- *removed* and *absent*. An absent key is
+**With the wait still registered here, through local readiness.** That is the drain of a cached Run,
+and the registration-time reconciliation whose removal succeeds first time -- the ordinary case for an
+inherited intent, and the one that never goes near the ledger. The reconciliation runs concurrently
+with the watcher it races, which is how the record gets silenced in the first place. Narrow, because
+the subscription is there to be read: only a wait still holding records, so a healthy park costs no
+Workflow Task, and never during the sweep, which owns every wake from that point and accounts for
+each one.
+
+**With the wait gone, through one unparked wake.** A close drops the subscription and an eviction
+drops the Run's map, both deliberately leaving the ledger and its retry alive -- so the removal that a
+recovered backend finally lets through is frequently the one with no buffer left to consult and no
+readiness channel to use. Conditioning the announcement on a subscription being there is what keeps
+the leak fixed while putting the record loss straight back. The wake is unconditional: whether a
+remote producer appended during the suppression window was never visible from this Worker, so "a
+record arrived" and "none did" are the same observation from here, and only one of them is silent if
+the guess goes wrong. It costs one empty Workflow Task, which this design permits. Sent as work of
+its own rather than under the park lock, whose budget bounds a single-key backend call and not a
+Signal with retries behind it, and awaited by shutdown -- the last of these handoffs is created by the
+final owed-removal pass, and a wake merely scheduled as the process exits was never sent.
+
+Both provider outcomes that clear the key hand off -- *removed* and *absent*. An absent key is
 cleanup that happened, including a delete this Worker committed and never got the reply to
 (`backend-contract.md`), and reading it as a mismatch would strand the record for good. A *mismatch*
-announces nothing: an intent is still installed, so the suppression has not ended, and it belongs to
-a park the entry knows nothing about. Narrow otherwise: only a non-empty buffer, and never during the
-sweep, which owns every wake from that point.
+hands off nothing: an intent is still installed, so the suppression has not ended, and it belongs to
+a park the entry knows nothing about.
+
+**No wake this Worker sends names an intent it has already decided to remove.** An owed removal says
+the generation installed at that key is one Core has discarded, so composing a wake from it produces
+a Signal the service accepts and Core ignores -- which is worse than a failure, because the send
+reports success. The manager holds the ledger, so the manager decides what a wake names rather than
+the sender reading `current_park_generation` for itself: an entry in the ledger, or a handoff for an
+intent just retired, both compose the unparked wake. That is what makes the shutdown sweep's
+accounting true, since the sweep wakes the subscriptions of a Run whose stale intents the final
+removal pass has not reached yet. Its wake and that removal's handoff are then one obligation, and it
+is recorded as discharged on the entry so the pass does not send it twice.
 
 **Discovery gets the same autonomous retry the removal does.** An owed removal is recorded from an
 intent's identity, so a read that never succeeds records nothing -- no ledger entry, no retry task, no
@@ -382,6 +408,11 @@ are silent otherwise:
 Accounting only where the sweep reached reported `shutdown_wake_failures == 0` for a Worker that had
 just abandoned every one of its handoffs, which is exactly the silence the metric exists to break: a
 dropped wake looks identical to a producer with nothing to say.
+
+The same metric counts a **cleanup handoff** the exit could not wait out. A stale intent retired by
+the final owed-removal pass owes an unparked wake for the record it silenced, and that pass runs after
+the sweep, so its handoff is as much a part of this shutdown as a wake the sweep sent itself — and as
+silent if abandoned. What the grace period cuts off there is counted, not dropped.
 
 Three cases are deliberately *not* counted, because a metric that fires on a clean shutdown is not
 alertable. A Run reported `Parked` or `WftOpen` owes nothing — the first is woken by a producer's
