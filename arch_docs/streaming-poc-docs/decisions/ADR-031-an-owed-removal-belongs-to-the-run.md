@@ -82,12 +82,37 @@ recovers while the Run stays cached and idle is enough to retire the stale inten
   while it does. Every park-lock hold outside an activation is therefore time-bounded, and a hold
   that runs out of time is a failed attempt. Holds an activation takes are not, because that wait is
   the backend exposure the park handshake already owns.
-- **Cleanup announces what the stale intent silenced.** Wakes sent while the intent was installed
-  named a generation Core discards, so removing it stops the suppression without delivering the
-  record it suppressed — which is buffered on this Worker, with its wake counted as sent. Every path
-  that retires an intent announces a wait that still holds records, the reconciliation's
-  first-time-success included: that is the *ordinary* path for an inherited intent, and the one that
-  never touches the ledger.
+- **Cleanup announces what the stale intent silenced, and that obligation is not the
+  subscription's either.** Wakes sent while the intent was installed named a generation Core
+  discards, so removing it stops the suppression without delivering the record it suppressed. With
+  the wait still registered, local readiness announces it — the reconciliation's first-time success
+  included, which is the *ordinary* path for an inherited intent and the one that never touches the
+  ledger. With the wait gone, nothing about the record is knowable from here: the buffer went with
+  the subscription that the close or the eviction dropped, and a remote producer's append into the
+  suppression window was never visible from this Worker at all. So a confirmed removal with no
+  subscription behind it sends one *unconditional* unparked wake. Conditioning it on a registered
+  subscription is the same mistake this ADR is about, one level up: it keeps the leak fixed and puts
+  the record loss straight back, for exactly the intents whose owner is gone. The cost is an empty
+  Workflow Task when nothing had arrived; the alternative is silence when something had.
+- **No wake this Worker sends names an intent it has already decided to remove.** A ledger entry
+  says that generation is one Core has discarded, so a wake composed from it is a Signal the service
+  accepts and Core ignores — a success the sender reports and the Workflow never sees. The manager
+  therefore decides what a wake names, rather than the sender reading `current_park_generation`
+  itself, and answers "unparked" both for an entry in the ledger and for a handoff whose intent was
+  just retired. That is what makes the shutdown sweep's accounting true: the sweep wakes the
+  subscriptions of a Run whose stale intents the final removal pass has not reached, and a counter
+  that reported a clean shutdown on the strength of an obsolete-generation Signal was reporting a
+  handoff nobody received.
+- **The sweep's wake and the removal's handoff are one obligation.** Both are the unparked wake for
+  the same wait, and the sweep runs first, so a successful sweep wake is recorded on the ledger entry
+  and the final pass does not send it again. Recorded only on success — a wake the sweep could not
+  get acknowledged leaves the handoff still owed.
+- **A cleanup handoff is work of its own, and shutdown waits for it.** Every drain reaches it holding
+  the Run's park lock, under a budget that bounds one single-key backend call rather than a Signal
+  with retries behind it. The last of these is created by the final owed-removal pass, which nothing
+  runs after, so shutdown awaits them within what is left of its grace period and counts what the
+  bound cuts off. A wake merely scheduled as the process exits is a wake never sent, and worse than
+  one reported lost.
 - **The provider reports three outcomes, and two of them mean "gone".** A delete that commits and
   loses its reply leaves a retry meeting a key it cleared itself, so *absent* and *mismatch* cannot
   be one answer: the first ends the suppression and may owe an announcement, the second is a park to
@@ -106,4 +131,7 @@ recovers while the Run stays cached and idle is enough to retire the stale inten
   a replacement intent intact. Three more cover the mechanism itself: a removal call that hangs
   rather than raises does not end the retry loop or keep the park lock, shutdown makes an attempt a
   cancelled backoff would have skipped, and a confirmed removal re-announces the record its intent
-  had silenced.
+  had silenced. Four cover the handoff once the subscription is gone: a removal confirmed after
+  eviction still sends the unparked wake, the sweep does not compose one from an intent it has
+  decided to remove, a removal the final pass confirms carries its own handoff and shutdown does not
+  exit before the Signal lands, and the sweep's wake is not sent a second time by that pass.
