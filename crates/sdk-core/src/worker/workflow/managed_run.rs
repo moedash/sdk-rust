@@ -251,9 +251,7 @@ impl ManagedRun {
         // Same reasoning for a query answer held across that finalization: the task it was going
         // to be reported on is gone, and the server re-delivers the query on the replacement if it
         // is still outstanding. Reporting it on *this* task would answer a query nobody asked.
-        self.waiting_on_local_work
-            .deferred_query_responses
-            .clear();
+        self.waiting_on_local_work.deferred_query_responses.clear();
         self.wft = Some(OutstandingTask {
             info: wft_info,
             pending_queries,
@@ -1130,9 +1128,7 @@ impl ManagedRun {
         // while the records it carries were consumed, and *before* the finalization request below,
         // so a job asking lang to finalize names the snapshot lang has just reported rather than
         // the one it superseded.
-        if registers_without_retaining
-            && let Some(request) = stream_commands.quiescence.take()
-        {
+        if registers_without_retaining && let Some(request) = stream_commands.quiescence.take() {
             self.register_external_stream_quiescence(request);
         }
 
@@ -1990,7 +1986,12 @@ impl ManagedRun {
     ) -> Option<PermittedWFT> {
         let about_to_issue_evict = self.trying_to_evict.is_some();
         let has_activation = self.activation().is_some();
-        if has_activation || about_to_issue_evict || self.more_pending_work() {
+        if must_buffer_wft(
+            self.wft.is_some(),
+            has_activation,
+            about_to_issue_evict,
+            self.more_pending_work(),
+        ) {
             debug!(run_id = %self.run_id(),
                    "Got new WFT for a run with outstanding work, buffering it act: {:?} wft: {:?} about to evict: {:?}", &self.activation(), &self.wft, about_to_issue_evict);
             self.task_buffer.buffer(work);
@@ -2921,10 +2922,33 @@ fn sorted(names: &[String]) -> Vec<String> {
     v
 }
 
+/// Whether a newly polled WFT for an existing run must be buffered rather than applied.
+///
+/// Pulled out of [`ManagedRun::buffer_wft_if_outstanding_work`] because the condition *is* the
+/// thing that has to be right: `_incoming_wft` treats a second WFT for one run as a bug and
+/// `dbg_panic!`s on it, so every state that means "this run already has a WFT" has to be kept out
+/// here.
+///
+/// `has_wft` is listed first because it was the one missing. `more_pending_work` is not a stand-in
+/// for it -- that is `wft.is_some() && machines.has_pending_jobs()`, which answers `false` for an
+/// outstanding WFT whose machines have nothing queued, and that is exactly the state a freshly
+/// polled task used to sail through. Buffering instead is safe in a way admitting is not: the
+/// buffer is drained on the next run update that finds no pending work, and `has_any_pending_work`
+/// counts an outstanding WFT, so the task waits precisely until the one in flight is cleared.
+fn must_buffer_wft(
+    has_wft: bool,
+    has_activation: bool,
+    about_to_issue_evict: bool,
+    more_pending_work: bool,
+) -> bool {
+    has_wft || has_activation || about_to_issue_evict || more_pending_work
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskStorageMetrics, log_workflow_task_duration, parse_wft_duration_warn_threshold,
+        TaskStorageMetrics, log_workflow_task_duration, must_buffer_wft,
+        parse_wft_duration_warn_threshold,
     };
     use crate::worker::workflow::{WFCommand, WFCommandVariant};
     use std::{
@@ -2993,6 +3017,35 @@ mod tests {
             log_workflow_task_duration("run-1", "MyWorkflow", 12, 3, 4096, duration, storage);
         });
         sub.events.lock().unwrap().drain(..).next()
+    }
+
+    #[test]
+    fn an_outstanding_wft_alone_buffers_a_newly_polled_task() {
+        // The regression. No activation, nothing about to evict, and machines with nothing
+        // queued -- so `more_pending_work` is false -- but a WFT is still outstanding. Admitting
+        // here reaches `_incoming_wft`, which treats two WFTs for one run as a bug and
+        // `dbg_panic!`s: the workflow-processing thread dies on a debug build, and a release build
+        // logs and carries on into code that was never written to hold two.
+        assert!(
+            must_buffer_wft(true, false, false, false),
+            "a run with an outstanding WFT admitted another one"
+        );
+    }
+
+    #[test]
+    fn a_run_with_nothing_outstanding_admits_the_task() {
+        // The other half: buffering unconditionally would stall every run, since the buffer is
+        // only drained by a later run update.
+        assert!(!must_buffer_wft(false, false, false, false));
+    }
+
+    #[test]
+    fn every_other_kind_of_outstanding_work_still_buffers() {
+        // These three were already handled and must stay handled -- the fix adds a reason to
+        // buffer, it does not replace the existing ones.
+        assert!(must_buffer_wft(false, true, false, false), "activation");
+        assert!(must_buffer_wft(false, false, true, false), "pending evict");
+        assert!(must_buffer_wft(false, false, false, true), "pending jobs");
     }
 
     #[test]
