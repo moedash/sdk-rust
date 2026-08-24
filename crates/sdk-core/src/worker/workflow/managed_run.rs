@@ -2947,17 +2947,35 @@ fn must_buffer_wft(
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskStorageMetrics, log_workflow_task_duration, must_buffer_wft,
+        ManagedRun, TaskStorageMetrics, log_workflow_task_duration, must_buffer_wft,
         parse_wft_duration_warn_threshold,
     };
-    use crate::worker::workflow::{WFCommand, WFCommandVariant};
+    use crate::{
+        MetricsContext,
+        abstractions::tests::fixed_size_permit_dealer,
+        protosext::ValidPollWFTQResponse,
+        replay::TestHistoryBuilder,
+        test_help::{ResponseType, hist_to_poll_resp, mock_worker_client, test_worker_cfg},
+        worker::{
+            WorkflowSlotKind,
+            client::mocks::DEFAULT_TEST_CAPABILITIES,
+            workflow::{
+                ActivationOrAuto, HistoryPaginator, HistoryUpdate, PermittedWFT, RunBasics,
+                RunTimerSink, WFCommand, WFCommandVariant, WFTReportStatus,
+            },
+        },
+    };
     use std::{
         fmt::Write,
         mem::{Discriminant, discriminant},
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, Instant},
     };
-    use temporalio_common::protos::coresdk::common::ExternalStorageMetrics;
+    use temporalio_common::protos::{
+        coresdk::{WorkflowSlotInfo, common::ExternalStorageMetrics},
+        temporal::api::enums::v1::EventType,
+    };
+    use tokio::sync::mpsc::unbounded_channel;
     use tracing::{
         Event, Level, Metadata, Subscriber,
         field::{Field, Visit},
@@ -3019,6 +3037,31 @@ mod tests {
         sub.events.lock().unwrap().drain(..).next()
     }
 
+    async fn permitted_wft(
+        history: &TestHistoryBuilder,
+        response_type: ResponseType,
+    ) -> PermittedWFT {
+        let valid = ValidPollWFTQResponse::try_from(
+            hist_to_poll_resp(history, "workflow", response_type).resp,
+        )
+        .unwrap();
+        let (paginator, work) = HistoryPaginator::from_poll(valid, Arc::new(mock_worker_client()))
+            .await
+            .unwrap();
+        let permit = fixed_size_permit_dealer::<WorkflowSlotKind>(1)
+            .try_acquire_owned()
+            .unwrap()
+            .into_used(WorkflowSlotInfo {
+                workflow_type: work.workflow_type.clone(),
+                is_sticky: work.is_incremental(),
+            });
+        PermittedWFT {
+            work,
+            permit,
+            paginator,
+        }
+    }
+
     #[test]
     fn an_outstanding_wft_alone_buffers_a_newly_polled_task() {
         // The regression. No activation, nothing about to evict, and machines with nothing
@@ -3046,6 +3089,68 @@ mod tests {
         assert!(must_buffer_wft(false, true, false, false), "activation");
         assert!(must_buffer_wft(false, false, true, false), "pending evict");
         assert!(must_buffer_wft(false, false, false, true), "pending jobs");
+    }
+
+    #[tokio::test]
+    async fn an_outstanding_managed_run_wft_buffers_then_drains_a_polled_task() {
+        let mut history = TestHistoryBuilder::default();
+        history.add_by_type(EventType::WorkflowExecutionStarted);
+        history.add_workflow_task_scheduled_and_started();
+        let first = permitted_wft(&history, ResponseType::AllHistory).await;
+
+        history.add_workflow_task_completed();
+        history.add_workflow_task_scheduled_and_started();
+        let replacement = permitted_wft(&history, ResponseType::OneTask(2)).await;
+
+        let (timer_tx, _timer_rx) = unbounded_channel();
+        let (mut run, first_activation) = ManagedRun::new(
+            RunBasics {
+                worker_config: Arc::new(test_worker_cfg().build().unwrap()),
+                workflow_id: "workflow".to_string(),
+                workflow_type: first.work.workflow_type.clone(),
+                run_id: history.get_orig_run_id().to_string(),
+                history: HistoryUpdate::dummy(),
+                metrics: MetricsContext::no_op(),
+                capabilities: DEFAULT_TEST_CAPABILITIES,
+                sdk_name: "test-core",
+                sdk_version: "0.0.0",
+            },
+            first,
+            None,
+            RunTimerSink { tx: timer_tx },
+        );
+        assert!(matches!(
+            first_activation,
+            Some(ActivationOrAuto::LangActivation(_))
+        ));
+
+        run.finish_activation(|_| true);
+        assert!(run.activation().is_none());
+        assert!(run.wft().is_some());
+        assert!(!run.more_pending_work());
+
+        assert!(run.buffer_wft_if_outstanding_work(replacement).is_none());
+        assert!(run.has_buffered_wft());
+        assert!(run.wft().is_some());
+
+        assert!(
+            run.mark_wft_complete(
+                WFTReportStatus::Reported {
+                    reset_last_started_to: None,
+                    completion_time: Instant::now(),
+                },
+                &TaskStorageMetrics::default(),
+            )
+            .is_some()
+        );
+        assert!(run.wft().is_none());
+
+        assert!(matches!(
+            run.check_more_activations(),
+            Some(ActivationOrAuto::Autocomplete { .. })
+        ));
+        assert!(run.wft().is_some());
+        assert!(!run.has_buffered_wft());
     }
 
     #[test]

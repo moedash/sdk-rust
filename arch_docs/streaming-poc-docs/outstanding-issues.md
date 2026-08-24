@@ -1,6 +1,8 @@
 # Outstanding issues
 
-Written 2026-08-24. Everything here is **open**. Nothing in this file is fixed.
+Written 2026-08-24; dispositions updated 2026-08-24. Issues **1, 3, 4, 5, and 8 are resolved in the
+current working trees**. Issues 2 and 7 remain open. Issue 6 is deferred as a broader Core design
+question rather than a confirmed streaming defect.
 
 This is a plain register of what is left. Detail and evidence for items 1-4 live in
 [`wft-double-dispatch-flake-handoff.md`](wft-double-dispatch-flake-handoff.md), which is long and
@@ -11,28 +13,37 @@ Two things this file names live on the task volume rather than in any repository
 version-controlled: `TASK_STATUS.md` and the `streaming-review-findings/` round that produced
 finding 14.
 
-Current tree: `sdk-python` `85aa5c57`, `sdk-rust` / Core submodule `57503951`, native extension
-rebuilt 2026-08-23 20:50 UTC. External stream suite: **653 pass, 1 fail** — the 1 is item 2.
+Heads this register was last reconciled against, immediately before the remediation for items 1, 3,
+4, 5 and 8 was committed: `sdk-python` `d9ccd4d1`, `sdk-rust` / Core submodule `7b21cd99`. The most
+recent full external-stream-suite baseline remains **653 pass, 1 fail** — the 1 is item 2, and that
+baseline must not be read as a clean final-suite result. Focused validation of the resolved items is
+recorded in the task-volume `TASK_STATUS.md`.
 
 ## Summary
 
-| # | Issue | Type | Diagnosed? |
+| # | Issue | Type | Disposition |
 |---|---|---|---|
-| 1 | Registry test fails during sandbox import | Test flake | Yes |
-| 2 | Replay tests time out on rejected Workflow Task reports | Unknown — possibly product | **No** |
-| 3 | Empty-stream replay test rejects a legitimate race | Test bug | Yes |
-| 4 | No end-to-end test for the Core admission fix | Missing coverage | n/a |
-| 5 | Five tests create a Core worker and never shut it down | Test hygiene | Yes |
-| 6 | `dbg_panic!` behaviour on release builds | Design question | Partly |
-| 7 | Repeated follow-up wakes on `NoOpenWorkflowTask` | Efficiency | Partly |
-| 8 | `TASK_STATUS.md` says there are no known defects | Stale doc | Yes |
+| 1 | Registry test fails during sandbox import | Test flake | **Resolved** |
+| 2 | Replay tests time out on rejected Workflow Task reports | Unknown — possibly product | **Open** |
+| 3 | Empty-stream replay test rejects a legitimate race | Test bug | **Resolved** |
+| 4 | No stateful test for the Core admission fix | Missing coverage | **Resolved** |
+| 5 | Five tests create a Core worker and never shut it down | Test hygiene | **Resolved** |
+| 6 | `dbg_panic!` behaviour on release builds | Design question | **Deferred** |
+| 7 | Repeated follow-up wakes on `NoOpenWorkflowTask` | Efficiency | **Open with #2** |
+| 8 | `TASK_STATUS.md` says there are no known defects | Stale doc | **Resolved** |
 
 ---
 
 ## 1. Registry test fails during sandbox import
 
+**Resolved.** `NoOpWorkflow` is now explicitly unsandboxed because these tests exercise Worker
+construction rather than sandboxing. The two successful registry constructions also use an
+`async with Worker(...)` lifetime, so their Core workers shut down orderly. The focused registry
+cases pass, including 32/32 concurrent repetitions of the formerly flaky construction.
+
+At the reviewed baseline,
 `tests/contrib/external_workflow_streams/test_registry.py::test_a_conforming_backend_registers_on_a_worker`
-(line 114). Fails intermittently in full-suite runs only, with `RuntimeError: Failed validating
+(line 114) failed intermittently in full-suite runs only, with `RuntimeError: Failed validating
 workflow NoOpWorkflow`.
 
 The chain, captured by the follow-up investigation: constructing the `Worker` validates
@@ -101,8 +112,16 @@ record, which is the exact failure the whole external-stream wake mechanism exis
 
 ## 3. Empty-stream replay test rejects a legitimate race
 
-`test_replay_end_to_end.py:874` asserts that **no** Workflow Task failed, on the grounds that a
-failure would make the second execution ambiguous evidence of the eviction. That rejects an outcome
+**Resolved.** The test now proves there was no Workflow Task failure and no workflow-body restart at
+the completed cache-eviction boundary. After the deliberate wake it permits only
+`WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND`, while continuing to reject all other causes and to
+check the marker, cursor, ranges, and offline replays. Because that retry may execute the workflow
+body again, the observation assertion checks at least the live run plus two explicit replays and
+requires every observation to equal the live result rather than requiring exactly three executions.
+The case passed 16/16 concurrent repetitions.
+
+`test_replay_end_to_end.py:874` previously asserted that **no** Workflow Task failed, on the grounds
+that a failure would make the second execution ambiguous evidence of the eviction. That rejected an outcome
 Temporal considers normal: a generation-0 wake Signal can arrive while the workflow is issuing its
 terminal command, the server rejects that task with `UnhandledCommand` so the Signal is not lost, and
 it schedules a replay. The workflow then completes correctly with the right records. Core's own
@@ -115,21 +134,36 @@ check, and permit `UNHANDLED_COMMAND` specifically while still rejecting nondete
 causes. Keep all the record, marker, range and offline-replay assertions — those are the claims the
 test exists to make.
 
-## 4. No end-to-end test for the Core admission fix
+## 4. No stateful test for the Core admission fix
 
-`sdk-rust` `57503951` fixed the admission gate (`must_buffer_wft` now includes `has_wft`) and added
-three unit tests over the condition, with a mutation check confirming they cover it. What is *not*
-covered is the sequence that triggers it: a polled task winning a race against the local
+**Resolved at the level required by the review.** A stateful Core regression now constructs a real
+`ManagedRun` and two `PermittedWFT`s, clears the first activation while leaving its Workflow Task
+outstanding with no pending jobs, verifies that the replacement task is buffered, reports the first
+task, and verifies that the replacement drains into the run. The test passes and covers the
+production call site in addition to the existing predicate tests. All 21 tests in the
+`managed_run` unit-test module pass. This is the minimum regression the review required. The
+lane-controlled integration test it called optional — poll-result lane against post-completion lane —
+was **not** added, because the harness does not expose those inputs without sleeps; a sleep-based
+race test would not be worth its flakiness.
+
+At the reviewed baseline, `sdk-rust` `57503951` fixed the admission gate (`must_buffer_wft` now
+includes `has_wft`) and added three unit tests over the condition, with a mutation check confirming
+they cover it. What was *not* covered was the sequence that triggers it: a polled task winning a race against the local
 post-completion message that clears `ManagedRun.wft`. That needs a test able to control Core's two
 input lanes, which the existing harness does not obviously allow.
 
-Until that exists, the fix is justified by the invariant it restores rather than by a reproduction.
+Before the stateful regression above, the fix was justified by the invariant it restored rather
+than by a reproduction.
 
 ## 5. Five tests create a Core worker and never shut it down
 
-`test_registry.py:115` and `:144`; `test_continuation.py:634`, `:672`, `:697`. Each constructs a
-`Worker`, which eagerly creates a real Core worker, asserts something about the constructor, and
-drops it.
+**Resolved.** All five successful constructor-only cases now use `async with Worker(...)`; the two
+parameter values make six focused executions, all passing. Constructor-failure tests remain direct
+constructions because no Worker exists to close when validation raises.
+
+At the reviewed baseline, `test_registry.py:115` and `:144`; `test_continuation.py:634`, `:672`,
+`:697` each constructed a `Worker`, which eagerly created a real Core worker, asserted something
+about the constructor, and dropped it.
 
 This is **not** the cause of any failure above — I held 400 such workers live in one process with no
 failure. It is ordinary hygiene worth cleaning up, and no more than that.
@@ -156,11 +190,15 @@ Not a correctness failure on its own. Worth bounding explicitly, and worth a tes
 
 ## 8. `TASK_STATUS.md` says there are no known defects
 
-Line 466 reads "None outstanding from any of the four reviews". That predates the current findings
-round (`streaming-review-findings/01`–`16`) and everything in this file. It should not be trusted.
+**Resolved.** `TASK_STATUS.md` now identifies the historical implementation sections as
+point-in-time records, reports the current repository heads and remediation state, lists #2/#7 as
+the remaining open work, classifies #6 as deferred rather than a known defect, and records the
+focused validation without presenting it as full CI.
 
-I did not correct it because doing so honestly means stating the status of the other fifteen findings,
-which I have not verified.
+At the reviewed baseline, line 466 read "None outstanding from any of the four reviews". That
+predated the current findings round (`streaming-review-findings/01`–`16`) and everything in this
+file. It was not corrected during the investigation because the other fifteen findings had not yet
+been verified; the comprehensive status refresh above supersedes it.
 
 ---
 
