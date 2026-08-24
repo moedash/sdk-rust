@@ -344,6 +344,9 @@ relevant information.
 * Rust SDK workers now warn when autoscaling task polling encounters errors continuously for one
   minute. Repeated warnings use exponential backoff up to 15-minute intervals and stop after
   polling recovers.
+* Workflow workers now preserve the outstanding workflow-task token if an internal admission
+  invariant is violated, buffering the replacement task instead of overwriting the task in flight
+  in release builds.
 * Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
   of failing the Workflow Execution. Workflows may still explicitly handle these errors.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before

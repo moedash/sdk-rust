@@ -195,6 +195,14 @@ impl ManagedRun {
     ) -> Result<Option<ActivationOrAuto>, RunUpdateErr> {
         if self.wft.is_some() {
             dbg_panic!("Trying to send a new WFT for a run which already has one!");
+            // `dbg_panic!` deliberately logs and continues in release builds.
+            // Continuing into the ordinary admission path would overwrite the
+            // outstanding task and lose ownership of its task token. Retaining
+            // the replacement here gives release builds the same safe ordering
+            // the caller's admission guard normally establishes, while debug
+            // builds still fail loudly at the violated invariant above.
+            self.task_buffer.buffer(pwft);
+            return Ok(None);
         }
         let start_time = Instant::now();
 
@@ -3062,37 +3070,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_outstanding_wft_alone_buffers_a_newly_polled_task() {
-        // The regression. No activation, nothing about to evict, and machines with nothing
-        // queued -- so `more_pending_work` is false -- but a WFT is still outstanding. Admitting
-        // here reaches `_incoming_wft`, which treats two WFTs for one run as a bug and
-        // `dbg_panic!`s: the workflow-processing thread dies on a debug build, and a release build
-        // logs and carries on into code that was never written to hold two.
-        assert!(
-            must_buffer_wft(true, false, false, false),
-            "a run with an outstanding WFT admitted another one"
-        );
-    }
-
-    #[test]
-    fn a_run_with_nothing_outstanding_admits_the_task() {
-        // The other half: buffering unconditionally would stall every run, since the buffer is
-        // only drained by a later run update.
-        assert!(!must_buffer_wft(false, false, false, false));
-    }
-
-    #[test]
-    fn every_other_kind_of_outstanding_work_still_buffers() {
-        // These three were already handled and must stay handled -- the fix adds a reason to
-        // buffer, it does not replace the existing ones.
-        assert!(must_buffer_wft(false, true, false, false), "activation");
-        assert!(must_buffer_wft(false, false, true, false), "pending evict");
-        assert!(must_buffer_wft(false, false, false, true), "pending jobs");
-    }
-
-    #[tokio::test]
-    async fn an_outstanding_managed_run_wft_buffers_then_drains_a_polled_task() {
+    async fn run_with_outstanding_wft_and_replacement() -> (ManagedRun, PermittedWFT) {
         let mut history = TestHistoryBuilder::default();
         history.add_by_type(EventType::WorkflowExecutionStarted);
         history.add_workflow_task_scheduled_and_started();
@@ -3128,6 +3106,41 @@ mod tests {
         assert!(run.activation().is_none());
         assert!(run.wft().is_some());
         assert!(!run.more_pending_work());
+        (run, replacement)
+    }
+
+    #[test]
+    fn an_outstanding_wft_alone_buffers_a_newly_polled_task() {
+        // The regression. No activation, nothing about to evict, and machines with nothing
+        // queued -- so `more_pending_work` is false -- but a WFT is still outstanding. Admitting
+        // here reaches `_incoming_wft`, which treats two WFTs for one run as a bug and
+        // `dbg_panic!`s: the workflow-processing thread dies on a debug build, and a release build
+        // logs and carries on into code that was never written to hold two.
+        assert!(
+            must_buffer_wft(true, false, false, false),
+            "a run with an outstanding WFT admitted another one"
+        );
+    }
+
+    #[test]
+    fn a_run_with_nothing_outstanding_admits_the_task() {
+        // The other half: buffering unconditionally would stall every run, since the buffer is
+        // only drained by a later run update.
+        assert!(!must_buffer_wft(false, false, false, false));
+    }
+
+    #[test]
+    fn every_other_kind_of_outstanding_work_still_buffers() {
+        // These three were already handled and must stay handled -- the fix adds a reason to
+        // buffer, it does not replace the existing ones.
+        assert!(must_buffer_wft(false, true, false, false), "activation");
+        assert!(must_buffer_wft(false, false, true, false), "pending evict");
+        assert!(must_buffer_wft(false, false, false, true), "pending jobs");
+    }
+
+    #[tokio::test]
+    async fn an_outstanding_managed_run_wft_buffers_then_drains_a_polled_task() {
+        let (mut run, replacement) = run_with_outstanding_wft_and_replacement().await;
 
         assert!(run.buffer_wft_if_outstanding_work(replacement).is_none());
         assert!(run.has_buffered_wft());
@@ -3145,6 +3158,43 @@ mod tests {
         );
         assert!(run.wft().is_none());
 
+        assert!(matches!(
+            run.check_more_activations(),
+            Some(ActivationOrAuto::Autocomplete { .. })
+        ));
+        assert!(run.wft().is_some());
+        assert!(!run.has_buffered_wft());
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "Trying to send a new WFT for a run which already has one!")]
+    async fn bypassing_wft_admission_guard_trips_the_debug_invariant() {
+        let (mut run, replacement) = run_with_outstanding_wft_and_replacement().await;
+
+        run.incoming_wft(replacement);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[tokio::test]
+    async fn bypassing_wft_admission_guard_buffers_in_release() {
+        let (mut run, replacement) = run_with_outstanding_wft_and_replacement().await;
+        let original_task_token = run.wft().unwrap().info.task_token.clone();
+
+        assert!(run.incoming_wft(replacement).is_none());
+        assert!(run.has_buffered_wft());
+        assert_eq!(run.wft().unwrap().info.task_token, original_task_token);
+
+        assert!(
+            run.mark_wft_complete(
+                WFTReportStatus::Reported {
+                    reset_last_started_to: None,
+                    completion_time: Instant::now(),
+                },
+                &TaskStorageMetrics::default(),
+            )
+            .is_some()
+        );
         assert!(matches!(
             run.check_more_activations(),
             Some(ActivationOrAuto::Autocomplete { .. })

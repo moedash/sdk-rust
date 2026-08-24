@@ -10,6 +10,20 @@ bounded disposition:
 Issues 2 and 7 are one investigation until evidence separates them. Issue 6 is a separate Core
 hardening decision; it must not turn this work into a global redesign of `dbg_panic!`.
 
+## Result
+
+Completed 2026-08-24.
+
+- **#2 and #7:** the correlated trace proved follow-up wakes sustained the closing-window replay
+  loop. Python now suppresses terminal re-arms and coalesces nonterminal readiness behind one
+  Run-wide, per-send-attempt wake cycle. Deterministic retry/eviction/cleanup regressions pass, as do
+  10 canary and 100 acceptance repetitions of each formerly failing live test.
+- **#6:** all production admission paths are guarded. `_incoming_wft` now also buffers the second
+  task in release builds after logging the invariant, preserving the debug panic and the original
+  task token. Debug- and release-profile fault-injection tests pass.
+- The timeout artifact collector remains in the two replay integrations. It writes complete History,
+  Workflow Task timing, subscription state, and correlated wake events before cleanup on recurrence.
+
 ## Completion criteria
 
 The work is complete only when all of the following are true:

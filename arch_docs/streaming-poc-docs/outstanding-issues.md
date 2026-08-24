@@ -1,8 +1,9 @@
 # Outstanding issues
 
-Written 2026-08-24; dispositions updated 2026-08-24. Issues **1, 3, 4, 5, and 8 are resolved in the
-current working trees**. Issues 2 and 7 remain open. Issue 6 is deferred as a broader Core design
-question rather than a confirmed streaming defect.
+Written 2026-08-24; dispositions updated 2026-08-24. **All eight reviewed issues are resolved.**
+Issues 2 and 7 were one product defect: follow-up wakes were not tied to the Workflow Task cycle
+they caused, so replay could manufacture more work in the closing window. Issue 6 received the
+plan's narrowly scoped Core hardening rather than a global `dbg_panic!` policy change.
 
 This is a plain register of what is left. Detail and evidence for items 1-4 live in
 [`wft-double-dispatch-flake-handoff.md`](wft-double-dispatch-flake-handoff.md), which is long and
@@ -13,23 +14,23 @@ Two things this file names live on the task volume rather than in any repository
 version-controlled: `TASK_STATUS.md` and the `streaming-review-findings/` round that produced
 finding 14.
 
-Heads this register was last reconciled against, immediately before the remediation for items 1, 3,
-4, 5 and 8 was committed: `sdk-python` `d9ccd4d1`, `sdk-rust` / Core submodule `7b21cd99`. The most
-recent full external-stream-suite baseline remains **653 pass, 1 fail** — the 1 is item 2, and that
-baseline must not be read as a clean final-suite result. Focused validation of the resolved items is
-recorded in the task-volume `TASK_STATUS.md`.
+The resolution commits are `sdk-python` `82b3c7d0` and `86144a0a`, plus the Core hardening commit
+that contains this disposition. The old **653 pass, 1 fail** external-stream-suite result is retained
+only as the pre-fix incident baseline. Post-fix evidence includes 10 canary and 100 acceptance
+repetitions of each formerly failing replay test, all passing; final full-suite validation is
+recorded separately in the task-volume `TASK_STATUS.md`.
 
 ## Summary
 
 | # | Issue | Type | Disposition |
 |---|---|---|---|
 | 1 | Registry test fails during sandbox import | Test flake | **Resolved** |
-| 2 | Replay tests time out on rejected Workflow Task reports | Unknown — possibly product | **Open** |
+| 2 | Replay tests time out on rejected Workflow Task reports | Product defect | **Resolved** |
 | 3 | Empty-stream replay test rejects a legitimate race | Test bug | **Resolved** |
 | 4 | No stateful test for the Core admission fix | Missing coverage | **Resolved** |
 | 5 | Five tests create a Core worker and never shut it down | Test hygiene | **Resolved** |
-| 6 | `dbg_panic!` behaviour on release builds | Design question | **Deferred** |
-| 7 | Repeated follow-up wakes on `NoOpenWorkflowTask` | Efficiency | **Open with #2** |
+| 6 | `dbg_panic!` behaviour on release builds | Local Core hardening | **Resolved** |
+| 7 | Repeated follow-up wakes on `NoOpenWorkflowTask` | Product defect | **Resolved with #2** |
 | 8 | `TASK_STATUS.md` says there are no known defects | Stale doc | **Resolved** |
 
 ---
@@ -66,7 +67,30 @@ workflow module, so it never exercised the path. Ignore that entry.
 
 ## 2. Replay tests time out on rejected Workflow Task reports
 
-The one currently-failing test. Two tests in `test_worker_integration.py` show it:
+**Resolved.** The retained trace established that issue 7 sustained the incident. A buffered
+readiness report received `NoOpenWorkflowTask`, sent a wake, and then another readiness generation
+or replayed subscription sent a distinct wake before Core had accepted the successful completion of
+the task the first wake caused. Those Signals repeatedly entered the execution's closing window,
+where Workflow Task reporting and signaling rejected one another with `UnhandledCommand` and
+`BUSY_WORKFLOW`; eviction reconstructed the readiness and repeated the cycle.
+
+The fix has two boundaries:
+
+- terminal Workflow completions do not re-arm buffered readiness because that Run cannot consume a
+  later activation;
+- nonterminal readiness is coalesced to one Run-wide wake cycle until a later activation completes
+  successfully. The cycle survives eviction/replay, correlates completion to each individual RPC
+  retry attempt, and opens again for a genuinely later activation. Cleanup of a stale park intent
+  explicitly invalidates the wake it silenced so the required unparked reannouncement is preserved.
+
+The deterministic regressions cover replay reconstruction, an already-running task completing
+during a wake send, a failed send attempt followed by a successful retry, genuinely new buffered
+ranges, terminal completion, and stale-intent cleanup. Both live replay tests passed 10 canary and
+100 acceptance repetitions apiece under four concurrent pytest workers (**220 total**). The timeout
+harness remains in the tests and retains complete History plus correlated manager state if the
+incident recurs.
+
+At the incident baseline, two tests in `test_worker_integration.py` showed it:
 `test_a_replayed_run_re_registers_its_wait_set` (line 632) and
 `test_a_replayed_record_is_prepared_off_the_workflow_thread` (line 1033). Both time out at
 `wait_for(handle.result(), 30)`.
@@ -80,10 +104,11 @@ It is one defect, not two flaky tests: runs before and after the Core fix, on th
 binary, produced the identical signature and the same 85 iterations in *different* tests of the same
 file. Both are replay-after-eviction cases, and it appears to land on whichever one is running.
 
-**The cause is not established.** Each replay re-announces the buffered record, which owes a wake, so
-a failing run also fires ~255 wake Signals (85 × 3 attempts) that are rejected the same way. Whether
-those Signals *sustain* the loop by contending for the workflow lock or merely ride it is the open
-question, and it decides whether any fix belongs in the manager at all.
+Each replay re-announced the buffered record, so a failing run fired ~255 wake attempts (85 × 3)
+that were rejected the same way. The correlated post-fix investigation established these were not
+merely passengers: allowing a failed attempt to claim a completion that occurred before its retry
+re-opened the gate and immediately reproduced distinct follow-up wakes. Resetting correlation at
+each attempt removed that sequence and passed the bounded stress gate.
 
 **Two of my experiments on this are void. Do not build on either:**
 
@@ -101,12 +126,7 @@ during two independent reproductions recorded `wake_park_generation_ledger_hit` 
 owed-removal ledger *did* populate (2 entries, via inherited-park reconciliation), so the new code
 paths were reachable and simply were not taken.
 
-**Suggested next steps, in order:** capture the failing workflow's History (the decisive question is
-why the execution is "closing" but never closes — `handle.result()` times out, so it had not); find
-what makes the count exactly 85, since a constant across independent occurrences suggests a cap or a
-timeout ratio rather than an open-ended loop; then settle sustain-or-ride with a working harness.
-
-**Trap:** do not "fix" this by treating `BUSY_WORKFLOW` as terminal in `_send_owed_wake`.
+**Preserved constraint:** do not treat `BUSY_WORKFLOW` as terminal in `_send_owed_wake`.
 `BUSY_WORKFLOW` is a transient server signal meaning retry later. Dropping the wake would lose a
 record, which is the exact failure the whole external-stream wake mechanism exists to prevent.
 
@@ -170,23 +190,31 @@ failure. It is ordinary hygiene worth cleaning up, and no more than that.
 
 ## 6. `dbg_panic!` behaviour on release builds
 
-`dbg_panic!` is `error!` plus `debug_assert!(false, ...)`. On a debug build (what this container uses)
-the admission violation killed the workflow-processing thread. On a release build it logged and
-carried on into code not written to hold two Workflow Tasks for one run.
+**Resolved locally.** All production admissions were audited. New-run construction starts with no
+task; polled tasks for an existing Run pass through `buffer_wft_if_outstanding_work`; and the task
+buffer drains only after `has_any_pending_work` confirms the outstanding WFT is gone. The stateful
+item-4 regression mutation-kills removal of the `has_wft` guard.
 
-Item 4's fix closes that particular path, but the general question stands: if an invariant like this
-can be violated under load, an assertion is the wrong tool and the branch needs a real recovery path.
-Worth deciding deliberately rather than per-site.
+`_incoming_wft` is nevertheless defensive now. It retains the debug `dbg_panic!`, but the release
+path buffers the replacement and returns instead of overwriting the outstanding task and losing its
+task token. Fault-injection tests prove the debug build panics at the invariant and the release build
+preserves the original token, buffers the replacement, and drains it after the original task is
+reported. All 22 debug-profile `managed_run` tests and the release-only recovery test pass. No other
+`dbg_panic!` call site or macro behavior changed.
 
 ## 7. Repeated follow-up wakes on `NoOpenWorkflowTask`
 
-Noted during the Failure C investigation: each `NoOpenWorkflowTask` readiness result counts an owed
-wake and sends a Signal, and repeated replay registration can re-read and re-announce the same
-buffered records. One captured run settled after three follow-ups. If timing keeps placing each
-Signal inside a terminal Workflow Task, this can loop through safe-but-wasteful retries — which is
-also the mechanism suspected in item 2.
+**Resolved with issue 2.** The mechanism was a correctness/liveness risk, not only an efficiency
+concern: distinct follow-up wakes could sustain the Workflow Task rejection/replay loop. Readiness
+now has an explicit lifecycle rule:
 
-Not a correctness failure on its own. Worth bounding explicitly, and worth a test.
+> With records buffered and no open Workflow Task, one Run-wide wake remains outstanding until an
+> activation that began during that exact acknowledged send attempt completes successfully. Replay
+> and concurrent waits coalesce behind it. A later completed cycle, a failed send, or retirement of
+> a park generation known to have silenced the wake permits the next required wake.
+
+The counter still advances between completed cycles, so genuinely later readiness is not
+deduplicated away. Retries within one cycle keep the same counter/request ID.
 
 ## 8. `TASK_STATUS.md` says there are no known defects
 
