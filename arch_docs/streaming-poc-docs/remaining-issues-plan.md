@@ -23,6 +23,12 @@ Completed 2026-08-24.
   task token. Debug- and release-profile fault-injection tests pass.
 - The timeout artifact collector remains in the two replay integrations. It writes complete History,
   Workflow Task timing, subscription state, and correlated wake events before cleanup on recurrence.
+- **Release gate:** the two formerly failing live tests each passed 10 canary and 100 acceptance
+  repetitions; the rebuilt native extension then passed three consecutive complete
+  external-stream suites at **658 passed** each. Core passed all 22 debug `managed_run` tests, the
+  release-only recovery test, all 496 Core library tests (one ignored), compile-fail suites, and
+  documentation tests. Rust formatting/lint and Python Ruff, Pyright, Mypy, BasedPyright, and
+  pydocstyle checks all pass.
 
 ## Completion criteria
 

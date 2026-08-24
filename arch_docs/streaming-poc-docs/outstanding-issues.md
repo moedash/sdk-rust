@@ -14,11 +14,13 @@ Two things this file names live on the task volume rather than in any repository
 version-controlled: `TASK_STATUS.md` and the `streaming-review-findings/` round that produced
 finding 14.
 
-The resolution commits are `sdk-python` `82b3c7d0` and `86144a0a`, plus the Core hardening commit
-that contains this disposition. The old **653 pass, 1 fail** external-stream-suite result is retained
-only as the pre-fix incident baseline. Post-fix evidence includes 10 canary and 100 acceptance
-repetitions of each formerly failing replay test, all passing; final full-suite validation is
-recorded separately in the task-volume `TASK_STATUS.md`.
+The behavioral resolution commits are `sdk-python` `82b3c7d0`, `86144a0a`, `4eca5b45`, and
+`2994f4fa`, plus Core `c4504901`; `sdk-python` `163019c6` points the vendored Core at that hardening.
+The old **653 pass, 1 fail** external-stream-suite result is retained only as the pre-fix incident
+baseline. Post-fix evidence includes 10 canary and 100 acceptance repetitions of each formerly
+failing replay test, all passing, followed by three consecutive complete external-stream-suite
+runs at **658 passed** each. Static cleanup is recorded in `sdk-python` `bff2571f`, `552e4f01`, and
+`380fe874`. The complete validation record also lives in the task-volume `TASK_STATUS.md`.
 
 ## Summary
 
@@ -41,6 +43,13 @@ recorded separately in the task-volume `TASK_STATUS.md`.
 construction rather than sandboxing. The two successful registry constructions also use an
 `async with Worker(...)` lifetime, so their Core workers shut down orderly. The focused registry
 cases pass, including 32/32 concurrent repetitions of the formerly flaky construction.
+
+The same pytest-rewrite import path later appeared in the handoff and end-to-end replay modules.
+Every external-stream test module that defines a sandboxed Workflow and constructs a Worker or
+Replayer now declares `PYTEST_DONT_REWRITE`, keeping pytest's assertion-rewriter internals outside
+the Workflow sandbox. The handoff Workflow is unsandboxed because that test exercises durable
+cross-Worker state, not sandbox behavior. Three consecutive complete suite runs pass after this
+broader fix.
 
 At the reviewed baseline,
 `tests/contrib/external_workflow_streams/test_registry.py::test_a_conforming_backend_registers_on_a_worker`
@@ -161,7 +170,8 @@ test exists to make.
 outstanding with no pending jobs, verifies that the replacement task is buffered, reports the first
 task, and verifies that the replacement drains into the run. The test passes and covers the
 production call site in addition to the existing predicate tests. All 21 tests in the
-`managed_run` unit-test module pass. This is the minimum regression the review required. The
+`managed_run` unit-test module passed before defensive recovery was added; all 22 debug-profile
+tests now pass. This is the minimum regression the review required. The
 lane-controlled integration test it called optional — poll-result lane against post-completion lane —
 was **not** added, because the harness does not expose those inputs without sleeps; a sleep-based
 race test would not be worth its flakiness.
@@ -179,7 +189,9 @@ than by a reproduction.
 
 **Resolved.** All five successful constructor-only cases now use `async with Worker(...)`; the two
 parameter values make six focused executions, all passing. Constructor-failure tests remain direct
-constructions because no Worker exists to close when validation raises.
+constructions because no Worker exists to close when validation raises. The handoff and Worker
+integration fixtures also retain and await their worker/shutdown tasks, eliminating the related
+"Task was destroyed but it is pending" teardown warnings.
 
 At the reviewed baseline, `test_registry.py:115` and `:144`; `test_continuation.py:634`, `:672`,
 `:697` each constructed a `Worker`, which eagerly created a real Core worker, asserted something
@@ -219,9 +231,9 @@ deduplicated away. Retries within one cycle keep the same counter/request ID.
 ## 8. `TASK_STATUS.md` says there are no known defects
 
 **Resolved.** `TASK_STATUS.md` now identifies the historical implementation sections as
-point-in-time records, reports the current repository heads and remediation state, lists #2/#7 as
-the remaining open work, classifies #6 as deferred rather than a known defect, and records the
-focused validation without presenting it as full CI.
+point-in-time records, reports the current repository heads and remediation state, records all
+eight issues as resolved, and distinguishes the complete release gate from earlier focused and
+statistical checks.
 
 At the reviewed baseline, line 466 read "None outstanding from any of the four reviews". That
 predated the current findings round (`streaming-review-findings/01`–`16`) and everything in this
