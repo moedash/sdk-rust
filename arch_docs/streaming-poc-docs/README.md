@@ -22,6 +22,8 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | Review the feature, or know which commits it is | [`review-guide.md`](review-guide.md) — a dated snapshot, not design |
 | Know what past reviews found and what was done | [`follow-up-review.md`](follow-up-review.md), then [`third-review.md`](third-review.md), [`fourth-review.md`](fourth-review.md), [`fifth-review.md`](fifth-review.md) — review records, not design |
 | Chase the empty-stream replay flake | [`empty-stream-replay-flake-handoff.md`](empty-stream-replay-flake-handoff.md) — a resolved investigation, with what it got wrong |
+| Know what is still broken | [`outstanding-issues.md`](outstanding-issues.md) — eight open items, including which experiments on them are void |
+| Chase the suite flakes, or the WFT admission window | [`wft-double-dispatch-flake-handoff.md`](wft-double-dispatch-flake-handoff.md) — three passes of investigation; the conclusions at the top supersede the archive below them |
 
 ## Specs — one subsystem per file
 
@@ -46,6 +48,10 @@ narrative, and where an alternative was considered and rejected the reasoning is
 - [`verification-hazards.md`](verification-hazards.md) — three ways a test result here can be
   confidently wrong: two that produced a written defect report against correct code, and one that
   lets a required-test gate pass while checking nothing.
+- [`outstanding-issues.md`](outstanding-issues.md) and
+  [`wft-double-dispatch-flake-handoff.md`](wft-double-dispatch-flake-handoff.md) — open defects and
+  the investigations behind them. Records, not design: they carry line numbers and dates, and they
+  say which of their own experiments turned out to be invalid.
 
 ## Conventions these documents hold to
 
