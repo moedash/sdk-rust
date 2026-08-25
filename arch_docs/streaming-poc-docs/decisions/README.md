@@ -32,7 +32,6 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [021](ADR-021-delivery-is-broadcast.md) | Delivery to multiple subscriptions is broadcast, not work-sharing | `spec/wft-lifecycle.md` |
 | [022](ADR-022-continue-as-new-cursor-in-a-reserved-header.md) | The Continue-As-New cursor travels in a reserved internal header | `spec/annotation-format.md` |
 | [023](ADR-023-park-generation-zero-is-the-unparked-wake.md) | `park_generation = 0` is the unparked wake | `spec/wake-signal.md` |
-| [024](ADR-024-milestone-0-is-throwaway.md) | Milestone 0 is a throwaway spike that exports no public API | — |
 | [025](ADR-025-wake-signal-bypasses-the-data-converter.md) | The wake Signal bypasses the user's `DataConverter` | `spec/wake-signal.md` |
 | [026](ADR-026-delivery-is-bounded-by-a-record-count.md) | Delivery within one activation is bounded by a record count, not by time | `spec/python-runtime.md` |
 | [027](ADR-027-a-late-binding-rides-its-own-frame.md) | A subscription created after the header is bound by its own frame | `spec/annotation-format.md` |
@@ -50,6 +49,8 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [039](ADR-039-the-continuation-carries-the-binding-and-it-is-must-understand.md) | The continuation carries the whole binding, and it is must-understand | `spec/annotation-format.md` |
 | [040](ADR-040-a-fence-is-ordered-behind-data-writes-only.md) | A fence is ordered behind data writes, and behind nothing else | `spec/backend-contract.md` |
 | [041](ADR-041-a-reported-task-keeps-the-readiness-promise.md) | A task on its way to the server keeps the readiness promise it made | `spec/core-lang-protocol.md` |
+| [042](ADR-042-one-run-has-one-outstanding-wake-cycle.md) | One Run has one outstanding wake cycle | `spec/wake-signal.md` |
+| [043](ADR-043-a-second-workflow-task-is-buffered.md) | A second Workflow Task is buffered, never substituted | `spec/wft-lifecycle.md` |
 
 ## The decisions that constrain the most
 
@@ -60,3 +61,7 @@ If you read only a few, read these — the rest of the design leans on them:
 - **ADR-011** (no I/O on the Workflow thread) is a hard property of the Python Worker, not a
   preference.
 - **ADR-002** (cursor as boundary) is the shape every provider operation is built around.
+- **ADR-042** (one outstanding wake cycle per Run) is the liveness and deduplication boundary for
+  every readiness result that Core cannot accept locally.
+- **ADR-043** (buffer a second Workflow Task) is the task-token ownership invariant at Core
+  admission.

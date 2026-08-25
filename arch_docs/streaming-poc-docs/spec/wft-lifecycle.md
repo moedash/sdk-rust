@@ -43,6 +43,18 @@ local activities already have this property, but a stream can hold a task open f
 latency for those inputs is bounded by the rollover deadline and nothing else, so callers who need
 lower latency must lower the Workflow Task timeout rather than the idle timeout.
 
+## Workflow Task admission is lossless
+
+A Run owns the task token of its current Workflow Task until that task is reported. A polled
+replacement can arrive before the local completion message clears the original even when no
+activation jobs remain, because poll results and local completions use different input lanes.
+
+Admission therefore buffers whenever `ManagedRun` already owns a Workflow Task; pending jobs are
+not the only evidence of outstanding work. The lower-level `_incoming_wft` invariant remains a debug
+panic, while its release path defensively queues the replacement and returns without overwriting the
+original slot. The original token is reported first, and only then does the replacement drain
+(ADR-043). Substitution is never recovery: it loses the token for a task the Worker still owns.
+
 ## Two independent questions at every activation return
 
 1. **Did replay-visible stream state change?** If yes, a `WorkflowStreamProgress` command carries the
@@ -467,3 +479,12 @@ repeated Workflow Task and no record is lost. Spurious wakeups and empty Workflo
 correctness-wise, which is what makes stale readiness and stale wake Signals safe to ignore rather
 than something to resolve exactly. Backend unavailability, retention loss, and integrity violations
 must surface distinctly — see `failure-taxonomy.md`.
+
+### A wake can race a terminal command
+
+A wake Signal may enter History while the Workflow Task is issuing its terminal command. The server
+can reject that task with `UnhandledCommand` so the external event is not lost, then schedule replay.
+That retry is a normal Temporal ordering outcome: the Workflow may execute again and still complete
+with the same stream observations. Tests for terminal wake races therefore allow
+`UnhandledCommand` specifically, reject every other Workflow Task failure cause, and compare the
+observations of every execution rather than requiring an exact workflow-body start count.
