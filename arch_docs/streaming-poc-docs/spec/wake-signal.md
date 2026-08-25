@@ -101,6 +101,28 @@ harmless. Python rechecks **every** active stream rather than only the stream na
 **Core suppresses the Signal from user handlers whether or not it validates**, so an unknown envelope
 version or a stale generation can never reach Workflow code as an unhandled Signal.
 
+## One outstanding wake cycle per Run
+
+When the Worker receives `Parked`, `NoOpenWorkflowTask`, or `RunNotFound`, it owes a Signal because
+Core could not accept the buffered readiness locally. That obligation is **Run-wide**, not per wait:
+one Workflow Task can resolve the complete wait set, so concurrent waits and a replayed copy of the
+same wait coalesce behind one outstanding cycle (ADR-042).
+
+Signal acknowledgement is not the end of the cycle. It proves the wake entered History, but the
+Workflow Task it creates can still fail, be rejected, or replay. The cycle closes only after Core
+accepts a successful completion for an activation that began during the acknowledged Signal attempt.
+Each retry moves the activation boundary to its own start, so a completion observed during a failed
+attempt cannot be inherited by the later successful retry.
+
+While the cycle is open, reconstructed readiness sends no distinct follow-up wake. After a
+nonterminal completion, buffered readiness is reported again and may open a new cycle with a new wake
+counter. A terminal completion never rearms delivery. Retiring a stale park intent first invalidates
+the cycle whose generation it silenced, then performs the unparked reannouncement that makes the
+buffer visible again.
+
+`BUSY_WORKFLOW` remains retryable. Treating it as terminal, or imposing a blind retry cap, can leave
+a durable record buffered after its watcher advanced past the only report that announced it.
+
 ## Producer send sequence
 
 1. Append the record.

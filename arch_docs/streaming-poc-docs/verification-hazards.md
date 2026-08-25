@@ -1,16 +1,11 @@
 # Verification hazards
 
-Three ways a test result in this repository can be confidently wrong. Each was hit during
-implementation, and each is cheap to check for once you know it exists.
+Seven ways a test result in this repository can be confidently wrong. Each is a current constraint
+on trustworthy validation and is cheap to check once it is named.
 
-The first two share a shape worth naming: **the apparatus was broken, not the code**. A failing test
-is evidence about the system *plus* the harness, and when the harness is wrong the failure still
-looks exactly like a real bug — with a plausible mechanism, a reproducible symptom, and a stack trace
-pointing at real code. Both produced a written defect report against code that turned out to be
-correct.
-
-The third is the inverse and is the more dangerous direction: a gate that **passes** while checking
-nothing.
+A result is evidence about the system *plus* its harness. Broken apparatus can produce a plausible,
+repeatable failure against correct code; a gate that never armed its case can produce a clean pass
+while checking nothing.
 
 ## 1. A stale native extension
 
@@ -127,17 +122,81 @@ is a cheap way to see what the pointer will arm before committing to it.
 **When to check.** Whenever a required-test list and its mapping are edited — which is every fix
 that adds a case.
 
+## 4. A pytest-rewritten module imported into the Workflow sandbox
+
+**Symptom.** Worker construction fails intermittently during Workflow validation with a `KeyError`
+inside CPython module-lock bookkeeping. It is more likely in a concurrent or complete suite than in
+the focused test and occurs before the Core worker exists.
+
+**Why it happens.** A Workflow defined in a test module is re-imported by the sandbox. If pytest's
+assertion rewriter transformed that module, the sandbox import also pulls `_pytest` implementation
+modules and their process-global import machinery into a path whose isolation assumptions they do
+not satisfy. The stack points at real sandbox and import-lock code, but the product behavior the test
+intended to exercise has not started.
+
+**The fix.** A test module that defines sandboxed Workflows and constructs a `Worker` or `Replayer`
+declares `PYTEST_DONT_REWRITE` in its module docstring, or moves the Workflow into a helper pytest
+does not rewrite. A Workflow may instead be unsandboxed only when the test is not about sandbox
+behavior. Do not diagnose a general sandbox defect from the pytest-specific path.
+
+## 5. Rejecting every Workflow Task failure in a terminal-race test
+
+**Symptom.** The Workflow returns the expected stream observations, yet a History assertion fails
+because one Workflow Task was rejected with `UnhandledCommand`; replay may also add another
+workflow-body execution.
+
+**Why it happens.** A wake Signal can race the terminal command. Temporal rejects the task so it can
+preserve the external event, then replays. This is the lifecycle described in
+`spec/wft-lifecycle.md`, not evidence that stream replay failed.
+
+**The fix.** Tests that deliberately create this race permit `UnhandledCommand` specifically while
+rejecting every other cause. They compare every execution's observations with the live result and do
+not require an exact body-start count. Tests that do not create the race should retain stricter
+assertions.
+
+## 6. A controlled experiment that never observes its control stimulus
+
+**Symptom.** A fault-injection or wake-suppression variant changes the failure rate dramatically, but
+its counters show that the event it was meant to isolate never reached the gate. The apparatus may
+have intercepted the legitimate delivery wake or changed scheduling before the target condition.
+
+**The check.** Assert that the original stimulus reached the server or the exact production boundary
+before accepting any experimental run. Count original inputs separately from follow-ups. Apply the
+same tracing to control and treatment; instrumentation on only one side makes scheduling part of the
+comparison. On timeout, retain History and correlated runtime state before cleanup, and use long
+tracebacks so the first failure is not reduced to a one-line table.
+
+**The rule.** A treatment that did not observe its control stimulus is void, no matter how stable its
+result looks.
+
+## 7. Worker tasks that outlive their test
+
+**Symptom.** A later test reports pending-task destruction, shutdown warnings, or scheduling-sensitive
+failures whose originating Worker was constructed by an earlier case.
+
+**Why it happens.** Constructing a `Worker` creates a real Core worker and integration fixtures often
+start worker and shutdown coroutines separately. Dropping the Python objects does not make those
+lifetimes orderly.
+
+**The fix.** Successful constructor tests use `async with Worker(...)`. Fixtures retain every worker
+and shutdown task and await them during teardown. Constructor-failure tests remain direct because no
+Worker exists to close when validation raises.
+
 ## Before reporting a defect found by a test
 
 1. Confirm the binary under test is the one you built (hazard 1).
 2. Confirm the test's own setup succeeded — an exception in a producer or fixture can present as a
    hang in the system under test (hazard 2).
-3. Reproduce at the smallest layer that shows it. If a Core-level test cannot reproduce what an
+3. Confirm required-test lists and their mappings come from the same submodule revision (hazard 3).
+4. Keep pytest rewriting and leaked Worker lifetimes out of Workflow tests (hazards 4 and 7).
+5. Classify `UnhandledCommand` against the event race the test created (hazard 5).
+6. Prove a controlled experiment observed its control stimulus (hazard 6).
+7. Reproduce at the smallest layer that shows it. If a Core-level test cannot reproduce what an
    end-to-end test shows, suspect the apparatus before concluding the layers disagree.
-4. Mutation-test the claim: break the code path you believe is at fault and confirm *that* test
+8. Mutation-test the claim: break the code path you believe is at fault and confirm *that* test
    fails. If nothing fails, the test was not covering what you thought — and if the test already
    passes without the mechanism, the defect is not where you think it is.
 
-Step 4 is the one that also covers hazard 3, and it is worth stating the general form: **a green
+The last step also covers hazard 3, and it is worth stating the general form: **a green
 result is a claim about what ran, and nothing checks that for you.** Before reading a pass as
 coverage, make the covering mechanism fail once.

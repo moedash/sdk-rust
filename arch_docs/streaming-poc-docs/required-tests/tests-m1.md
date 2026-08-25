@@ -146,11 +146,11 @@ gate checks that the two agree.
 - A trimmed range (Redis `XTRIM`/`MAXLEN` removing the head of a recorded range) and a deleted
   write fence both fail as `StreamIntegrityError`, distinctly from an unreachable backend.
 
-## Boundaries an implementation review found unprotected
+## Additional protected boundaries
 
 New cases are appended here rather than filed under the sections they belong to, because the gate
 maps cases by position: inserting one renumbers every case after it and silently repoints every
-mapping. Each of these covers an invariant that was stated in a spec and held by nothing.
+mapping.
 
 - The first live drain after a replay sees only records past the marker's boundary **with no
   event-loop turn in between**: the reposition has to have happened by the time the replay returns,

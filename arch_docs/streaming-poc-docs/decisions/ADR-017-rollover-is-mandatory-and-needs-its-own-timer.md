@@ -19,7 +19,7 @@ and make the local-activity heartbeat one caller of it.
 
 ## Decision
 
-**C**, in the first slice that retains Workflow Tasks at all — including the Milestone 0 spike.
+**C**, from the first Workflow Task retained for external-stream delivery.
 
 **Why A is not available.** A stream whose inter-record gaps stay under the idle timeout never reaches
 the idle parking path, so the retained Workflow Task runs until the server's Workflow Task timeout
@@ -52,7 +52,7 @@ out.
   so Signals, Updates, and non-legacy Queries queue until it completes. Retention latency for those
   inputs is bounded by the rollover deadline and nothing else; callers needing lower latency must
   lower the Workflow Task timeout, not the idle timeout.
-- C13 is on the critical path for anything that retains a Workflow Task, and a test must exercise a
-  Worker with `enable_local_activities = false`.
-- Rollover splits into C12a (transport, no marker — usable in the spike) and C12b (finalization and
-  marker emission).
+- The sink-independent timer is required for anything that retains a Workflow Task, and a test must
+  exercise a Worker with `enable_local_activities = false`.
+- Rollover transport and marker finalization remain separate responsibilities so Core can request a
+  replacement task without writing an annotation until Python supplies its terminal boundary.

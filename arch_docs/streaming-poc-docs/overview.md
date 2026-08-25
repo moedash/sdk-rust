@@ -26,6 +26,11 @@ replay local-activity results come from the marker — so payloads would have to
 defeating the feature's entire purpose. `ReplayExternalStreams` is precisely the hook that does not
 exist today.
 
+Live consumption and deterministic replay are one indivisible capability. The SDK exposes no
+live-only mode that reads external records without recording their cursor boundaries: a Workflow
+Task retry, eviction, or Worker restart would otherwise have no durable position from which to
+distinguish a record already observed from one not yet delivered.
+
 ## Scope and lifetime
 
 - A stream is identified by the tuple `(namespace, workflow ID, first execution Run ID, stream
