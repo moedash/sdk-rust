@@ -37,7 +37,10 @@ its `int` offset surface is incompatible with opaque provider offsets even for t
 overlap.
 
 C stays open as future work but is explicitly not a dependency of this design — it requires solving
-the dense-integer-offset mapping.
+the dense-integer-offset mapping. A distinct extension of External Workflow Streams with
+Workflow-originated output and opaque client cursors is described in the
+[output-stream proposal](../proposals/workflow-originated-external-streams.md); it does not alter
+this decision until accepted and incorporated into the specification.
 
 ## Consequences
 

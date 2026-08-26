@@ -42,6 +42,9 @@ distinguish a record already observed from one not yet delivered.
   (ADR-022, ADR-039).
 - A stream remains open across producer calls and producer failures. Independent stream
   identities and lifecycles are future work.
+- Workflow-originated, client-consumed output is not part of this accepted design. A complementary
+  direction is described separately as a
+  [proposal](proposals/workflow-originated-external-streams.md).
 
 ## API sketch
 
