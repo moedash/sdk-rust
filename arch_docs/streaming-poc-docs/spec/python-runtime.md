@@ -12,15 +12,15 @@ which real network I/O cannot be awaited at all. **Any design in which `_apply` 
 wrong by construction, not merely slow.**
 
 Everything below follows from it. The subscription manager lives outside the sandbox on the Worker's
-own asyncio loop and owns every backend connection and watcher task; the Workflow thread only pops
+own asyncio loop and owns the backend connection and every watcher task; the Workflow thread only pops
 from a bounded per-subscription buffer; readiness is reported to Core **only after** a record is
 buffered, which is what makes the activation it produces guaranteed non-blocking; and the activation
 jobs that need backend work are answered before `activate()` is ever called. A backend slower than
 the deadlock timeout therefore delays readiness rather than failing an activation.
 
 Only an opaque handle crosses the sandbox boundary — the manager module is registered for sandbox
-passthrough, and no provider instance is reachable from Workflow code, which names a backend
-registered on the Worker and nothing else.
+passthrough, and no provider instance is reachable from Workflow code. Every topic uses the one
+backend configured on the Worker.
 
 ## Decoding is split across the boundary
 

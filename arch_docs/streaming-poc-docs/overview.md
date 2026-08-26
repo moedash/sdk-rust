@@ -47,13 +47,13 @@ distinguish a record already observed from one not yet delivered.
 
 The consumer-side and producer-side handles are **distinct types**. They are not the same object
 passed across a process boundary: a Workflow handle is bound to the running Workflow's identity
-and the Worker's backend registry, while a producer handle must be constructed explicitly from
+and the Worker's configured backend, while a producer handle must be constructed explicitly from
 credentials the producer holds (ADR-019).
 
 ```python
 # Workflow (consumer side)
 streams = external_stream.with_options(idle_timeout=timedelta(seconds=1))
-tokens = streams.topic("tokens", backend="tokens-redis", type=str)
+tokens = streams.topic("tokens", type=str)
 
 async for token in tokens.subscribe():
     process(token)
@@ -62,8 +62,7 @@ async for token in tokens.subscribe():
 ```python
 # Activity or plain external process (producer side)
 producer = await ExternalStreamProducer.connect(
-    backend="tokens-redis",           # name registered on the Worker, or an explicit
-                                      # provider instance for non-Temporal processes
+    backend=RedisStreamBackend(url=..., credentials=...),
     workflow=WorkflowChainKey(        # fully explicit; nothing is inferred
         namespace=...,
         workflow_id=...,
@@ -92,32 +91,18 @@ async for source, item in streams.merge(tokens, tool_events):
 
 ### Worker configuration
 
-Named stream backends are registered on the Worker, alongside the existing plugin and interceptor
-options, so Workflow code names a backend rather than holding a connection:
+One stream backend is configured on the Worker, alongside the existing plugin and interceptor
+options. Workflow code never holds the connection or chooses among backend instances:
 
 ```python
 Worker(
     ...,
-    external_stream_backends={"tokens-redis": RedisStreamBackend(url=..., credentials=...)},
+    external_stream_backend=RedisStreamBackend(url=..., credentials=...),
 )
 ```
 
-Backend instances live outside the Workflow sandbox. Workflow code may only name them.
-
-One further option exists, and it is a rollout control rather than a feature switch:
-
-```python
-Worker(
-    ...,
-    external_stream_continuation_schema_version=2,  # unset = the release's shipped stage
-)
-```
-
-It selects the schema version this Worker *writes* into a Continue-As-New cursor header, which is
-read by the successor Run's Worker and so must be a version that Worker can decode. Left unset it
-takes the stage the release ships in. Raising it is the writer half of the two-stage rollout ADR-039
-describes; it cannot be raised past what this Worker can itself read, and Worker construction fails
-rather than the first Continue-As-New if it is.
+The backend instance lives outside the Workflow sandbox. The feature is unreleased, so its
+annotation and continuation encodings have one current format and no legacy compatibility mode.
 
 ## Naming
 

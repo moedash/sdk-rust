@@ -5,7 +5,7 @@
 ## Context
 
 The annotation opens with a header frame carrying one binding per subscription — stream key, start
-cursor, backend name, and the provider identity recorded for it. The header goes to Core in the
+cursor, and the configured provider identity. The header goes to Core in the
 first observation delta of a Workflow Task.
 
 `subscribe()` is ordinary Workflow code, and a retained Workflow Task spans many activations, so a
@@ -13,7 +13,7 @@ subscription can be created after that delta has already been sent. Core appends
 to a byte buffer and never rewrites what it holds, so the header it already has cannot be amended.
 
 A wait with no binding still produces runs and a terminal entry, and replay then reads a `wait_id`
-with no stream key, no backend, and no start cursor — reported as a wait "the Workflow did not
+with no stream key and no start cursor — reported as a wait "the Workflow did not
 create", against code that never changed.
 
 ## Options
@@ -45,11 +45,7 @@ flat table and never asks when a wait joined.
 
 ## Consequences
 
-- `SCHEMA_VERSION` stays at **2**. The frame is purely additive: every annotation written before it
-  decodes byte-identically, the grammar is self-describing through its frame tags, and a decoder
-  that does not know the tag fails loudly on it rather than misreading the bytes that follow. A
-  version exists to tell a reader what it is looking at; here the tags already do, and nothing needs
-  to assume that version 2 implies no bindings frame.
+- `SCHEMA_VERSION` is **1**, the only format for this unreleased feature. There is no legacy decoder.
 - A wait is bound **exactly once** per annotation. A second binding for one `wait_id`, or any
   binding after the terminal, is a decode failure — replay must not choose between two stream keys,
   since the one it chose could be the one the records were not written to.

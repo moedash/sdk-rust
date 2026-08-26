@@ -37,8 +37,8 @@ A producer needs five things, none of which it can infer:
 - **The Workflow chain key**, including `first_execution_run_id`, verified by describing the Workflow
   before the first append. Publishing under an unverified key is a configuration error, not a silent
   no-op.
-- **A backend connection.** Workers register named backends; a plain process constructs a provider
-  directly.
+- **A backend connection.** A Worker has one configured backend; a plain process constructs a
+  provider directly.
 - **A Temporal client**, for the wake Signal.
 - **The same `DataConverter`** the consuming Workflow uses, including any codec (ADR-015).
 - **A stable producer session ID and sequence**, which is what makes append idempotent under Activity
