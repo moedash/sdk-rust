@@ -35,17 +35,17 @@ Row three is separated from row two because a converter mismatch is a configurat
 never damaged (ADR-015).
 
 Row four covers every way a marker and the code replaying it disagree about the wait set: a wait the
-marker bound that the Workflow no longer creates, a wait whose recorded stream or backend is not the
-one the code now subscribes, a recorded delivery the replay never took, and a stream or backend name
-that disagrees with what the predecessor Run committed for that `wait_id` across a Continue-As-New.
+marker bound that the Workflow no longer creates, a wait whose recorded stream is not the one the
+code now subscribes, a recorded delivery the replay never took, and a stream name that disagrees
+with what the predecessor Run committed for that `wait_id` across a Continue-As-New.
 What is *not* row four is a subscription the annotation has no binding for: replay runs the Workflow
 past the Workflow Task the marker covers, so that is the ordinary case rather than a disagreement
 (`annotation-format.md`). Core-side, a marker found by lookahead with no matching state machine is
 handled as local activities already handle that case.
 
-Nor is the *provider* half of either comparison row four. A backend name that still resolves, mapped
-to another implementation or another format version, leaves the Workflow unchanged and both stores
-undamaged, so it is row one — retried, and cleared by a Worker carrying the recorded implementation.
+Nor is the provider half of either comparison row four. Configuring another implementation or
+another format version leaves the Workflow unchanged and both stores undamaged, so it is row one —
+retried, and cleared by a Worker carrying the recorded implementation.
 That split is the same one whether the recorded binding came from a marker or from a Continue-As-New
 header, because it is a claim about what the deployment registered rather than about what the
 Workflow asked for (`annotation-format.md`).

@@ -187,8 +187,8 @@ A producer needs five things, none of which it can infer (ADR-019):
   whatever channel a non-Temporal producer already uses — and the producer verifies it by
   describing the Workflow before its first append. Publishing under an unverified key is a
   configuration error, not a silent no-op.
-- **A backend connection.** Workers register named backends; a plain process constructs a provider
-  directly.
+- **A backend connection.** A Worker has one configured backend; a plain process constructs a
+  provider directly.
 - **A Temporal client**, for the wake Signal.
 - **The same `DataConverter`** the consuming Workflow uses, including any codec, **bound to the
   same serialization context** — which the producer derives from the chain key it was given, so it

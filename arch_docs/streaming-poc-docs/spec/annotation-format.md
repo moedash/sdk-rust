@@ -74,15 +74,15 @@ during a retained Workflow Task are buffered until the task completes, in both d
 
 ## Schema
 
-The annotation is a versioned binary encoding. `schema_version` leads, so markers written by older
-SDK versions stay readable.
+The annotation is a versioned binary encoding. `schema_version` leads so an incompatible format is
+rejected explicitly. This unreleased feature has one current format and no legacy decoder.
 
 ```text
 annotation := header, (bindings | segment)*, terminal
 
 header   := schema_version, streams[]     // wait_id -> binding
 bindings := streams[]                     // the same, for waits bound after the header
-binding  := (stream_key, start_cursor, backend_name, provider_id, provider_format_version)
+binding  := (stream_key, start_cursor, provider_id, provider_format_version)
 
 segment := run*, segment_end_reason
 run     := (wait_id, first_offset, last_offset, count, control_positions)
@@ -93,18 +93,11 @@ terminal := blocked_snapshot[]            // wait_id -> cursor boundary: BEGINNI
 
 ### Bindings are per wait
 
-A binding names the Worker-registered backend the Workflow's own `topic(backend=...)` chose, and
-carries the provider identity of whatever is registered under that name. One label for the whole
-annotation cannot say which of two registered backends owns a given wait, and two instances of one
-provider — two Redis clusters, two key prefixes — declare the same provider id, so a label does not
-distinguish those either: replay would read a wait's recorded range out of a store that never held
-it.
-
-Which half of a binding disagrees decides how the disagreement is reported. `stream_key` and
-`backend_name` are Workflow code's choice, so a mismatch is row four of `failure-taxonomy.md` —
-nondeterminism, fixed by versioning the Workflow. `provider_id` and `provider_format_version`
-describe whatever the Worker registered under that name, so a mismatch there is a deployment
-problem, with the Workflow unchanged and the backend undamaged.
+A binding carries the stream identity chosen by Workflow code and the identity and format version
+of the backend configured on the Worker. A stream-name mismatch is row four of
+`failure-taxonomy.md` — nondeterminism, fixed by versioning the Workflow. A `provider_id` or
+`provider_format_version` mismatch is a deployment problem, with the Workflow unchanged and the
+store not necessarily damaged.
 
 ### A wait bound after the header
 
@@ -191,8 +184,8 @@ report row four of `failure-taxonomy.md` — nondeterminism — rather than inte
 recorded ranges are exactly where they were written and it is the Workflow that moved.
 
 1. **Each recorded wait's binding**, when that wait is registered, and again when a marker is
-   replayed onto subscriptions that already exist. The comparison is the stream *name* and the
-   backend name, which are the two halves of a binding that Workflow code chose.
+   replayed onto subscriptions that already exist. The Workflow-code comparison is the stream
+   *name*.
 2. **Every recorded delivery was taken.** A replay that reaches the end of the last segment still
    holding one is running code that consumed less than History says it consumed.
 3. **Every bound wait was recreated**, checked once after the last segment as `bound ⊆ registered`
@@ -243,8 +236,8 @@ matching each marker to its Workflow Task rather than concatenating blindly.
 
 A high-water mark is a *fraction* of the budget, and it becomes true only once a frame that crossed it
 has been emitted. Frames are indivisible, and three of the four have no length this side chooses: a
-binding carries the namespace, Workflow ID, first-execution Run ID, stream name, backend name, and
-provider id; a run carries two provider-supplied offset strings. Any of them can be larger than the
+binding carries the namespace, Workflow ID, first-execution Run ID, stream name, and provider id; a
+run carries two provider-supplied offset strings. Any of them can be larger than the
 slack a fractional mark leaves, and the batch a frame records cannot be moved to the next annotation —
 its deliveries happened in *this* Workflow Task, and that task's marker is where replay has to find
 them. So "roll over at 75%" is a policy, not a guarantee, and three further rules are what make the
@@ -375,7 +368,7 @@ case, including the case where the stream was empty for the subscription's entir
 ### The continuation header carries the whole binding
 
 Keyed by `wait_id`, and carrying per wait what a binding above carries: the cursor, the stream name,
-the backend name, and the provider identity — `provider_id` and `provider_format_version`. The cursor
+and the provider identity — `provider_id` and `provider_format_version`. The cursor
 alone cannot say *what it is a position in*, and an offset means nothing outside the store that
 produced it, so a successor that resumed on the wait number alone would hand a predecessor's offset
 to a store that never held those records — which the backend accepts, and which skips everything
@@ -389,17 +382,14 @@ Which half disagrees decides how it is reported, and it is the same split the bi
 
 | Disagreement | Reported as |
 |---|---|
-| Stream name, or backend name | Row four of `failure-taxonomy.md` — Workflow code moved |
-| `provider_id`, or `provider_format_version` | Row one — a deployment mapped the name elsewhere |
+| Stream name | Row four of `failure-taxonomy.md` — Workflow code moved |
+| `provider_id`, or `provider_format_version` | Row one — the configured backend changed |
 
 Both are raised where the subscription is registered, before the cursor reaches the manager, so no
 backend ever reads at a boundary that was not produced against it.
 
-**A recorded format version is compared by presence, not by truthiness.** Nothing in the provider
-contract reserves zero, so it is a version a provider may declare and the encoding represents it
-exactly; treating it as a "nothing was recorded" sentinel skipped the comparison for that one value
-and made Continue-As-New less safe than replay for the identical binding. A header that recorded no
-version has no entry at all, and that is what skips the check.
+**A recorded format version is compared exactly, including zero.** Nothing in the provider contract
+reserves a sentinel value.
 
 ### The continuation is snapshotted where no Workflow code can still run
 
@@ -423,40 +413,13 @@ header at the later boundary cannot disagree with a History written at the earli
 successor resumes from is the copy in its own `WorkflowExecutionStarted`, which is durable and which
 replaying the predecessor does not rewrite.
 
-### The binding is must-understand, and the schema version is what enforces it
+### The continuation format is must-understand
 
-The header's reader is the **successor's** Worker, which is what makes its wire compatibility a
-different problem from the annotation's. An annotation is written and read by one deploy's Workers;
-this header is written by one Run and read by the next Run's Worker, and on an unversioned task queue
-that can be an *older* one. It is read while the successor's runtime is built, before any Workflow
-code runs.
-
-**A Worker that cannot validate the binding must not start the Run**, and a schema version it
-refuses is the only thing that makes it one. Nothing about the byte layout can help here: syntactic
-compatibility is not semantic compatibility, and an old Worker that *parses* the header does not
-thereby acquire the check — it runs the restoration it shipped with, compares the stream name, and
-accepts a cursor it cannot vouch for. If its registry resolves that backend name to another store,
-every record below the boundary is skipped in silence, which is the exact failure the binding exists
-to prevent. So the binding is encoded **inline in each entry** rather than appended after the entries
-an older reader consumes: a trailing block is what an unknowing reader steps over, and stepping over
-this is the one thing no reader may do (ADR-039).
-
-What that costs is stated rather than designed away. An old Worker fails the successor's first
-Workflow Task, and every identical retry, until a binding-aware Worker picks it up; a rollback to
-only old Workers blocks that Run until it is rolled forward. That is a blocked Run rather than a
-wrong one, which is the direction ADR-014 and `failure-taxonomy.md` take throughout — an explicit,
-retryable incompatibility in place of possible silent data loss.
-
-Two things follow for anyone changing this:
-
-- **Moving the emitted version is a staged deployment step.** Every Worker must *decode* the new
-  version before any Worker *writes* it, and the version carried on the value rather than fixed in
-  the encoder is what lets a writer be pinned behind its readers while that is arranged. A
-  deployment that cannot tolerate the stall at all needs Worker Versioning or build routing to keep
-  the successor on a binding-aware build — a deployment mechanism, not something the SDK provides.
-- **An older version stays decodable**, and accepting it restores a cursor with the binding checks
-  skipped. That is the same outcome an old Worker reaches and not the same fault: a check that was
-  never recorded cannot be made, while a check that *was* recorded must never be discarded.
+The provider binding is encoded inline in every continuation entry and decoded before Workflow
+code runs. A Worker that cannot validate the binding must not start the successor Run. Because the
+feature is unreleased, the encoder writes one current schema and the decoder accepts exactly that
+schema; there is no legacy reader, writer-stage selector, or compatibility mode. An incompatible
+version fails explicitly instead of restoring a cursor under checks it does not understand.
 
 ## Subscription numbering is a nondeterminism hazard
 
@@ -467,11 +430,11 @@ renumbers every later wait in that Run.
 - Such a change is nondeterministic for Workflows already running against deployed code and must be
   gated behind `workflow.patched()`, exactly as an inserted timer would be.
 - Adding a subscription on a code path a running Workflow has not yet reached is safe.
-- **Detection is by binding, and it is not complete.** A wait whose stream or backend changed is
+- **Detection is by binding, and it is not complete.** A wait whose stream changed is
   reported where it is registered, and a wait the marker bound that the Workflow no longer creates is
   reported at the end of replay — both as row four of the failure table (`failure-taxonomy.md`)
   rather than as a silently different stream result. What no check can see is a change among waits
   whose bindings are *identical*: inserting a `subscribe()` in the middle of several subscriptions to
-  the same stream on the same backend renumbers them without changing any comparison, and an
+  the same stream renumbers them without changing any comparison, and an
   addition at the end is a supported change, so the two are indistinguishable from the annotation.
   That residue is why this is stated as a rule about Workflow code rather than left to a check.
