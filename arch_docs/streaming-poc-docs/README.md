@@ -15,6 +15,7 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | If you want to… | Read |
 |---|---|
 | Understand what the feature is | [`overview.md`](overview.md) |
+| Review proposed complementary stream directions | [`proposals/`](proposals/) |
 | Know why something is shaped the way it is | [`decisions/`](decisions/README.md) |
 | Know what a Workflow Task does from open to marker | [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) |
 | Implement a backend provider | [`spec/backend-contract.md`](spec/backend-contract.md) |
@@ -39,6 +40,9 @@ narrative, and where an alternative was considered and rejected the reasoning is
 
 ## The rest of the set
 
+- [`proposals/`](proposals/) — candidate extensions that are not part of the accepted specification.
+  Each proposal names the unresolved decisions and must become specs plus accepted ADRs before code
+  may claim its behavior.
 - [`decisions/`](decisions/README.md) — 42 current design decisions, each with the alternatives that
   were rejected. A spec states what is true; a decision record states why the other shape was not
   taken.
@@ -49,9 +53,10 @@ narrative, and where an alternative was considered and rejected the reasoning is
   validation, from native-extension freshness and submodule alignment to sandbox isolation and
   controlled fault injection.
 
-This directory intentionally contains only current design, accepted decisions, required behavior,
-and validation constraints. Status reports, review rounds, implementation plans, and investigation
-handoffs are not part of the design set; their durable conclusions belong in the documents above.
+This directory intentionally contains current design, clearly labelled candidate proposals,
+accepted decisions, required behavior, and validation constraints. Status reports, review rounds,
+implementation plans, and investigation handoffs are not part of the design set; their durable
+conclusions belong in the documents above.
 
 ## Conventions these documents hold to
 
