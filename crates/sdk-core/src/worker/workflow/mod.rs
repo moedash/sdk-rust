@@ -86,6 +86,7 @@ use temporalio_common::{
             protocol::v1::Message as ProtocolMessage,
             query::v1::WorkflowQuery,
             sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
+            stream::v1::StreamSlice,
             taskqueue::v1::StickyExecutionAttributes,
             workflowservice::v1::{PollActivityTaskQueueResponse, get_system_info_response},
         },
@@ -989,6 +990,7 @@ struct PreparedWFT {
     query_requests: Vec<QueryWorkflow>,
     update: HistoryUpdate,
     messages: Vec<IncomingProtocolMessage>,
+    stream_slices: Vec<StreamSlice>,
 }
 
 impl PreparedWFT {

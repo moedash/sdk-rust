@@ -42,6 +42,7 @@ use temporalio_common::protos::{
     temporal::api::{
         enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
+        stream::v1::StreamSlice,
     },
 };
 use tokio::sync::oneshot;
@@ -247,7 +248,8 @@ impl ManagedRun {
             if is_incremental {
                 self.metrics.sticky_cache_hit();
             }
-            self.wfm.new_work_from_server(work.update, work.messages)?
+            self.wfm
+                .new_work_from_server(work.update, work.messages, work.stream_slices)?
         } else {
             let r = self.wfm.get_next_activation()?;
             if r.jobs.is_empty() {
@@ -1448,8 +1450,10 @@ impl WorkflowManager {
         &mut self,
         update: HistoryUpdate,
         messages: Vec<IncomingProtocolMessage>,
+        stream_slices: Vec<StreamSlice>,
     ) -> Result<WorkflowActivation> {
-        self.machines.new_work_from_server(update, messages)?;
+        self.machines
+            .new_work_from_server(update, messages, stream_slices)?;
         self.get_next_activation()
     }
 

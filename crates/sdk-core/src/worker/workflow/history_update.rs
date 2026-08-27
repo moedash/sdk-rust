@@ -162,6 +162,7 @@ impl HistoryPaginator {
             query_requests: wft.query_requests,
             update,
             messages: wft.messages,
+            stream_slices: wft.stream_slices,
         };
         Ok((paginator, prepared))
     }
