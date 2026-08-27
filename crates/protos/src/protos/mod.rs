@@ -1374,6 +1374,13 @@ pub mod coresdk {
                                 fin.reason()
                             )
                         }
+                        workflow_activation_job::Variant::DeliverStreamMessages(d) => {
+                            write!(
+                                f,
+                                "DeliverStreamMessages({}, {}..{})",
+                                d.stream_id, d.from_offset, d.to_offset
+                            )
+                        }
                     }
                 }
             }
@@ -1580,6 +1587,23 @@ pub mod coresdk {
                         None => write!(f, "Empty"),
                         Some(v) => write!(f, "{v}"),
                     }
+                }
+            }
+
+            impl Display for SubscribeStream {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "SubscribeStream({})", self.stream_id)
+                }
+            }
+
+            impl Display for AddStreamMessages {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "AddStreamMessages({}, {} messages)",
+                        self.stream_id,
+                        self.messages.len()
+                    )
                 }
             }
 
@@ -2004,6 +2028,12 @@ pub mod temporal {
                                 CommandType::ScheduleActivityTask
                             }
                             Attributes::StartTimerCommandAttributes(_) => CommandType::StartTimer,
+                            Attributes::SubscribeStreamCommandAttributes(_) => {
+                                CommandType::SubscribeStream
+                            }
+                            Attributes::AddStreamMessagesCommandAttributes(_) => {
+                                CommandType::AddStreamMessages
+                            }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
                             }
@@ -2054,6 +2084,28 @@ pub mod temporal {
                     impl Display for command::Attributes {
                         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                             write!(f, "{:?}", self.as_type())
+                        }
+                    }
+
+                    impl From<workflow_commands::AddStreamMessages> for command::Attributes {
+                        fn from(s: workflow_commands::AddStreamMessages) -> Self {
+                            Self::AddStreamMessagesCommandAttributes(
+                                AddStreamMessagesCommandAttributes {
+                                    stream_id: s.stream_id,
+                                    messages: s.messages,
+                                },
+                            )
+                        }
+                    }
+
+                    impl From<workflow_commands::SubscribeStream> for command::Attributes {
+                        fn from(s: workflow_commands::SubscribeStream) -> Self {
+                            Self::SubscribeStreamCommandAttributes(
+                                SubscribeStreamCommandAttributes {
+                                    stream_id: s.stream_id,
+                                    start_offset: s.start_offset,
+                                },
+                            )
                         }
                     }
 
@@ -2516,6 +2568,8 @@ pub mod temporal {
                                 | EventType::TimerStarted
                                 | EventType::UpsertWorkflowSearchAttributes
                                 | EventType::WorkflowPropertiesModified
+                                | EventType::WorkflowStreamSubscribed
+                                | EventType::WorkflowStreamMessagesAdded
                                 | EventType::NexusOperationScheduled
                                 | EventType::NexusOperationCancelRequested
                                 | EventType::WorkflowExecutionCanceled
@@ -2615,6 +2669,10 @@ pub mod temporal {
                             // mark any new event types as ignorable or not.
                             if let Some(a) = self.attributes.as_ref() {
                                 match a {
+                                    Attributes::WorkflowStreamSubscribedEventAttributes(_) => false,
+                                    Attributes::WorkflowStreamMessagesAddedEventAttributes(_) => {
+                                        false
+                                    }
                                     Attributes::WorkflowExecutionStartedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionCompletedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionFailedEventAttributes(_) => false,
@@ -2702,6 +2760,8 @@ pub mod temporal {
                         pub fn event_type(&self) -> EventType {
                             // I just absolutely _love_ this
                             match self {
+                            Attributes::WorkflowStreamSubscribedEventAttributes(_) => { EventType::WorkflowStreamSubscribed }
+                            Attributes::WorkflowStreamMessagesAddedEventAttributes(_) => { EventType::WorkflowStreamMessagesAdded }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
                             Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
                             Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }
@@ -2817,6 +2877,11 @@ pub mod temporal {
         pub mod sdk {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.sdk.v1");
+            }
+        }
+        pub mod stream {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.stream.v1");
             }
         }
         pub mod taskqueue {

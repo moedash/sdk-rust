@@ -26,6 +26,7 @@ use temporalio_common::protos::{
         enums::v1::{EventType, TaskQueueKind, WorkflowTaskFailedCause},
         failure::v1::{CanceledFailureInfo, Failure, failure},
         history::v1::{history_event::Attributes, *},
+        stream::v1::StreamCursor,
         taskqueue::v1::TaskQueue,
         update,
         update::v1::outcome,
@@ -130,6 +131,22 @@ impl TestHistoryBuilder {
             ..Default::default()
         });
         self.previous_task_completed_id = id;
+    }
+
+    /// Add a workflow task completed event recording the stream offsets that
+    /// task consumed. Only the range is in History; the payloads come back from
+    /// the server on the poll response.
+    pub fn add_workflow_task_completed_with_stream_cursors(
+        &mut self,
+        cursors: Vec<StreamCursor>,
+    ) -> i64 {
+        let id = self.add(WorkflowTaskCompletedEventAttributes {
+            scheduled_event_id: self.workflow_task_scheduled_event_id,
+            stream_cursors: cursors,
+            ..Default::default()
+        });
+        self.previous_task_completed_id = id;
+        id
     }
 
     /// Add a workflow task timed out event.

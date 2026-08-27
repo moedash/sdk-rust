@@ -300,9 +300,11 @@ impl ManagedRun {
             if is_incremental {
                 self.metrics.sticky_cache_hit();
             }
-            self.wfm
-                .machines
-                .new_work_from_server(work.update, work.messages)?;
+            self.wfm.machines.new_work_from_server(
+                work.update,
+                work.messages,
+                work.stream_slices,
+            )?;
         }
 
         // A wake Signal reaches Core as a history event, so it can only be classified once that
