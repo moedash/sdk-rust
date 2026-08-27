@@ -175,4 +175,8 @@ enum EventType {
     EVENT_TYPE_WORKFLOW_EXECUTION_UNPAUSED = 59;
     // An event that indicates time skipping advanced time or was disabled automatically after a bound was reached.
     EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED = 60;
+    // A Workflow subscribed to a stream. Once per subscription, not per
+    // message: consumed offsets ride WorkflowTaskCompleted and payloads never
+    // enter History.
+    EVENT_TYPE_WORKFLOW_STREAM_SUBSCRIBED = 61;
 }

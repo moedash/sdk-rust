@@ -1814,6 +1814,8 @@ enum WFCommandVariant {
     ExternalOutputStreamCommit(WorkflowOutputStreamCommit),
     /// External output is buffered in lang and needs a run-scoped flush deadline.
     ExternalOutputStreamBuffered(WorkflowOutputStreamBuffered),
+    SubscribeStream(SubscribeStream),
+    AddStreamMessages(AddStreamMessages),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1822,6 +1824,10 @@ impl TryFrom<WorkflowCommand> for WFCommand {
     fn try_from(c: WorkflowCommand) -> result::Result<Self, Self::Error> {
         let variant = match c.variant.ok_or(EmptyWorkflowCommandErr)? {
             workflow_command::Variant::StartTimer(s) => WFCommandVariant::AddTimer(s),
+            workflow_command::Variant::SubscribeStream(s) => WFCommandVariant::SubscribeStream(s),
+            workflow_command::Variant::AddStreamMessages(s) => {
+                WFCommandVariant::AddStreamMessages(s)
+            }
             workflow_command::Variant::CancelTimer(s) => WFCommandVariant::CancelTimer(s),
             workflow_command::Variant::ScheduleActivity(s) => WFCommandVariant::AddActivity(s),
             workflow_command::Variant::RequestCancelActivity(s) => {
