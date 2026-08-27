@@ -54,7 +54,21 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        SubscribeStream subscribe_stream = 23;
     }
+}
+
+// Subscribe this workflow to a stream, so later Workflow Tasks carry the
+// ranges it has not consumed yet.
+//
+// The stream's addressing is resolved by the server. A workflow cannot look it
+// up without doing I/O, and a value it carried would be a reading rather than a
+// fact, so it could differ on replay.
+message SubscribeStream {
+    string stream_id = 1;
+    // Negative means from wherever the stream is when the subscription is
+    // registered. The server resolves that once and records it.
+    int64 start_offset = 2;
 }
 
 message StartTimer {
