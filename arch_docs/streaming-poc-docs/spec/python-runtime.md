@@ -1,3 +1,11 @@
+---
+doc_id: EWS-SPEC-PYTHON
+status: normative-pre-production
+audience: [implementers, coding-agents, reviewers]
+canonical_for: python-worker-runtime
+related_adrs: [ADR-010, ADR-011, ADR-026, ADR-028, ADR-029, ADR-034, ADR-035, ADR-037]
+---
+
 # Python runtime: the out-of-sandbox manager
 
 How stream I/O happens without ever touching the Workflow thread, and which component owns which

@@ -1,3 +1,11 @@
+---
+doc_id: EWS-SPEC-WFT
+status: normative-pre-production
+audience: [implementers, coding-agents, reviewers]
+canonical_for: workflow-task-lifecycle
+related_adrs: [ADR-004, ADR-009, ADR-016, ADR-017, ADR-021, ADR-030, ADR-031, ADR-032, ADR-043, ADR-045]
+---
+
 # Workflow Task lifecycle
 
 When a Workflow Task is retained, how it ends, and how a subscription is woken in each state it can

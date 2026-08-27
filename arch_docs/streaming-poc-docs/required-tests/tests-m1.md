@@ -1,7 +1,7 @@
-# Milestone 1 required tests — 101 cases
+# Milestone 1 required tests — 102 cases
 
 One stream, end to end. Milestone 2's 17 cases are in `tests-m2.md`; the two partition the
-118 required cases exactly.
+119 required cases exactly.
 
 This list is read at test time, not by a human: `tests/contrib/external_workflow_streams/
 m1_gate.py` parses the count in the heading and every bullet below it, and maps each case
@@ -298,3 +298,5 @@ mapping.
 - A missing staged record or expired deciding History produces integrity failure.
 - Output marker and activation batch budgets are hard bounds, including an oversized topic name
   and a single oversized logical record.
+- The public `external_stream` options default `idle_timeout` to exactly one second, and deriving
+  options with another timeout does not mutate that default.

@@ -1,3 +1,11 @@
+---
+doc_id: EWS-SPEC-WAKE
+status: normative-pre-production
+audience: [implementers, coding-agents, reviewers]
+canonical_for: reserved-wake-signal
+related_adrs: [ADR-023, ADR-025, ADR-036, ADR-038, ADR-042]
+---
+
 # Reserved wake Signal
 
 The server-visible wakeup used whenever no open Workflow Task can accept local readiness. It never
@@ -143,8 +151,8 @@ a round trip, not a wakeup. What the claim is for, and what its lease buys, is i
 `backend-contract.md`.
 
 Wake signaling is independently retryable and idempotent. Retrying the wake step is a producer
-obligation, not an automatic property; `publish()`'s acknowledged-wake contract (P6b) is what turns
-it into one.
+obligation, not an automatic property; `publish()`'s acknowledged-wake contract is what turns it
+into one.
 
 ### The append itself has an acknowledgement window
 

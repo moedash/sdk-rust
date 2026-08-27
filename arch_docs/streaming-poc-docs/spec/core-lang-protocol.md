@@ -1,3 +1,11 @@
+---
+doc_id: EWS-SPEC-PROTOCOL
+status: normative-pre-production
+audience: [implementers, coding-agents, reviewers]
+canonical_for: core-language-protocol
+related_adrs: [ADR-008, ADR-013, ADR-041]
+---
+
 # Core/lang protocol
 
 Every message, call, and piece of Core state the feature adds. Names are internal to the Core
@@ -343,7 +351,7 @@ struct ExternalWaitSet {
 ### Generalizing WFT retention
 
 The per-Run concept is *local work that may retain the Workflow Task*. It generalizes the earlier
-local-activity-only state (C5):
+local-activity-only state:
 
 ```rust
 struct WaitingOnLocalWork {
@@ -396,7 +404,7 @@ marker reproduces the recorded idle boundary.
 
 The idle deadline and the Workflow Task rollover deadline are **separate**. The rollover deadline
 derives from the same `wft_timeout` that drives the existing local-activity heartbeat, but it cannot
-reuse that mechanism — see ADR-017 and C13.
+reuse that mechanism — see ADR-017.
 
 ## Output deadline and park arbitration
 

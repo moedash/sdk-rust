@@ -1,9 +1,19 @@
-# Implemented design — Workflow-originated external output streams
+---
+doc_id: EWS-PROPOSAL-OUTPUT-DESIGN
+status: implemented-promotion-record
+audience: [implementers, coding-agents, design-reviewers]
+normative: false
+---
+
+# Detailed promotion design — Workflow-originated external output streams
 
 **Status:** Implemented as part of External Workflow Streams. The feature as a whole remains
 pre-production. The normative contracts now live in `spec/` and ADR-044 through ADR-048; this
 document retains the end-to-end rationale and API overview. `required-tests/` records remaining
 feature-wide validation coverage explicitly.
+
+For a short decision overview, read
+[`workflow-originated-external-streams-overview.md`](workflow-originated-external-streams-overview.md).
 
 ## Summary
 

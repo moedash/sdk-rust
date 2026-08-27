@@ -1,4 +1,11 @@
-# Future enhancement — Workflow-to-Workflow External Stream Subscriptions
+---
+doc_id: EWS-PROPOSAL-W2W-DESIGN
+status: future-not-implemented
+audience: [implementers, coding-agents, design-reviewers]
+normative: false
+---
+
+# Detailed proposal — Workflow-to-Workflow External Stream Subscriptions
 
 **Status:** Future enhancement; not implemented
 
@@ -6,6 +13,9 @@
 
 **Depends on:** External input streams, Workflow-originated external output streams, and their
 existing replay, output-staging, and wake-signal protocols
+
+For a short decision overview, read
+[`workflow-to-workflow-external-streams-overview.md`](workflow-to-workflow-external-streams-overview.md).
 
 ## Summary
 

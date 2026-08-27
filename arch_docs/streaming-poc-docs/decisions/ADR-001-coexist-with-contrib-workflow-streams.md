@@ -1,6 +1,6 @@
 # ADR-001 — Coexist with `contrib.workflow_streams` rather than replacing it
 
-**Status:** Accepted · **Affects:** P9, P17 · **Spec:** `overview.md`
+**Status:** Accepted · **Affects:** P9, P17 · **Spec:** `spec/public-surface.md`
 
 ## Context
 

@@ -1,3 +1,11 @@
+---
+doc_id: EWS-SPEC-FAILURE
+status: normative-pre-production
+audience: [implementers, coding-agents, reviewers]
+canonical_for: failure-classification-and-operator-response
+related_adrs: [ADR-014, ADR-015]
+---
+
 # Failure taxonomy
 
 Four distinct outcomes, deliberately not collapsed — each has a different operator response.
