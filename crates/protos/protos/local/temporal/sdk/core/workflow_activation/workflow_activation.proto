@@ -108,6 +108,10 @@ message WorkflowActivation {
     // the workflow is Pinned.
     // Experimental.
     bool target_worker_deployment_version_changed = 12;
+    // The event immediately preceding this Workflow Task's WorkflowTaskScheduled event in the
+    // ordered History view Core used to build the activation. Zero means Core could not identify
+    // that exact predecessor, in which case output must not be staged for this task.
+    int64 history_floor_event_id = 13;
 }
 
 message WorkflowActivationJob {
@@ -211,6 +215,8 @@ message ReplayExternalStreams {
     // Opaque to Core.
     bytes replay_annotation = 3;
     coresdk.external_data.ParkReason terminal_boundary = 4;
+    // The output manifest recorded in the same marker, if this Workflow Task published output.
+    coresdk.external_data.ExternalOutputStreamManifest output = 5;
 }
 
 // Issued before Core writes a marker for a boundary Core itself decided and no park handshake

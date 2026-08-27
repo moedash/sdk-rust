@@ -168,6 +168,13 @@ fn verify_marker_matches(
             data.quiescence_generation, state.data.quiescence_generation
         )));
     }
+    if data.output != state.data.output {
+        return TransitionResult::Err(WFMachinesError::Nondeterminism(
+            "External stream marker in history carries a different external output manifest than \
+             the machine expecting it"
+                .to_string(),
+        ));
+    }
     TransitionResult::default()
 }
 
@@ -302,5 +309,56 @@ impl WFMachinesAdapter for ExternalStreamMachine {
             }
             ExternalStreamCommand::AlreadyRecorded => vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temporalio_common::protos::coresdk::external_data::ExternalOutputStreamManifest;
+
+    fn marker_with_stage_token(stage_token: &str) -> ExternalStreamMarkerData {
+        ExternalStreamMarkerData {
+            schema_version: 1,
+            output: Some(ExternalOutputStreamManifest {
+                schema_version: 1,
+                fingerprint_version: 1,
+                stage_token: stage_token.to_string(),
+                history_floor_event_id: 1,
+                run_id: "run-id".to_string(),
+                provider_id: "provider".to_string(),
+                provider_format_version: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_different_output_manifest_is_nondeterministic() {
+        let expected = marker_with_stage_token("expected");
+        let mut state = SharedState {
+            data: expected.clone(),
+        };
+        let actual = marker_with_stage_token("different");
+
+        assert!(matches!(
+            verify_marker_matches(&mut state, &actual),
+            TransitionResult::Err(WFMachinesError::Nondeterminism(message))
+                if message.contains("different external output manifest")
+        ));
+    }
+
+    #[test]
+    fn the_same_output_manifest_matches() {
+        let expected = marker_with_stage_token("expected");
+        let mut state = SharedState {
+            data: expected.clone(),
+        };
+
+        assert!(matches!(
+            verify_marker_matches(&mut state, &expected),
+            TransitionResult::Ok { .. }
+        ));
     }
 }

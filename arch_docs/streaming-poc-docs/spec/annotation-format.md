@@ -5,11 +5,13 @@ parses it.
 
 ## The invariant
 
-Workflow code is deterministic given two things, and only these two need to be reproduced:
+Workflow code is deterministic given three things, and only these three need to be reproduced:
 
 1. The identical ordered sequence of stream-future resolutions delivered to Workflow code.
 2. The identical set of points at which the runtime returned control with no further stream data
    available.
+3. The identical logical output records, topic-local order, and activation segment in which Workflow
+   code published them.
 
 Everything the annotation records exists to reproduce exactly that. A detail that affects neither
 need not be recorded; a detail that affects either must be.
@@ -23,7 +25,8 @@ conditions fire.
 ## Activation segmentation
 
 A retained Workflow Task may span many `ResolveExternalStreamWaits` activations but produces one
-marker. Replay therefore must not collapse them (ADR-018).
+marker. That marker may cover both consumed input and produced output. Replay therefore must not
+collapse the activations or run one event-loop schedule per direction (ADR-018, ADR-046).
 
 Core stays annotation-blind, so segmentation is reproduced inside Python rather than by issuing
 multiple activations. The annotation is divided into **segments**, one per original activation. On
@@ -31,6 +34,10 @@ replay, Core issues a single `ReplayExternalStreams` job, and Python's replay dr
 segments in order, performing one event-loop drain per segment. The live run's *k* activations
 become *k* drains inside one replay activation, so coroutine scheduling and condition evaluation
 match.
+
+The optional output manifest records one per-topic count vector for every segment, including empty
+segments. Those vectors are attached to the same segment schedule as the input runs. Input and
+output therefore share one replay driver and one drain count; their segment counts are never added.
 
 *k*, and not *k + 1*. **The replay driver is not the only thing that drains.** The job lands in the
 non-query job set, so the activation runs one `_run_once` of its own for that set once every job in it
@@ -156,6 +163,37 @@ reached. Recording another wait's position for it names a boundary this subscrip
 - `start_cursor` in a wait's binding makes its initial position explicit rather than re-derived.
 - `ParkReason` is **not** in the terminal. It lives once, in the Core-readable
   `ExternalStreamMarkerData.terminal_boundary` (ADR-008).
+
+## Output manifest and logical identity
+
+Workflow-originated output is represented by the optional
+`ExternalStreamMarkerData.output` manifest. It contains no record payloads or provider offsets. It
+records:
+
+- schema and fingerprint versions;
+- the opaque provider stage token, the producing Run ID, and the exact History event immediately
+  preceding this Workflow Task's `WorkflowTaskScheduled` event;
+- provider ID and provider format version;
+- for each topic, the record count, deterministic logical byte count, SHA-256 logical fingerprint,
+  and whether the batch includes the explicit `FINISH` record; and
+- a per-topic record-count vector for each shared activation segment.
+
+Fingerprint version 1 operates before payload codecs and external-payload storage. A logical record
+frame contains the length-prefixed UTF-8 topic, length-prefixed numeric record kind, metadata-entry
+count, metadata keys sorted by their UTF-8 bytes with length-prefixed keys and values, and
+length-prefixed payload data. The batch digest is SHA-256 over the ordered canonical frames, each
+itself length-prefixed. `logical_byte_count` is the sum of frame lengths, excluding those batch-level
+prefixes (ADR-046).
+
+On replay, Python recreates those logical frames using only the deterministic payload converter and
+validates topic order, kind, count, logical bytes, fingerprint, finished state, and the shared
+segment schedule. It does not mint a token, stage bytes, consult live capacity or latency settings,
+or run a payload codec. A mismatch is nondeterminism.
+
+On a live staging retry, the same token and logical manifest are mandatory even when a randomized
+codec would produce different encoded bytes. The provider's first successfully staged encoded bytes
+remain authoritative. The exact History floor plus stage token is the positive commit proof used by
+lazy reconciliation; no elapsed-time inference can replace it (ADR-044).
 
 ## Replay validation
 
@@ -314,10 +352,19 @@ transition per record and cannot be compressed by range encoding. It produces on
 hits the high-water mark sooner, and rolls over more often. Bounded marker size is bought with
 additional Workflow Tasks.
 
-That is the *only* driver of marker growth, so the budget is not expected to fire at all in the
-single-stream scope of Milestone 1. It is still enforced at encode time rather than assumed, and
-tests assert **encoded byte size** rather than run count — a run-count assertion tells you nothing
-about what a future per-record field would cost.
+The output manifest has its own hard 64 KiB encoded-size bound. Python measures the exact protobuf
+before running a codec, external payload store, or provider operation. A single manifest that cannot
+fit is rejected as `ExternalStreamCapacityError`; topic names or activation-segment metadata must be
+reduced. Output record and logical-byte capacities are also computed from the canonical pre-codec
+frames for the whole retained Workflow Task, never reset per activation. Reaching either requests a
+replacement task; one record larger than the configured logical-byte capacity is rejected before
+external I/O (ADR-046).
+
+For the input annotation, that is the *only* driver of growth, so its budget is not expected to fire
+at all in the single-stream input scope of Milestone 1. It is still enforced at encode time rather
+than assumed, and tests assert **encoded byte size** rather than run count — a run-count assertion
+tells you nothing about what a future per-record field would cost. Output topic and segment metadata
+is bounded independently as described above.
 
 ## Delta accumulation
 
@@ -325,6 +372,11 @@ about what a future per-record field would cost.
 report for the same Workflow Task — the header on the first of them, then whichever bindings and
 segments that activation produced. Core appends each delta to `ExternalWaitSet.replay_annotation`
 and writes the accumulated result as the marker's `replay_annotation`. Core never parses either.
+
+Output uses the same marker rather than a second marker or replay job. The compact output manifest
+is recorded alongside any input annotation when the output batch is staged. Its segment vectors
+describe the shared activation schedule: they align with input segments when input is present and
+supply that schedule themselves for an output-only marker (ADR-046).
 
 ## Replay read path
 
@@ -420,6 +472,21 @@ code runs. A Worker that cannot validate the binding must not start the successo
 feature is unreleased, the encoder writes one current schema and the decoder accepts exactly that
 schema; there is no legacy reader, writer-stage selector, or compatibility mode. An incompatible
 version fails explicitly instead of restoring a cursor under checks it does not understand.
+
+### Finished output topics use a separate must-understand header
+
+Input cursor continuation and output terminal continuation are distinct reserved headers. The output
+header stores its own schema version, provider ID, provider format version, and the sorted set of
+topics whose explicit `FINISH` record committed in the predecessor chain (ADR-048).
+
+The successor decodes and validates that header before Workflow code runs and before any backend
+read. It restores those topics as permanently finished, so a later `publish()` or `finish()` for one
+fails immediately and deterministically. A missing, unsupported, or mismatched header is never
+silently ignored.
+
+Only an explicit Workflow `finish()` or direct producer `finish_writing()` appends `FINISH`.
+Workflow success, failure, cancellation, termination, and Continue-As-New do not synthesize a topic
+terminal.
 
 ## Subscription numbering is a nondeterminism hazard
 

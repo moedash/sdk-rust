@@ -7,10 +7,11 @@
 
 use crate::{
     ExternalStreamReadyResult, ExternalStreamRunStatus, PollError,
-    replay::{TestHistoryBuilder, canned_histories},
+    replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
-        MockPollCfg, ResponseType, WorkerExt, build_fake_worker, build_mock_pollers,
-        hist_to_poll_resp, mock_worker, query_ok, schedule_activity_cmd, start_timer_cmd,
+        MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt, build_fake_worker,
+        build_mock_pollers, hist_to_poll_resp, mock_worker, query_ok, schedule_activity_cmd,
+        start_timer_cmd,
     },
     worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
 };
@@ -25,27 +26,33 @@ use std::{
     time::Duration,
 };
 use temporalio_common::{
-    protos::coresdk::{
-        external_data::{
-            ExternalStreamMarkerData, ParkReason, extract_external_stream_marker_data,
-        },
-        external_stream::{self, WakeSignal},
-        workflow_activation::{WorkflowActivation, workflow_activation_job},
-        workflow_commands::{
-            ActivityCancellationType, CompleteWorkflowExecution, ContinueAsNewWorkflowExecution,
-            ExternalStreamFinalized, ExternalStreamParkResult, ExternalStreamWait,
-            FailWorkflowExecution, ParkSetConfirmed, StreamSetBecameReady, WorkflowStreamProgress,
-            WorkflowStreamQuiescent, external_stream_park_result, workflow_command,
-        },
-        workflow_completion::WorkflowActivationCompletion,
-    },
     protos::{
         constants::EXTERNAL_STREAM_MARKER_NAME,
+        coresdk::{
+            external_data::{
+                ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
+                ExternalOutputTopicManifest, ExternalStreamMarkerData, ParkReason,
+                extract_external_stream_marker_data,
+            },
+            external_stream::{self, WakeSignal},
+            workflow_activation::{WorkflowActivation, workflow_activation_job},
+            workflow_commands::{
+                ActivityCancellationType, CompleteWorkflowExecution,
+                ContinueAsNewWorkflowExecution, ExternalStreamFinalized, ExternalStreamParkResult,
+                ExternalStreamWait, FailWorkflowExecution, ParkSetConfirmed, ScheduleActivity,
+                StreamSetBecameReady, UpdateResponse, WorkflowOutputStreamBuffered,
+                WorkflowOutputStreamCommit, WorkflowStreamProgress, WorkflowStreamQuiescent,
+                external_stream_park_result, update_response::Response as UpdateOutcome,
+                workflow_command,
+            },
+            workflow_completion::WorkflowActivationCompletion,
+        },
         temporal::api::{
             command::v1::command,
             common::v1::Payload,
             enums::v1::{CommandType, EventType},
             query::v1::WorkflowQuery,
+            workflowservice::v1::RespondWorkflowTaskCompletedResponse,
         },
     },
     worker::WorkerTaskTypes,
@@ -3333,6 +3340,986 @@ fn worker_recording_markers(
         w.max_cached_workflows = 1;
     });
     mock_worker(mock)
+}
+
+fn output_manifest(
+    run_id: &str,
+    history_floor_event_id: i64,
+    stage_token: &str,
+) -> ExternalOutputStreamManifest {
+    ExternalOutputStreamManifest {
+        schema_version: 1,
+        fingerprint_version: 1,
+        stage_token: stage_token.to_string(),
+        history_floor_event_id,
+        run_id: run_id.to_string(),
+        topics: vec![ExternalOutputTopicManifest {
+            topic: "results".to_string(),
+            record_count: 2,
+            logical_byte_count: 7,
+            logical_fingerprint: vec![b'f'; 32],
+            finished: false,
+        }],
+        segments: vec![ExternalOutputSegmentManifest {
+            record_counts_by_topic: vec![2],
+        }],
+        provider_id: "test-provider".to_string(),
+        provider_format_version: 1,
+    }
+}
+
+fn output_commit_command(manifest: ExternalOutputStreamManifest) -> workflow_command::Variant {
+    workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit {
+        manifest: Some(manifest),
+        request_rollover: false,
+    })
+}
+
+fn output_capacity_commit_command(
+    manifest: ExternalOutputStreamManifest,
+) -> workflow_command::Variant {
+    workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit {
+        manifest: Some(manifest),
+        request_rollover: true,
+    })
+}
+
+fn output_buffered_command(max_publish_latency: Duration) -> workflow_command::Variant {
+    workflow_command::Variant::WorkflowOutputStreamBuffered(WorkflowOutputStreamBuffered {
+        max_publish_latency: Some(max_publish_latency.try_into().unwrap()),
+    })
+}
+
+fn immediately_parkable_quiescence_command(
+    quiescence_generation: u64,
+    idle_timeout: Duration,
+) -> workflow_command::Variant {
+    workflow_command::Variant::WorkflowStreamQuiescent(WorkflowStreamQuiescent {
+        quiescence_generation,
+        waits: vec![ExternalStreamWait {
+            wait_id: 1,
+            generation: 0,
+            immediately_parkable: true,
+        }],
+        idle_timeout: Some(idle_timeout.try_into().unwrap()),
+    })
+}
+
+fn output_only_marker_history() -> (TestHistoryBuilder, ExternalOutputStreamManifest) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    let manifest = output_manifest(t.get_orig_run_id(), 1, "stage-token");
+    t.add_full_wf_task();
+    t.add_external_stream_marker_data(ExternalStreamMarkerData {
+        schema_version: 1,
+        quiescence_generation: 0,
+        waits: vec![],
+        replay_annotation: vec![],
+        terminal_boundary: ParkReason::CommandsProduced as i32,
+        output: Some(manifest.clone()),
+    });
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    (t, manifest)
+}
+
+fn replay_outputs(activation: &WorkflowActivation) -> Vec<ExternalOutputStreamManifest> {
+    activation
+        .jobs
+        .iter()
+        .filter_map(|job| match &job.variant {
+            Some(workflow_activation_job::Variant::ReplayExternalStreams(replay)) => {
+                replay.output.clone()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn activation_carries_the_exact_history_floor_before_its_scheduled_event() {
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        canned_histories::single_timer("1"),
+        [1, 2],
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    assert_eq!(
+        first.history_floor_event_id, 1,
+        "event 1 immediately precedes the first WorkflowTaskScheduled event"
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+
+    let second = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        second.history_floor_event_id, 6,
+        "TimerFired event 6 immediately precedes the second WorkflowTaskScheduled event; got \
+         {second:?}"
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn exact_output_floor_excludes_the_previous_workflow_task_close() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    let previous_wft_close = history.current_event_id();
+    history.add_we_signaled("deciding-event", vec![]);
+    let exact_floor = history.current_event_id();
+    history.add_workflow_task_scheduled_and_started();
+
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [2], mock_worker_client());
+    mock_cfg.num_expected_fails = 1;
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    let run_id = replayed.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
+        .await
+        .unwrap();
+
+    let producing = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(producing.history_floor_event_id, exact_floor);
+    assert!(
+        producing.history_floor_event_id > previous_wft_close,
+        "the previous Workflow Task close must be below, not inside, the deciding interval"
+    );
+
+    let mut falsely_low = output_manifest(&run_id, previous_wft_close - 1, "false-floor-token");
+    falsely_low.topics[0].logical_fingerprint = vec![b'l'; 32];
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id,
+            output_commit_command(falsely_low),
+        ))
+        .await
+        .unwrap();
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn an_output_only_marker_is_emitted_replayed_and_not_rewritten() {
+    let (history, manifest) = output_only_marker_history();
+    let recorded: Arc<Mutex<Vec<ExternalStreamMarkerData>>> = Default::default();
+    let collected = recorded.clone();
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history.clone(), [1, 2], mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| collected.lock().extend(stream_marker_data(wft)));
+        asserts.then(|_| {});
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        first.history_floor_event_id,
+        manifest.history_floor_event_id
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                output_commit_command(manifest.clone()),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(fired.jobs.iter().any(|job| matches!(
+        job.variant,
+        Some(workflow_activation_job::Variant::FireTimer(_))
+    )));
+    let written = recorded.lock().clone();
+    assert_eq!(written.len(), 1, "an output-only task writes one marker");
+    assert!(written[0].waits.is_empty());
+    assert!(written[0].replay_annotation.is_empty());
+    assert_eq!(written[0].output.as_ref(), Some(&manifest));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            fired.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    let replay_markers: StreamMarkers = Default::default();
+    let worker = worker_recording_markers(replay_markers.clone(), vec![2], history);
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(replay_outputs(&replayed), vec![manifest]);
+    assert_eq!(resolve_hints(&replayed), Vec::<u32>::new());
+    assert_eq!(park_jobs(&replayed), Vec::new());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(fired.jobs.iter().any(|job| matches!(
+        job.variant,
+        Some(workflow_activation_job::Variant::FireTimer(_))
+    )));
+    assert!(
+        replay_markers.lock().is_empty(),
+        "the marker found by replay lookahead must not be written again"
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            fired.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn output_capacity_replacement_enters_lang_instead_of_autocompleting() {
+    // Capacity backpressure blocks the publishing Workflow in lang. Its staged commit has no
+    // server command that could create a job on the forced replacement, so absent a Core-carried
+    // resume intent the replacement is empty and gets autocompleted without ever releasing the
+    // publisher. The replacement must contain exactly one runtime resume job even when there are
+    // no input waits to hint.
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let manifest = output_manifest(history.get_orig_run_id(), 1, "capacity-stage-token");
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(ExternalStreamMarkerData {
+        schema_version: 1,
+        quiescence_generation: 0,
+        waits: vec![],
+        replay_annotation: vec![],
+        terminal_boundary: ParkReason::OutputCapacity as i32,
+        output: Some(manifest.clone()),
+    });
+    history.add_workflow_task_scheduled_and_started();
+
+    let expected = manifest.clone();
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, [1, 2], mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            assert!(
+                wft.force_create_new_workflow_task,
+                "capacity completion must request its replacement"
+            );
+            let markers = stream_marker_data(wft);
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0].terminal_boundary(), ParkReason::OutputCapacity);
+            assert_eq!(markers[0].output.as_ref(), Some(&expected));
+        });
+        asserts.then(|_| {});
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            output_capacity_commit_command(manifest),
+        ))
+        .await
+        .unwrap();
+
+    let replacement = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(replacement.run_id, run_id);
+    assert!(!replacement.is_replaying);
+    assert_eq!(
+        replacement.jobs.len(),
+        1,
+        "the otherwise-empty replacement must produce one lang activation"
+    );
+    let Some(workflow_activation_job::Variant::ResolveExternalStreamWaits(resume)) =
+        &replacement.jobs[0].variant
+    else {
+        panic!("capacity replacement did not carry its runtime resume job: {replacement:?}");
+    };
+    assert!(resume.ready_hints.is_empty());
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id,
+            CompleteWorkflowExecution::default().into(),
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+async fn exercise_speculative_output_redelivery(changed_manifest: bool) {
+    let workflow_id = if changed_manifest {
+        "speculative-changed"
+    } else {
+        "speculative-identical"
+    };
+    let mut base = TestHistoryBuilder::default();
+    base.add_by_type(EventType::WorkflowExecutionStarted);
+    base.add_full_wf_task();
+    base.add_activity_task_scheduled("act1");
+
+    let mut speculative_history = base.clone();
+    speculative_history.add_workflow_task_scheduled_and_started();
+    let update_id = "speculative-update";
+    let mut first_attempt =
+        hist_to_poll_resp(&speculative_history, workflow_id, ResponseType::OneTask(2));
+    first_attempt.add_update_request(update_id, 1);
+    let mut redelivery =
+        hist_to_poll_resp(&speculative_history, workflow_id, ResponseType::OneTask(2));
+    redelivery.add_update_request(update_id, 1);
+
+    let completions: Arc<Mutex<Vec<Vec<ExternalStreamMarkerData>>>> = Default::default();
+    let reset_ids: Arc<Mutex<Vec<i64>>> = Default::default();
+    let recorded = completions.clone();
+    let recorded_resets = reset_ids.clone();
+    let client = mock_worker_client();
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        workflow_id,
+        base,
+        [
+            ResponseType::ToTaskNum(1),
+            first_attempt.into(),
+            redelivery.into(),
+        ],
+        client,
+    );
+    let mut completion_number = 0;
+    mock_cfg.completion_mock_fn = Some(Box::new(move |wft| {
+        completion_number += 1;
+        recorded.lock().push(stream_marker_data(wft));
+        let mut response = RespondWorkflowTaskCompletedResponse::default();
+        if completion_number == 2 {
+            response.reset_history_event_id = 3;
+        }
+        recorded_resets.lock().push(response.reset_history_event_id);
+        Ok(response)
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let initial = worker.poll_workflow_activation().await.unwrap();
+    let run_id = initial.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            ScheduleActivity {
+                activity_id: "act1".to_string(),
+                activity_type: DEFAULT_ACTIVITY_TYPE.to_string(),
+                ..Default::default()
+            }
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let speculative = worker.poll_workflow_activation().await.unwrap();
+    let floor = speculative.history_floor_event_id;
+    let discarded = output_manifest(&run_id, floor, "discarded-stage-token");
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(discarded.clone()),
+                UpdateResponse {
+                    protocol_instance_id: update_id.to_string(),
+                    response: Some(UpdateOutcome::Rejected(Default::default())),
+                }
+                .into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let redelivered = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        redelivered.history_floor_event_id, floor,
+        "redelivery reused event IDs and therefore the same exact floor"
+    );
+    let mut accepted = output_manifest(&run_id, floor, "accepted-stage-token");
+    if changed_manifest {
+        accepted.topics[0].logical_fingerprint = vec![b'g'; 32];
+    }
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![
+                output_commit_command(accepted.clone()),
+                UpdateResponse {
+                    protocol_instance_id: update_id.to_string(),
+                    response: Some(UpdateOutcome::Accepted(())),
+                }
+                .into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    let written = completions.lock();
+    assert_eq!(written.len(), 3);
+    assert!(written[0].is_empty());
+    assert_eq!(written[1].len(), 1);
+    assert_eq!(written[1][0].output.as_ref(), Some(&discarded));
+    assert_eq!(written[2].len(), 1);
+    assert_eq!(written[2][0].output.as_ref(), Some(&accepted));
+    assert_eq!(
+        reset_ids.lock().as_slice(),
+        &[0, 3, 0],
+        "only the first token-bearing completion was discarded; the redelivery was accepted"
+    );
+}
+
+#[tokio::test]
+async fn speculative_output_redelivery_accepts_a_fresh_token_once() {
+    exercise_speculative_output_redelivery(false).await;
+    exercise_speculative_output_redelivery(true).await;
+}
+
+#[tokio::test]
+async fn buffered_output_uses_the_earliest_reported_deadline() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let manifest = output_manifest(history.get_orig_run_id(), 1, "earliest-stage-token");
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(ExternalStreamMarkerData {
+        schema_version: 1,
+        quiescence_generation: 0,
+        waits: vec![],
+        replay_annotation: vec![],
+        terminal_boundary: ParkReason::OutputLatency as i32,
+        output: Some(manifest.clone()),
+    });
+    history.add_workflow_task_scheduled_and_started();
+
+    let recorded: Arc<Mutex<Vec<ExternalStreamMarkerData>>> = Default::default();
+    let forced = Arc::new(AtomicBool::new(false));
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
+    let collected = recorded.clone();
+    let saw_force = forced.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            collected.lock().extend(stream_marker_data(wft));
+            saw_force.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+        });
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                output_buffered_command(Duration::from_millis(400)),
+                output_buffered_command(Duration::from_millis(40)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let flush = tokio::time::timeout(
+        Duration::from_millis(250),
+        worker.poll_workflow_activation(),
+    )
+    .await
+    .expect("the earlier 40ms output deadline must win")
+    .unwrap();
+    assert_eq!(
+        finalization_jobs(&flush),
+        vec![(0, ParkReason::OutputLatency, vec![])]
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![
+                finalized_command(0, b""),
+                output_commit_command(manifest.clone()),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let written = recorded.lock().clone();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].terminal_boundary(), ParkReason::OutputLatency);
+    assert_eq!(written[0].output.as_ref(), Some(&manifest));
+    assert!(forced.load(Ordering::Relaxed));
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn three_output_flush_windows_cost_three_markers_and_workflow_tasks() {
+    const WINDOWS: usize = 3;
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let mut next_floor = history.current_event_id();
+    let mut manifests = Vec::with_capacity(WINDOWS);
+    for window in 0..WINDOWS {
+        let manifest = output_manifest(
+            history.get_orig_run_id(),
+            next_floor,
+            &format!("window-{window}-stage-token"),
+        );
+        history.add_full_wf_task();
+        history.add_external_stream_marker_data(ExternalStreamMarkerData {
+            schema_version: 1,
+            quiescence_generation: (window + 1) as u64,
+            waits: vec![
+                temporalio_common::protos::coresdk::external_data::ExternalWaitMarker {
+                    wait_id: 1,
+                    generation: 0,
+                },
+            ],
+            replay_annotation: vec![],
+            terminal_boundary: ParkReason::OutputLatency as i32,
+            output: Some(manifest.clone()),
+        });
+        manifests.push(manifest);
+        if window + 1 < WINDOWS {
+            history.add_we_signaled("next-output-window", vec![]);
+            next_floor = history.current_event_id();
+        }
+    }
+
+    let lifecycle: Arc<Mutex<Vec<(Vec<ExternalStreamMarkerData>, bool)>>> = Default::default();
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, [1, 2, 3], mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        for _ in 0..WINDOWS {
+            let lifecycle = lifecycle.clone();
+            asserts.then(move |wft| {
+                lifecycle
+                    .lock()
+                    .push((stream_marker_data(wft), wft.force_create_new_workflow_task));
+            });
+        }
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    for (window, manifest) in manifests.iter().enumerate() {
+        let activation = worker.poll_workflow_activation().await.unwrap();
+        assert_eq!(
+            activation.history_floor_event_id, manifest.history_floor_event_id,
+            "window {window} staged against the wrong Workflow Task"
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                activation.run_id.clone(),
+                vec![
+                    output_buffered_command(Duration::from_secs(90)),
+                    output_buffered_command(Duration::from_secs(60)),
+                    output_buffered_command(Duration::from_secs(30)),
+                    quiescent_command((window + 1) as u64, &[1], Duration::from_secs(300)),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        worker.notify_external_output_flush_deadline(&activation.run_id);
+        assert_eq!(
+            worker.external_stream_run_status(&activation.run_id).await,
+            ExternalStreamRunStatus::WftOpen
+        );
+        let finalize = worker.poll_workflow_activation().await.unwrap();
+        assert_eq!(
+            finalization_jobs(&finalize),
+            vec![((window + 1) as u64, ParkReason::OutputLatency, vec![1])]
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                activation.run_id,
+                vec![
+                    finalized_command((window + 1) as u64, b""),
+                    output_commit_command(manifest.clone()),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+    worker.drain_pollers_and_shutdown().await;
+
+    let lifecycle = lifecycle.lock();
+    assert_eq!(
+        lifecycle.len(),
+        WINDOWS,
+        "each latency window must complete exactly one Workflow Task"
+    );
+    for (window, ((markers, forced), manifest)) in
+        lifecycle.iter().zip(manifests.iter()).enumerate()
+    {
+        assert_eq!(markers.len(), 1, "window {window} wrote extra markers");
+        assert_eq!(markers[0].output.as_ref(), Some(manifest));
+        assert_eq!(markers[0].terminal_boundary(), ParkReason::OutputLatency);
+        assert!(
+            *forced,
+            "window {window} did not request its replacement task"
+        );
+    }
+}
+
+fn output_park_boundary_history(
+    terminal: ParkReason,
+    wait_generation: u64,
+    stage_token: &str,
+    add_signal: bool,
+) -> (TestHistoryBuilder, ExternalOutputStreamManifest) {
+    let mut history = TestHistoryBuilder::default();
+    history.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
+    let manifest = output_manifest(history.get_orig_run_id(), 1, stage_token);
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(ExternalStreamMarkerData {
+        schema_version: 1,
+        quiescence_generation: 1,
+        waits: vec![
+            temporalio_common::protos::coresdk::external_data::ExternalWaitMarker {
+                wait_id: 1,
+                generation: wait_generation,
+            },
+        ],
+        replay_annotation: vec![],
+        terminal_boundary: terminal as i32,
+        output: Some(manifest.clone()),
+    });
+    if add_signal {
+        history.add_we_signaled("keep-the-run-cached", vec![]);
+    }
+    history.add_workflow_task_scheduled_and_started();
+    (history, manifest)
+}
+
+#[tokio::test]
+async fn confirmed_park_flushes_output_in_its_marker_without_forcing_a_task() {
+    let (history, manifest) =
+        output_park_boundary_history(ParkReason::AllWriteFenced, 0, "park-stage-token", true);
+    let recorded: Arc<Mutex<Vec<ExternalStreamMarkerData>>> = Default::default();
+    let forced = Arc::new(AtomicBool::new(true));
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, [1, 2], mock_worker_client());
+    let collected = recorded.clone();
+    let saw_force = forced.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            collected.lock().extend(stream_marker_data(wft));
+            saw_force.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+        });
+        asserts.then(|_| {});
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_buffered_command(Duration::from_secs(30)),
+                immediately_parkable_quiescence_command(1, Duration::from_secs(30)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        park_jobs(&park),
+        vec![(1, ParkReason::AllWriteFenced, vec![1])]
+    );
+    assert_eq!(finalization_jobs(&park), Vec::new());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(manifest.clone()),
+                park_confirmed_command(1, b""),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let written = recorded.lock().clone();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].terminal_boundary(), ParkReason::AllWriteFenced);
+    assert_eq!(written[0].output.as_ref(), Some(&manifest));
+    assert!(
+        !forced.load(Ordering::Relaxed),
+        "a successful park must not force a replacement merely to commit its output"
+    );
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::Parked
+    );
+
+    let replacement = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replacement.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn readiness_winner_finalizes_output_already_staged_for_park() {
+    let (history, manifest) = output_park_boundary_history(
+        ParkReason::TaskCompleted,
+        0,
+        "stale-park-stage-token",
+        false,
+    );
+    let recorded: Arc<Mutex<Vec<ExternalStreamMarkerData>>> = Default::default();
+    let forced = Arc::new(AtomicBool::new(false));
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, [1, 2], mock_worker_client());
+    let collected = recorded.clone();
+    let saw_force = forced.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            collected.lock().extend(stream_marker_data(wft));
+            saw_force.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+        });
+        asserts.then(|_| {});
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_buffered_command(Duration::from_secs(30)),
+                immediately_parkable_quiescence_command(1, Duration::from_secs(30)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(park_jobs(&park).len(), 1);
+
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(manifest.clone()),
+                park_confirmed_command(1, b"stale-terminal-must-not-be-recorded"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&finalize),
+        vec![(1, ParkReason::TaskCompleted, vec![1])]
+    );
+    assert_eq!(resolve_hints(&finalize), vec![1]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(1, b""),
+        ))
+        .await
+        .unwrap();
+
+    let written = recorded.lock().clone();
+    assert_eq!(
+        written.len(),
+        1,
+        "the staged batch is recorded exactly once"
+    );
+    assert_eq!(written[0].terminal_boundary(), ParkReason::TaskCompleted);
+    assert_eq!(written[0].output.as_ref(), Some(&manifest));
+    assert!(written[0].replay_annotation.is_empty());
+    assert!(
+        forced.load(Ordering::Relaxed),
+        "the replacement task must deliver readiness that defeated the park"
+    );
+
+    let replacement = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&replacement), vec![1]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replacement.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn output_deadline_invalidates_an_issued_park_and_flushes_once() {
+    let (history, manifest) =
+        output_park_boundary_history(ParkReason::OutputLatency, 1, "latency-stage-token", false);
+
+    let recorded: Arc<Mutex<Vec<ExternalStreamMarkerData>>> = Default::default();
+    let forced = Arc::new(AtomicBool::new(false));
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, [1, 2], mock_worker_client());
+    let collected = recorded.clone();
+    let saw_force = forced.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            collected.lock().extend(stream_marker_data(wft));
+            saw_force.store(wft.force_create_new_workflow_task, Ordering::Relaxed);
+        });
+        asserts.then(|_| {});
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_buffered_command(Duration::from_millis(400)),
+                output_buffered_command(Duration::from_millis(40)),
+                immediately_parkable_quiescence_command(1, Duration::from_secs(30)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        park_jobs(&park),
+        vec![(1, ParkReason::AllWriteFenced, vec![1])],
+        "buffered output and parking must be allowed to race"
+    );
+
+    worker.notify_external_output_flush_deadline(&run_id);
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "the serialized status probe is a barrier behind the deadline input"
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(manifest.clone()),
+                park_confirmed_command(1, b"losing-park-terminal"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let flush = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&flush),
+        vec![(1, ParkReason::OutputLatency, vec![1])]
+    );
+    assert_eq!(resolve_hints(&flush), vec![1]);
+    assert_eq!(park_jobs(&flush), Vec::new());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(1, b""),
+        ))
+        .await
+        .unwrap();
+
+    let written = recorded.lock().clone();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].terminal_boundary(), ParkReason::OutputLatency);
+    assert_eq!(written[0].output.as_ref(), Some(&manifest));
+    assert!(
+        forced.load(Ordering::Relaxed),
+        "a latency flush hands the run to a replacement Workflow Task"
+    );
+
+    let replacement = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolve_hints(&replacement), vec![1]);
+    assert_eq!(park_jobs(&replacement), Vec::new());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replacement.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]

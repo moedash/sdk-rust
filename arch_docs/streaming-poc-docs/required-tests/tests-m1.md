@@ -1,7 +1,7 @@
-# Milestone 1 required tests — 79 cases
+# Milestone 1 required tests — 101 cases
 
-One stream, end to end. Milestone 2's 12 cases are in `tests-m2.md`; the two partition the
-91 required cases exactly.
+One stream, end to end. Milestone 2's 17 cases are in `tests-m2.md`; the two partition the
+118 required cases exactly.
 
 This list is read at test time, not by a human: `tests/contrib/external_workflow_streams/
 m1_gate.py` parses the count in the heading and every bullet below it, and maps each case
@@ -19,7 +19,7 @@ gate checks that the two agree.
 - A consumed record followed by a terminal command (complete / fail / continue-as-new) commits
   its marker before the terminal command.
 - A retained Workflow Task spanning several progress reports produces exactly one marker.
-- Every completion path in the finalization-ownership table produces exactly one marker whose
+- Every input-direction completion path in the finalization-ownership table produces exactly one marker whose
   annotation ends with a terminal — normal, command-producing, terminal command, park
   confirmation, all-fenced immediate park, deadline rollover, budget rollover, and shutdown with
   a Workflow Task open — while an aborted park and a shutdown with no open Workflow Task produce
@@ -92,9 +92,9 @@ gate checks that the two agree.
 - An unacknowledged shutdown wake follows the documented policy: retried within the grace period
   under the same request ID, then reported through the
   `temporal_external_stream_shutdown_wake_failed` metric without blocking shutdown and without being reported as delivered.
-- `FinalizeExternalStreams` calls no provider method: with a provider that raises on every call,
-  finalization still produces a marker with a terminal, and provider code runs on neither the
-  Workflow thread nor the finalization path.
+- With no buffered output, `FinalizeExternalStreams` calls no input-provider method: with a provider
+  that raises on every input call, finalization still produces a marker with a terminal, and provider
+  code runs on neither the Workflow thread nor the terminal-encoding path.
 
 ## Replay
 
@@ -254,3 +254,47 @@ mapping.
   raised error remain one state: deliberate wake and lease overrides become the next recovery's
   defaults, while cancellation delivered on any attempt remains set. Resolving from the later error
   sends the owed wake and leaves one record.
+
+### Workflow-originated output promotion cases
+
+- No Workflow-originated output record becomes visible before the producing Workflow Task's marker
+  commits.
+- An explicitly failed or rejected Workflow Task leaves no visible output.
+- A discarded speculative Workflow Task stages one token and its redelivery stages another when
+  event IDs are reused, for both identical and changed logical manifests; History commits only the
+  accepted attempt's token.
+- A pending speculative token aborts at the first durable Workflow Task closing boundary strictly
+  above its exact History floor, without requiring speculative Scheduled or Started events.
+- The producing task's History floor is the event immediately before its Scheduled event and
+  excludes the preceding Workflow Task close; moving the floor below that close demonstrates the
+  false abort the exact-floor rule prevents.
+- A disconnected speculative Update with no later durable event remains pending regardless of
+  elapsed time, and retention loss is eventually classified as integrity failure.
+- A crash after staging but before server completion resolves to abort or retry without exposing a
+  phantom record.
+- A cold `ExternalOutputStreamClient` repairs a committed pending batch after server acceptance and
+  Worker loss, including after the Workflow has completed.
+- Repeated output stage, commit, abort, and History reconciliation calls are idempotent.
+- Reusing one output stage identity with a different logical fingerprint is rejected atomically.
+- Output replay validates recorded commands and segmentation without backend writes, token minting,
+  live capacity splits, or wall-clock flushes.
+- Replay uses the marker's output segmentation when a codec's encoded size differs from live
+  execution.
+- A Workflow publish made during a retained Workflow Task becomes visible within the configured
+  output-flush quantum under healthy dependencies.
+- Several publishes inside one output-flush window produce one marker, while crossing *n* windows
+  produces *n* markers and the corresponding Workflow Task lifecycle cost.
+- A pending Workflow output batch blocks later directly committed Activity output from overtaking
+  it on the same topic.
+- Activity output retry produces one visible record for each `(session_id, sequence)` identity.
+- A randomized payload codec preserves logical stage identity and the first successfully staged
+  encoded bytes across a retry.
+- Two logically identical Payloads whose metadata maps were inserted in opposite orders have the
+  same versioned canonical frame, logical byte count, and SHA-256 fingerprint.
+- Concurrent message Updates scan from their own output boundaries to their own returned `turn_id`
+  and cannot adopt one another's `turn_started` event.
+- An output-stage outage blocks Workflow Task progress and is classified as transient external
+  storage failure.
+- A missing staged record or expired deciding History produces integrity failure.
+- Output marker and activation batch budgets are hard bounds, including an oversized topic name
+  and a single oversized logical record.

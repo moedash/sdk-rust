@@ -9,11 +9,13 @@ bridge.
 serialization and delivery to Workflow code; stable stream offsets and write-fence interpretation;
 background readiness watchers and readiness coalescing; the backend side of the race-free
 park/wakeup handshake; creation and interpretation of opaque replay annotations, including
-cross-stream delivery order; exact-offset reads and integrity checks during replay.
+cross-stream delivery order; exact-offset reads and integrity checks during replay; deterministic
+logical output framing; output staging and lazy promotion or abort of pending stages.
 
 **Core owns:** serializing stream readiness with all other Workflow inputs; tracking deterministic
 external wait IDs and generations; holding a Workflow Task open while Workflow code is quiescent;
-one global quiescence timeout per open Workflow Task and Workflow Task rollover timing; issuing
+one global quiescence timeout and one output-visibility deadline per open Workflow Task, plus
+Workflow Task rollover timing; issuing
 activations; coordinating atomic parking of the complete external wait set, marker creation, and
 Workflow Task completion; returning recorded annotations to Python during replay; intercepting the
 reserved wake Signal and suppressing it from user Signal handlers.
@@ -25,7 +27,7 @@ Temporal History.
 ## Completion commands
 
 Added to the `WorkflowCommand.variant` oneof in `workflow_commands.proto`. Tags 1–22 are in use;
-new variants take 23–26.
+new variants take 23–28.
 
 ```protobuf
 // Tag 23. Commits an observation delta for external streams. Emitted on every
@@ -74,6 +76,19 @@ message ExternalStreamFinalized {
   uint64 quiescence_generation = 1;
   bytes final_observation_delta = 2;
 }
+
+// Tag 27. Reports that output for this Workflow Task is durably staged.
+message WorkflowOutputStreamCommit {
+  ExternalOutputStreamManifest manifest = 1;
+  // Capacity alone requests an immediate replacement Workflow Task.
+  bool request_rollover = 2;
+}
+
+// Tag 28. Reports unstaged output retained in lang and arms the earliest
+// visibility deadline for the current Workflow Task.
+message WorkflowOutputStreamBuffered {
+  google.protobuf.Duration max_publish_latency = 1;
+}
 ```
 
 `ExternalStreamWait` is a shared message, not a oneof variant, and takes no command tag.
@@ -116,7 +131,7 @@ message ReplayExternalStreams {
 message FinalizeExternalStreams {
   uint64 quiescence_generation = 1;
   repeated ExternalStreamWait waits = 2;
-  ParkReason reason = 3; // ROLLOVER, SHUTDOWN
+  ParkReason reason = 3; // ROLLOVER, SHUTDOWN, OUTPUT_LATENCY
 }
 ```
 
@@ -130,8 +145,10 @@ complete active wait set. Python handles both without invoking user Workflow cod
 `StreamSetBecameReady` and Core issues a normal resolve activation rather than running user code
 from inside the park path.
 
-**Two** of these four jobs — `ReplayExternalStreams` and `PrepareExternalStreamPark` — require
-backend I/O. `FinalizeExternalStreams` requires **none** (ADR-010). All three are still dispatched
+**Two** of these four jobs — `ReplayExternalStreams` and `PrepareExternalStreamPark` — require input
+backend I/O. The `FinalizeExternalStreams` handler itself requires none (ADR-010). When its reason is
+`OUTPUT_LATENCY`, however, the Worker's outer async layer stages the buffered output before it sends
+the existing finalization response and output commit. All three runtime-internal jobs are dispatched
 outside the synchronous Workflow thread; see `python-runtime.md`.
 
 ## Marker envelope
@@ -145,15 +162,42 @@ message ExternalStreamMarkerData {
   repeated ExternalWaitMarker waits = 3;
   bytes replay_annotation = 4;
   ParkReason terminal_boundary = 5;
+  ExternalOutputStreamManifest output = 6;
 }
 
 message ExternalWaitMarker {
   uint32 wait_id = 1;
   uint64 generation = 2;
 }
+
+message ExternalOutputStreamManifest {
+  uint32 schema_version = 1;
+  uint32 fingerprint_version = 2;
+  string stage_token = 3;
+  int64 history_floor_event_id = 4;
+  string run_id = 5;
+  repeated ExternalOutputTopicManifest topics = 6;
+  repeated ExternalOutputSegmentManifest segments = 7;
+  string provider_id = 8;
+  uint32 provider_format_version = 9;
+}
+
+message ExternalOutputTopicManifest {
+  string topic = 1;
+  uint32 record_count = 2;
+  uint64 logical_byte_count = 3;
+  bytes logical_fingerprint = 4;
+  bool finished = 5;
+}
+
+message ExternalOutputSegmentManifest {
+  repeated uint32 record_counts_by_topic = 1;
+}
 ```
 
-`ParkReason` lives here and only here — see "Who finalizes the annotation" below.
+The topic manifests contain logical counts, bytes, fingerprints, and finished flags; segment entries
+contain positional per-topic record counts. No output payload enters History. `ParkReason` lives here
+and only here — see "Who finalizes the annotation" below.
 
 During replay, Core performs marker lookahead before resolving the matching external wait set,
 analogous to local-activity marker lookahead: `Replaying --(Schedule)-->
@@ -173,11 +217,19 @@ Core*, with no Python activation outstanding at the moment of decision:
 | All-fenced immediate park | Core, from the quiescence snapshot | same |
 | Rollover-deadline expiry | Core timer | `FinalizeExternalStreams{ROLLOVER}` → `ExternalStreamFinalized` |
 | Byte-budget rollover | Python, via `request_rollover` | already carried by the triggering `WorkflowStreamProgress` |
+| Output-visibility deadline | Core timer | `FinalizeExternalStreams{OUTPUT_LATENCY}` → `ExternalStreamFinalized`, with the staged `WorkflowOutputStreamCommit` on the same completion |
+| Output logical-capacity rollover | Python | `WorkflowOutputStreamCommit{request_rollover=true}` already carries the staged manifest |
 | Command-producing completion | Python | already carried by the completion's `WorkflowStreamProgress` |
 | Terminal Workflow completion | Python | same, ordered before the terminal command |
 | Query answered while stream waits are still registered | Core, by refusing retention to report the answer | `FinalizeExternalStreams` → `ExternalStreamFinalized` |
 | Worker shutdown / eviction, Workflow Task open | Core | `FinalizeExternalStreams{SHUTDOWN}` → `ExternalStreamFinalized`. If Python cannot answer, **no marker is written** and the Workflow Task fails for retry |
 | Worker shutdown / eviction, no open Workflow Task | — | No marker exists to write; see `wft-lifecycle.md` |
+
+An idle or all-fenced park with buffered output is a single terminal, not two. Python stages first
+and orders `WorkflowOutputStreamCommit` before the confirmed `ExternalStreamParkResult`; Core writes
+one shared marker and does not force a replacement. If the park recheck becomes ready, Python sends
+`WorkflowOutputStreamBuffered` before `became_ready`, preserving the already chosen earliest output
+deadline. ADR-045 defines the case where that deadline wins while preparation is outstanding.
 
 **The rule that makes this coherent, and that has no exceptions:** Core never writes a marker for a
 boundary it decided without first receiving a terminal from Python (ADR-008). If a terminal cannot
@@ -280,35 +332,36 @@ enum ExternalWaitStatus {
 struct ExternalWaitSet {
     quiescence_generation: u64,
     waits: HashMap<u32, ExternalWaitState>,
-    ready_wait_ids: HashSet<u32>,
-    idle_timeout: Duration,
-    idle_timer: AbortHandle,
+    ready: HashMap<u32, u64>,
+    idle_timeout: Option<Duration>,
+    park_generation: Option<u64>,
+    wft_open: bool,
     replay_annotation: Vec<u8>,
 }
 ```
 
 ### Generalizing WFT retention
 
-Retention of an open Workflow Task is currently driven solely by outstanding local activities, via
-`ManagedRun`'s `waiting_on_la: Option<WaitingOnLAs>`. Retention is expressed by completing with
-`ActivationCompleteOutcome::DoNothing` instead of reporting to the server, keyed off
-`outstanding_local_activity_count() == 0`.
-
-The broader per-Run concept is *local work that may retain the Workflow Task*. `WaitingOnLAs` is
-renamed and extended into it (C5):
+The per-Run concept is *local work that may retain the Workflow Task*. It generalizes the earlier
+local-activity-only state (C5):
 
 ```rust
 struct WaitingOnLocalWork {
-    /// Present when local activities are outstanding; carries the existing
-    /// wft_timeout / hb_timeout_handle / heartbeat_timeout_pending fields.
     local_activities: Option<LocalActivityHeartbeatState>,
-    external_wait_set: Option<ExternalWaitSet>,
-    wft_rollover_timer: AbortHandle,
+    external_wait_set: ExternalWaitSet,
+    wft_rollover_timer: Option<AbortHandle>,
+    idle_timer: Option<AbortHandle>,
+    output_flush_timer: Option<OutputFlushTimer>,
+    output_buffered: bool,
+    output_latency_pending: bool,
+    park_rollback_resolve_pending: bool,
+    pending_output_commit: Option<WorkflowOutputStreamCommit>,
 }
 ```
 
-The retention predicate becomes "local activities outstanding **or** the external wait set retains".
-This is a pure refactor with no behavior change for local activities.
+The retention predicate is "local activities outstanding, the external wait set retains, **or
+unstaged output is buffered under a retainable wait snapshot**". The generalization does not change
+local-activity behavior.
 
 External waits remain logically pending after parking, but only a wait set containing
 `BlockedWftOpen`, `Ready`, or `Parking` states retains the current Workflow Task. Core must not
@@ -317,9 +370,10 @@ complete the task merely because one member becomes idle or parkable.
 ### Local input routing
 
 `enum LocalInputs` gains `ExternalStreamReady`, `ExternalStreamIdleTimeout`, and
-`ExternalStreamParkResult`. Each carries a run ID and must be added to the `LocalInputs::run_id()`
-match. These use the same prioritized local-input lane as local-activity completions
-(`LocalInputs::LocalResolution`).
+`ExternalStreamParkResult`; the retained-output path also supplies
+`ExternalOutputFlushDeadline`.
+Each carries a run ID and must be added to the `LocalInputs::run_id()` match. These use the same
+prioritized local-input lane as local-activity completions (`LocalInputs::LocalResolution`).
 
 ## Idle timer
 
@@ -344,6 +398,31 @@ The idle deadline and the Workflow Task rollover deadline are **separate**. The 
 derives from the same `wft_timeout` that drives the existing local-activity heartbeat, but it cannot
 reuse that mechanism — see ADR-017 and C13.
 
+## Output deadline and park arbitration
+
+`WorkflowOutputStreamBuffered` is legal only when the completion has a retainable quiescent input
+snapshot, no user/server command, and no output-capacity rollover. The first buffered output arms a
+monotonic deadline. The default is 100 milliseconds; if later topics join the retained batch, Core
+keeps the earliest deadline derived from their minimum configured latency and clamps it below
+ordinary rollover. Replay arms no output timer.
+
+The output deadline, readiness, parking, ordinary rollover, and server-bound completion compete on
+the same serialized state:
+
+- confirmed park: accept the staged commit before the confirmed park result and write one marker;
+- readiness wins the park recheck: retain the output and preserve its original deadline;
+- readiness wins after lang already staged for a confirmation: discard the stale park terminal,
+  resolve the abandoned intents, finalize with `TASK_COMPLETED`, record the carried commit once, and
+  force a replacement;
+- output deadline wins during prepare: invalidate the losing quiescence generation, queue resolve so
+  Python rolls back every installed park intent, then queue
+  `FinalizeExternalStreams{OUTPUT_LATENCY}`, carry a commit returned by the losing prepare or stage
+  during finalization, and force a replacement task after the shared marker;
+- late park or timer results: treat them as stale and never write another marker.
+
+Suppressing the output timer while a park is outstanding is incorrect: a stalled provider park
+operation could otherwise violate the output visibility bound indefinitely (ADR-045).
+
 ## Implementation locations
 
 The surface the feature occupies:
@@ -366,4 +445,6 @@ timers, finalization, shutdown transitions, the sink-independent timer facility)
 accumulate annotations, issue markers, and perform replay lookahead. Keep the stream provider out of
 `LocalActivityManager`; only the scheduling pattern is shared.
 
-**Python SDK:** see `python-runtime.md`.
+**Python SDK:** see `python-runtime.md`; output-specific modules are `_output_api.py`,
+`_output_backend.py`, `_output_client.py`, `_output_codec.py`, `_output_continuation.py`, and
+`_output_producer.py`, with Workflow staging coordinated by `_runtime.py` and `worker/_workflow.py`.

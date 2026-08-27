@@ -48,7 +48,10 @@ use crate::{
 };
 use anyhow::anyhow;
 use futures_util::{
-    Stream, StreamExt, future::AbortHandle, future::abortable, stream, stream::BoxStream,
+    Stream, StreamExt,
+    future::{AbortHandle, abortable},
+    stream,
+    stream::BoxStream,
 };
 use itertools::Itertools;
 use prost_types::TimestampError;
@@ -768,6 +771,12 @@ impl Workflows {
             run_id: run_id.into(),
             quiescence_generation,
         });
+    }
+
+    /// Test-only reach into the output deadline's serialized local input.
+    #[cfg(test)]
+    pub(super) fn notify_external_output_flush_deadline(&self, run_id: impl Into<String>) {
+        self.send_local(LocalInputs::ExternalOutputFlushDeadline(run_id.into()));
     }
 
     /// Test scaffolding -- see [`EmitTerminalLessMarkerMsg`].
@@ -1845,6 +1854,10 @@ enum WFCommandVariant {
     ExternalStreamParkResult(ExternalStreamParkResult),
     /// Lang's answer to `FinalizeExternalStreams`.
     ExternalStreamFinalized(ExternalStreamFinalized),
+    /// Compact manifest for an external output batch already staged by lang.
+    ExternalOutputStreamCommit(WorkflowOutputStreamCommit),
+    /// External output is buffered in lang and needs a run-scoped flush deadline.
+    ExternalOutputStreamBuffered(WorkflowOutputStreamBuffered),
     SubscribeNotificationChannel(SubscribeNotificationChannel),
     UnsubscribeNotificationChannel(UnsubscribeNotificationChannel),
 }
@@ -1925,6 +1938,12 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::ExternalStreamFinalized(s) => {
                 WFCommandVariant::ExternalStreamFinalized(s)
+            }
+            workflow_command::Variant::WorkflowOutputStreamCommit(commit) => {
+                WFCommandVariant::ExternalOutputStreamCommit(commit)
+            }
+            workflow_command::Variant::WorkflowOutputStreamBuffered(buffered) => {
+                WFCommandVariant::ExternalOutputStreamBuffered(buffered)
             }
         };
         Ok(Self {

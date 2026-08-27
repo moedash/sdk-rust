@@ -26,8 +26,8 @@ surface.
 
 | | `contrib.workflow_streams` | External Workflow Streams |
 |---|---|---|
-| Direction | Workflow **produces**; external clients consume | External producers publish; Workflow **consumes** |
-| Workflow-side API | `topic().publish()`; deliberately no workflow-side `subscribe()` | `topic().subscribe()`; no workflow-side produce path |
+| Direction | Workflow **produces**; external clients consume | Both external-input and external-output directions |
+| Workflow-side API | `topic().publish()`; deliberately no workflow-side `subscribe()` | Input topics `subscribe()`; output topics `publish()` and `finish()` on distinct handles |
 | Storage | Append-only log in Workflow state, i.e. in History | Pluggable external backend; payloads never enter History |
 | Offsets | Dense `int`, exposed in `subscribe(from_offset: int)` and the offset Query | Opaque, provider-defined, totally ordered tokens (Redis IDs are `<ms>-<seq>`) |
 | Transport | Signals, long-poll Updates, SSE bridge | Direct backend reads; Signals carry no payload and supply only wakeups |
@@ -37,15 +37,14 @@ its `int` offset surface is incompatible with opaque provider offsets even for t
 overlap.
 
 C stays open as future work but is explicitly not a dependency of this design — it requires solving
-the dense-integer-offset mapping. A distinct extension of External Workflow Streams with
-Workflow-originated output and opaque client cursors is described in the
-[output-stream proposal](../proposals/workflow-originated-external-streams.md); it does not alter
-this decision until accepted and incorporated into the specification.
+the dense-integer-offset mapping. External Workflow Streams instead include a distinct output
+direction with opaque client cursors; its separation of handle types preserves this decision.
 
 ## Consequences
 
 - Both features ship; neither is deprecated by this work.
 - This feature takes distinct names: module `temporalio.contrib.external_workflow_streams`, entry
-  point `external_stream`, reserved Signal `__temporal_external_stream_wake`.
+  points `external_stream` and `external_output_stream`, reserved Signal
+  `__temporal_external_stream_wake`.
 - **No name in this feature may begin with `__temporal_workflow_stream`.** P9's completion criteria
   assert this.

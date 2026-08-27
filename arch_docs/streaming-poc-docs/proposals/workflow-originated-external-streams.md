@@ -1,17 +1,20 @@
-# Proposal — Workflow-originated external output streams
+# Implemented design — Workflow-originated external output streams
 
-**Status:** Proposed, not part of the accepted External Workflow Streams specification
+**Status:** Implemented as part of External Workflow Streams. The feature as a whole remains
+pre-production. The normative contracts now live in `spec/` and ADR-044 through ADR-048; this
+document retains the end-to-end rationale and API overview. `required-tests/` records remaining
+feature-wide validation coverage explicitly.
 
 ## Summary
 
-Add the complementary stream direction:
+External Workflow Streams include the complementary stream direction:
 
 ```text
 Workflow or its Activities -> external backend -> external client
 ```
 
-The current feature moves externally produced records into a Workflow without putting their
-payloads in History. This proposal lets a Workflow publish externally observable records under the
+The input direction moves externally produced records into a Workflow without putting their
+payloads in History. The output direction lets a Workflow publish externally observable records under the
 same constraint. It is intended for agent token deltas, progress events, traces, and other ordered
 output that clients must be able to resume without making Workflow History the data store.
 
@@ -27,7 +30,7 @@ The central rule is:
 
 Writing to the backend before Workflow Task completion without such a gate leaks output from a
 failed or rejected task. Writing only after completion loses output if the Worker dies after the
-server accepts the task but before the backend write. The proposed protocol therefore stages output
+server accepts the task but before the backend write. The implemented protocol therefore stages output
 before completing the Workflow Task, records only a compact commit proof in History, and exposes the
 staged records after the server accepts that proof.
 
@@ -49,7 +52,7 @@ token streams then scale History bytes and replay work with token count.
 The current External Workflow Streams feature cannot replace it because its direction is the mirror
 image:
 
-| Capability | Current external stream | Proposed external output stream |
+| Capability | External input stream | External output stream |
 |---|---|---|
 | Workflow role | Consumer | Producer |
 | Other endpoint | External producer | External client subscriber |
@@ -95,9 +98,12 @@ externalize the client-facing log.
 - Token-rate publishing from Workflow code at no History-event cost. Output-flush rollover bounds
   latency by trading one marker plus Workflow Task lifecycle events for each flush window.
 
-## Proposed API shape
+## Public API
 
-The names in this section are provisional. The separation of roles is not.
+These names are the implemented Python surface. Workflow code uses
+`ExternalOutputStreamOptions` and `ExternalOutputStreamTopic`; direct producers use
+`ExternalOutputStreamProducer` and `ExternalOutputStreamProducerTopic`; readers use
+`ExternalOutputStreamClient`, `ExternalOutputStreamClientTopic`, and `ExternalOutputStreamItem`.
 
 ### Workflow publisher
 
@@ -118,8 +124,9 @@ await events.finish()
 backend round trip and returns no external offset. Making it awaitable gives the runtime a
 deterministic backpressure point: when the batch's record or logical-byte budget is exhausted, the
 await yields so the current batch can be staged and a new Workflow Task can continue publishing.
-The first accepted value also arms `max_publish_latency`; if that deadline wins first, Core stages
-the accumulated batch and rolls over the retained Workflow Task outside the Workflow thread.
+The first retained completion carrying accepted output arms `max_publish_latency`; if that deadline
+wins first, Core asks the out-of-sandbox Python runtime to finalize, Python stages the accumulated
+batch, and Core rolls over the retained Workflow Task.
 
 `finish()` appends an ordered terminal control record for this topic. It is explicit because a
 Workflow failure or termination cannot reliably execute cleanup code. A client may also stop by
@@ -154,7 +161,10 @@ Workflow code threads the key through an Activity input or an opaque application
 
 Unlike the current input producer, an output producer sends no wake Signal to the Workflow. Its
 consumer watches the backend directly. Its records are immediately committed singleton batches,
-idempotent on `(session_id, sequence)`.
+idempotent on `(session_id, sequence)`. `finish_writing()` closes that producer's topic handle; when
+direct and Workflow publishers share a topic, the application chooses one terminal owner because a
+direct producer cannot mutate the Workflow's continuation state and clients stop at the first
+`FINISH`.
 
 ### External client subscriber
 
@@ -209,15 +219,19 @@ wins.
 - If `ParkSetConfirmed` wins, the output batch is staged and its marker is included before that park
   completion is sent to the server. The output timer is cancelled; parking already provides an
   earlier visibility boundary.
-- If stream readiness wins, the current park preparation is rolled back by the existing input
-  protocol and the output timer remains armed for the still-open Workflow Task.
+- If the backend recheck becomes ready, Python returns `WorkflowOutputStreamBuffered` before
+  `StreamSetBecameReady`; the current park preparation is rolled back and the original output
+  deadline remains armed for the still-open Workflow Task.
+- If readiness wins after Python already staged output for a confirmation, Core discards the stale
+  park terminal, issues resolve to retire every intent, then finalizes with `TASK_COMPLETED`, records
+  the carried commit once, and forces a replacement Workflow Task.
 - If the output-flush deadline wins while `PrepareExternalStreamPark` is outstanding, Core aborts
-  that quiescence generation and cancels the preparation. Python removes every intent installed by
-  the cancelled attempt under the existing cancellation/owed-removal rules. Only after that
-  rollback is accounted for — removal confirmed or its retry recorded in the manager's owed ledger
-  — does Core stage the output and complete with `force_new_wft = true`. The wait generations
-  remain active and are reconstructed in the replacement task; the output flush never confirms a
-  park generation.
+  that quiescence generation. When the outstanding result returns, Core ignores its park terminal,
+  issues resolve to remove or record every owed intent removal, then finalizes with
+  `OUTPUT_LATENCY`. A commit already carried by the losing result is retained; otherwise Python
+  stages during finalization. Core records it once and completes with `force_new_wft = true`. The
+  wait generations remain active and are reconstructed in the replacement task; the output flush
+  never confirms a park generation.
 - A late `ParkSetConfirmed`, readiness result, or deadline result for the losing transition is stale
   and cannot produce a second marker or completion.
 
@@ -461,9 +475,12 @@ not rewrite record bytes. A Redis provider can use an append-only record log plu
 atomic scripts. Providers that cannot stop a read at unresolved data do not satisfy the output
 contract even if they satisfy the current input contract.
 
-Input and output conformance suites are separate. Requiring every existing input backend to support
-transactional output staging would turn an additive feature into a breaking change; a provider may
-declare input-only support.
+Input and output conformance suites and capability ABCs are separate. An input-only
+`StreamBackend` remains valid, and direct output producers and clients can use an output-only
+`OutputStreamBackend`. The first-release Worker option is narrower: it is validated as a
+`StreamBackend`, so Workflow-originated output requires that configured provider to implement both
+contracts. Requiring every existing input provider to support transactional output staging would
+turn an additive feature into a breaking change.
 
 ## Ordering guarantees
 
@@ -498,9 +515,9 @@ may span many activations; all of their accepted output counts against the same 
 accepting another record would cross a limit, `await publish()` yields and requests Workflow Task
 rollover; the next Workflow Task resumes after the preceding batch is staged.
 
-Logical size is the deterministic serialized `Payload` protobuf size defined above, before any
-`PayloadCodec`. Encoded size is recorded for metrics and provider admission but never chooses a
-Workflow-visible boundary. A provider may stream one logical stage through several idempotent
+Logical size is the deterministic canonical frame size defined above, before any `PayloadCodec`.
+Encoded size is provider/transport cost and never chooses a Workflow-visible boundary. A provider
+may stream one logical stage through several idempotent
 transport writes under the same pending token, then seal its manifest; it must not force a new
 Workflow segment merely because a codec changed compression ratio.
 
@@ -522,17 +539,17 @@ The output key uses the first execution Run ID, so Continue-As-New keeps the sam
 metadata names the current Run, and the independently unique stage token prevents retries and
 successive Runs from colliding even when speculative Workflow Task event IDs are reused.
 
-Continue-As-New is not a terminal record. An explicit `finish()` remains visible across the chain
-and prevents later publishes to that topic. The finished-topic set, including each topic's provider
-binding and format version, travels in a reserved must-understand Continue-As-New header. The
+Continue-As-New is not a terminal record. An explicit Workflow `finish()` remains visible across the chain
+and prevents later publishes to that topic. The finished-topic set plus the configured provider ID
+and format version travels in a reserved must-understand Continue-As-New header. The
 successor restores it before Workflow code runs and deterministically rejects a later `publish()`;
 it never asks mutable backend state whether the topic was finished. This is the output analogue of
 ADR-022 and ADR-039.
 
-Normal Workflow completion may record terminal status for every still-open output topic in the
-final batch, but failure, cancellation, and termination cannot rely on a final Workflow command. A
-following client should combine backend watches with Temporal execution status when it needs to stop
-automatically.
+Normal Workflow completion does **not** synthesize terminal records. Only explicit `finish()` from
+Workflow code or `finish_writing()` from a direct producer appends `FINISH`. Failure, cancellation,
+termination, and successful completion therefore do not close still-open topics. A client that
+needs to stop automatically combines backend watches with Temporal execution status.
 
 Committed records and their resolution metadata must remain available for at least the advertised
 client resume window. Pending resolution requires the associated History to remain available.
@@ -572,7 +589,7 @@ resolution to a trusted component.
 
 ## Temporal Agent Harness migration
 
-Once this proposal is implemented, the harness can migrate without changing its external event
+The harness can migrate without changing its external event
 vocabulary:
 
 1. `AgentWorkflowRunner` publishes `AgentEvent` envelopes to one external output topic.
@@ -651,23 +668,19 @@ An implementation is not complete without tests that force every acknowledgement
 Every crash test must prove that its injected failure reached the intended boundary before its
 result is accepted; the existing verification-hazard rules apply unchanged.
 
-## Promotion work after acceptance
+## Normative promotion
 
-This proposal does not change the accepted specs by itself. Acceptance requires moving the durable
-rules into their single normative homes and recording at least these independent decisions:
+The durable rules are promoted into their single normative homes:
 
-- unique Worker-minted stage tokens plus the History-floor reconciliation predicate;
-- latency-driven output flush, its Workflow Task/History-event tradeoff, and its precedence and
-  quiescence-generation effects against the input park handshake;
-- per-Workflow-Task logical capacity with marker-driven replay segmentation shared by input and
-  output;
-- the pending-batch ordering barrier and its deliberately limited mixed-producer guarantee; and
-- finished-topic state in the must-understand Continue-As-New header.
+- ADR-044 and `spec/backend-contract.md`: stage tokens and exact History-floor reconciliation;
+- ADR-045 and `spec/wft-lifecycle.md`: latency flush and the shared output/park terminal race;
+- ADR-046 and `spec/annotation-format.md`: logical capacity and shared replay segmentation;
+- ADR-047 and `spec/backend-contract.md`: pending ordering barriers and mixed producers; and
+- ADR-048 and `spec/annotation-format.md`: finished-topic Continue-As-New state.
 
-The validation cases above then become entries in `required-tests/` with concrete mappings. The
-vendored Core pointer must move with those lists before the Python M1/M2 gates can claim the cases;
-otherwise verification hazard 3 leaves them unarmed. Until that promotion is complete, current
-`spec/`, `decisions/`, and required-test lists continue to describe only the input direction.
+`spec/core-lang-protocol.md`, `spec/python-runtime.md`, and `spec/failure-taxonomy.md` own the
+cross-boundary mechanics and failure reporting. The 27 validation cases are promoted into
+`required-tests/`; this document is not a second normative copy of those contracts.
 
 ## Alternatives considered
 
@@ -697,21 +710,27 @@ meet the goal of keeping payload bytes out of History.
 
 This hybrid reduces token Signal volume and may be a useful intermediate harness migration. It
 creates two logs, two cursor spaces, and no single ordering between Activity and Workflow events, so
-it is not the end-state proposed here.
+it is not the implemented end state recorded here.
 
-## Open decisions before acceptance
+## Resolved public and operational decisions
 
-- Final public names for the output entry point, producer, client, topic, and yielded item.
-- Whether lazy client reconciliation is mandatory in every client or delegated through a pluggable
-  resolver interface with a mandatory default.
-- Whether explicit `finish()` is sufficient or successful Workflow completion also synthesizes
-  topic terminal records.
-- The default `max_publish_latency`; the mechanism and its History-event tradeoff are required even
-  if the initial default changes.
-- Whether providers may expose output-only support as well as input-only support.
-- The default committed-output retention and the operator API for resolving an integrity incident.
-- Whether the first release supports Activity publishers in the same topic or restricts the stream
-  to Workflow batches until mixed-producer ordering has its own conformance suite.
-
-Until these decisions are accepted and recorded as ADRs, this document describes a candidate design
-and must not be treated as the behavior of the current implementation.
+- The public names are `external_output_stream`, `ExternalOutputStreamOptions`,
+  `ExternalOutputStreamTopic`, `ExternalOutputStreamProducer`,
+  `ExternalOutputStreamProducerTopic`, `ExternalOutputStreamClient`,
+  `ExternalOutputStreamClientTopic`, and `ExternalOutputStreamItem`.
+- Lazy History reconciliation is built into every `ExternalOutputStreamClient`; it is not a
+  pluggable optional resolver. Workers also reconcile opportunistically after reporting.
+- Topic termination is explicit only: `finish()` and `finish_writing()` append it; Workflow
+  completion does not.
+- The default `max_publish_latency` is 100 milliseconds. The minimum configured latency among the
+  non-empty topics in one batch controls its deadline.
+- Input and output provider capabilities are independent. Input-only providers remain valid;
+  output-only providers serve direct producers and clients; Workflow-originated output on a Worker
+  currently requires one provider implementing both contracts.
+- The SDK sets no default committed-output retention and exposes no force-resolve operator API.
+  Providers retain records for their advertised resume window and resolution metadata for at least
+  the matching History window. Missing proof is an integrity incident to repair or terminate, never
+  a timeout-based guess.
+- Activity/external direct producers and Workflow publishers may share a topic. Pending Workflow
+  stages are ordering barriers, but the SDK promises neither a global cross-producer order nor a
+  cross-topic transaction.

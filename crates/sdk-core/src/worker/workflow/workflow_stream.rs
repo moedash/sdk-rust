@@ -153,6 +153,9 @@ impl WFStream {
                             LocalInputs::WftRolloverDeadline(run_id) => {
                                 state.process_wft_rollover_deadline(run_id)
                             }
+                            LocalInputs::ExternalOutputFlushDeadline(run_id) => {
+                                state.process_external_output_flush_deadline(run_id)
+                            }
                             LocalInputs::RequestEviction(evict) => {
                                 state.request_eviction(evict).into_run_update_resp()
                             }
@@ -564,6 +567,14 @@ impl WFStream {
         }
     }
 
+    fn process_external_output_flush_deadline(&mut self, run_id: String) -> RunUpdateAct {
+        if let Some(rh) = self.runs.get_mut(&run_id) {
+            rh.external_output_flush_deadline()
+        } else {
+            None
+        }
+    }
+
     /// A watcher reports that a record is buffered for one external stream wait.
     ///
     /// The acknowledgement is sent from here rather than from the caller because only this lane
@@ -820,6 +831,9 @@ pub(super) enum LocalInputs {
     /// already finished.
     #[from(ignore)]
     WftRolloverDeadline(String),
+    /// The earliest max-publish-latency deadline for buffered external output expired.
+    #[from(ignore)]
+    ExternalOutputFlushDeadline(String),
     #[cfg(test)]
     ExternalStreamSeedWaits(ExternalStreamSeedWaitsMsg),
     #[cfg(test)]
@@ -843,6 +857,7 @@ impl LocalInputs {
             LocalInputs::ExternalStreamIdleTimeout(t) => &t.run_id,
             LocalInputs::ExternalStreamRunStatus(s) => &s.run_id,
             LocalInputs::WftRolloverDeadline(run_id) => run_id,
+            LocalInputs::ExternalOutputFlushDeadline(run_id) => run_id,
             #[cfg(test)]
             LocalInputs::ExternalStreamSeedWaits(sw) => &sw.run_id,
             #[cfg(test)]

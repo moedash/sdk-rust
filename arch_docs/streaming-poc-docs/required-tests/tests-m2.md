@@ -1,7 +1,7 @@
-# Milestone 2 required tests — 12 cases
+# Milestone 2 required tests — 17 cases
 
 Multiple streams, `merge`, same-stream subscriptions, and Continue-As-New. Together with
-`tests-m1.md`'s 79 cases it partitions the 91 required cases exactly.
+`tests-m1.md`'s 101 cases it partitions the 118 required cases exactly.
 
 Every bullet is one case. If you add or remove one, update the count in this heading; the
 gate checks that the two agree.
@@ -22,3 +22,13 @@ gate checks that the two agree.
   the same reduction is observed on replay.
 - A wake Signal for one parked stream causes all streams to be rechecked.
 - Continue-As-New restores its initial cursor from History.
+- A multi-activation retained Workflow Task carrying both input and output annotations reproduces
+  exactly the live drain count, rather than summing two replay drivers.
+- Output cursor resume has neither gaps nor duplicates across Workflow Task rollover and
+  Continue-As-New.
+- Input and output topics with the same user-visible name remain physically isolated.
+- Output-flush and input-park races in both orders produce exactly one Workflow Task terminal and
+  one output marker: an output winner invalidates the quiescence generation, rolls back every
+  installed intent, and forces a replacement task; a park winner stages output before completing.
+- A finished output topic survives Continue-As-New in the reserved must-understand header and
+  rejects a successor publish before any backend read.

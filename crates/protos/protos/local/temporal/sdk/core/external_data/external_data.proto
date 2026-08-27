@@ -66,6 +66,10 @@ enum ParkReason {
   // no stream wait remained pending. Distinct from PARK_REASON_COMMANDS_PRODUCED so the marker
   // says which of the two it actually was rather than implying commands that never existed.
   PARK_REASON_TASK_COMPLETED = 8;
+  // The Workflow Task's output visibility deadline expired.
+  PARK_REASON_OUTPUT_LATENCY = 9;
+  // The staged output reached its deterministic record or logical-byte capacity.
+  PARK_REASON_OUTPUT_CAPACITY = 10;
 }
 
 // What Core writes into a marker for a Workflow Task that consumed external streams. Exactly one
@@ -79,9 +83,49 @@ message ExternalStreamMarkerData {
   // this and never parses any of it.
   bytes replay_annotation = 4;
   ParkReason terminal_boundary = 5;
+  // The output staged for this Workflow Task, if any. Output shares this marker with input so
+  // replay has one activation-segment schedule and never drains the Workflow event loop twice.
+  ExternalOutputStreamManifest output = 6;
 }
 
 message ExternalWaitMarker {
   uint32 wait_id = 1;
   uint64 generation = 2;
+}
+
+// Compact proof of the externally staged output belonging to one Workflow Task.
+//
+// This message contains no record payloads. The stage token identifies the immutable pending
+// batch in the provider, while the remaining fields let replay validate the deterministic logical
+// output and let a cold reader reconcile the pending batch against History.
+message ExternalOutputStreamManifest {
+  uint32 schema_version = 1;
+  uint32 fingerprint_version = 2;
+  string stage_token = 3;
+  // The event immediately preceding this Workflow Task's WorkflowTaskScheduled event in the
+  // ordered History view used to build its activation.
+  int64 history_floor_event_id = 4;
+  string run_id = 5;
+  repeated ExternalOutputTopicManifest topics = 6;
+  // One entry per live activation segment, including segments which published no output.
+  repeated ExternalOutputSegmentManifest segments = 7;
+  // Stable configured provider binding. Reconciliation refuses to interpret the batch through a
+  // different provider or provider wire format.
+  string provider_id = 8;
+  uint32 provider_format_version = 9;
+}
+
+// Logical, pre-codec identity of one topic sub-batch.
+message ExternalOutputTopicManifest {
+  string topic = 1;
+  uint32 record_count = 2;
+  uint64 logical_byte_count = 3;
+  bytes logical_fingerprint = 4;
+  bool finished = 5;
+}
+
+// Record counts for one activation segment. Entries correspond positionally to `topics` in the
+// enclosing ExternalOutputStreamManifest, retaining empty segments without repeating topic names.
+message ExternalOutputSegmentManifest {
+  repeated uint32 record_counts_by_topic = 1;
 }

@@ -1194,6 +1194,7 @@ pub mod coresdk {
                     last_sdk_version: String::new(),
                     suggest_continue_as_new_reasons: vec![],
                     target_worker_deployment_version_changed: false,
+                    history_floor_event_id: 0,
                 }
             }
 
@@ -1804,6 +1805,34 @@ pub mod coresdk {
                         "ExternalStreamFinalized({}, {} byte(s))",
                         self.quiescence_generation,
                         self.final_observation_delta.len()
+                    )
+                }
+            }
+
+            impl Display for WorkflowOutputStreamCommit {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "WorkflowOutputStreamCommit({} topic(s){})",
+                        self.manifest
+                            .as_ref()
+                            .map(|manifest| manifest.topics.len())
+                            .unwrap_or_default(),
+                        if self.request_rollover {
+                            ", rollover requested"
+                        } else {
+                            ""
+                        }
+                    )
+                }
+            }
+
+            impl Display for WorkflowOutputStreamBuffered {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "WorkflowOutputStreamBuffered({:?})",
+                        self.max_publish_latency
                     )
                 }
             }

@@ -116,6 +116,9 @@ pub(crate) struct WorkflowMachines {
     external_stream_marker_machines: VecDeque<MachineKey>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
+    /// The exact predecessor of the current WorkflowTaskScheduled event in the ordered History
+    /// view. Output staging must fail rather than guess when this is unavailable.
+    current_wft_history_floor_event_id: Option<i64>,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -307,6 +310,7 @@ impl WorkflowMachines {
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
+            current_wft_history_floor_event_id: None,
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -428,6 +432,10 @@ impl WorkflowMachines {
         self.current_started_event_id
     }
 
+    pub(crate) fn current_wft_history_floor_event_id(&self) -> Option<i64> {
+        self.current_wft_history_floor_event_id
+    }
+
     pub(crate) fn history_size_bytes(&self) -> u64 {
         self.history_size_bytes
     }
@@ -501,6 +509,7 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
+            history_floor_event_id: self.current_wft_history_floor_event_id.unwrap_or_default(),
         }
     }
 
@@ -569,6 +578,7 @@ impl WorkflowMachines {
                 waits,
                 replay_annotation: data.replay_annotation.clone(),
                 terminal_boundary: data.terminal_boundary,
+                output: data.output.clone(),
             })
             .into(),
         );
@@ -591,6 +601,10 @@ impl WorkflowMachines {
     /// history event, so they have no state machine to be driven by.
     pub(crate) fn send_core_generated_job(&mut self, variant: workflow_activation_job::Variant) {
         self.drive_me.send_job(variant.into());
+    }
+
+    pub(crate) fn discard_pending_external_stream_park(&mut self) {
+        self.drive_me.discard_pending_external_stream_park();
     }
 
     pub(crate) fn has_pending_jobs(&self) -> bool {
@@ -631,6 +645,33 @@ impl WorkflowMachines {
     pub(crate) fn reset_last_started_id(&mut self, id: i64) {
         debug!("Resetting back to event id {} due to speculative WFT", id);
         self.current_started_event_id = id;
+        self.current_wft_history_floor_event_id = None;
+        // A speculative rejection means the server discarded every command from that task. Most
+        // command machines are forbidden on a rejected Update task, but Core's external-output
+        // marker is generated after lang has answered and is therefore the exception. Leaving it
+        // queued makes the redelivery report both the rejected token and its fresh token.
+        let discarded_stream_markers: Vec<_> = self
+            .commands
+            .iter()
+            .chain(&self.current_wf_task_commands)
+            .filter_map(|command| {
+                matches!(
+                    self.all_machines.get(command.machine),
+                    Some(Machines::ExternalStreamMachine(_))
+                )
+                .then_some(command.machine)
+            })
+            .collect();
+        self.commands
+            .retain(|command| !discarded_stream_markers.contains(&command.machine));
+        self.current_wf_task_commands
+            .retain(|command| !discarded_stream_markers.contains(&command.machine));
+        self.external_stream_marker_machines
+            .retain(|key| !discarded_stream_markers.contains(key));
+        for key in discarded_stream_markers {
+            self.machine_is_core_created.remove(key);
+            self.all_machines.remove(key);
+        }
         // We must reset the last event we "processed" to be after the last WFT we really completed
         // + any command events (since the SDK "processed" those when it emitted the commands). This
         // is also equal to what we just processed in the speculative task, minus two, since we
@@ -777,6 +818,9 @@ impl WorkflowMachines {
                     self.last_processed_event,
                     eid
                 ));
+            }
+            if event.event_type() == EventType::WorkflowTaskScheduled {
+                self.current_wft_history_floor_event_id = Some(self.last_processed_event);
             }
             let next_event = history.peek();
 
@@ -1767,14 +1811,16 @@ impl WorkflowMachines {
                     );
                 }
                 // External stream commands are consumed above the machine level -- progress
-                // accumulates into the wait set (C14a) and the other three are answers to
+                // accumulates into the wait set (C14a), three are answers to
                 // runtime-internal activations that `ManagedRun` resolves (C6, C8, C15a). None of
-                // them should reach the machines, and reaching them silently would drop a
-                // replay-visible observation delta on the floor.
+                // them should reach the machines; the output commit is also intercepted there.
+                // Reaching any one silently would drop replay-visible state on the floor.
                 leaked @ (WFCommandVariant::ExternalStreamProgress(_)
                 | WFCommandVariant::ExternalStreamQuiescent(_)
                 | WFCommandVariant::ExternalStreamParkResult(_)
-                | WFCommandVariant::ExternalStreamFinalized(_)) => {
+                | WFCommandVariant::ExternalStreamFinalized(_)
+                | WFCommandVariant::ExternalOutputStreamCommit(_)
+                | WFCommandVariant::ExternalOutputStreamBuffered(_)) => {
                     return Err(fatal!(
                         "External stream command {leaked} reached the state machines; it should \
                          have been consumed by the run's external wait set"
