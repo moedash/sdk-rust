@@ -70,6 +70,7 @@ use temporalio_common::{
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
+            stream::v1::StreamSlice,
         },
     },
     worker::WorkerDeploymentVersion,
@@ -86,6 +87,13 @@ pub(crate) struct WorkflowMachines {
     /// kept because the lang side polls & completes for every workflow task, but we do not need
     /// to poll the server that often during replay.
     last_history_from_server: HistoryUpdate,
+    /// Stream ranges an earlier task consumed, keyed by the WorkflowTaskCompleted
+    /// event that recorded each one. Only offsets are in History, so replay is
+    /// served by the server reading the stream again and sending the bytes back
+    /// tagged with that event.
+    stream_slices_by_event: HashMap<i64, Vec<StreamSlice>>,
+    /// Ranges for the task about to run, which no event records yet.
+    current_stream_slices: Vec<StreamSlice>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
@@ -276,6 +284,8 @@ impl WorkflowMachines {
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
             drive_me: driven_wf,
+            stream_slices_by_event: Default::default(),
+            current_stream_slices: Default::default(),
             replaying,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -325,11 +335,26 @@ impl WorkflowMachines {
         &mut self,
         update: HistoryUpdate,
         protocol_messages: Vec<IncomingProtocolMessage>,
+        stream_slices: Vec<StreamSlice>,
     ) -> Result<()> {
         if !self.protocol_msgs.is_empty() {
             dbg_panic!("There are unprocessed protocol messages while receiving new work");
         }
         self.protocol_msgs = protocol_messages;
+        // An untagged slice belongs to the task about to run; a tagged one is
+        // re-supplying a range some earlier task already consumed.
+        self.current_stream_slices.clear();
+        self.stream_slices_by_event.clear();
+        for slice in stream_slices {
+            if slice.workflow_task_completed_event_id == 0 {
+                self.current_stream_slices.push(slice);
+            } else {
+                self.stream_slices_by_event
+                    .entry(slice.workflow_task_completed_event_id)
+                    .or_default()
+                    .push(slice);
+            }
+        }
         self.new_history_from_server(update)?;
         Ok(())
     }
@@ -617,12 +642,18 @@ impl WorkflowMachines {
                 }
             }};
         }
+        let mut replayed_slice_events = vec![];
         let mut peeked_events = events.iter().peekable();
         while let Some(event) = peeked_events.next() {
             if let Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(ref wtc)) =
                 event.attributes
             {
                 apply_wft_complete_data!(self, wtc);
+                // The event records which offsets that task consumed; the server
+                // sends the bytes back separately, keyed by this event.
+                if !wtc.stream_cursors.is_empty() {
+                    replayed_slice_events.push(event.event_id);
+                }
             }
             if peeked_events.peek().is_none()
                 && let Some(wtc) = self
@@ -821,6 +852,24 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
+            }
+        }
+
+        // Ranges an earlier task consumed, in the order those tasks ran, so a
+        // replaying workflow observes them exactly as it did the first time.
+        replayed_slice_events.sort_unstable();
+        for event_id in replayed_slice_events {
+            if let Some(slices) = self.stream_slices_by_event.remove(&event_id) {
+                for slice in slices {
+                    self.drive_me.send_job(deliver_stream_messages_job(slice));
+                }
+            }
+        }
+        // Then the range for the task about to run, which is only meaningful
+        // once we have caught up to it.
+        if !self.replaying {
+            for slice in std::mem::take(&mut self.current_stream_slices) {
+                self.drive_me.send_job(deliver_stream_messages_job(slice));
             }
         }
 
@@ -1816,4 +1865,15 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+/// Turn a slice the server supplied into the job lang sees.
+fn deliver_stream_messages_job(slice: StreamSlice) -> OutgoingJob {
+    workflow_activation::DeliverStreamMessages {
+        stream_id: slice.stream_id,
+        from_offset: slice.from_offset,
+        to_offset: slice.to_offset,
+        messages: slice.messages,
+    }
+    .into()
 }

@@ -1277,6 +1277,13 @@ pub mod coresdk {
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
                         }
+                        workflow_activation_job::Variant::DeliverStreamMessages(d) => {
+                            write!(
+                                f,
+                                "DeliverStreamMessages({}, {}..{})",
+                                d.stream_id, d.from_offset, d.to_offset
+                            )
+                        }
                     }
                 }
             }
@@ -2638,6 +2645,11 @@ pub mod temporal {
         pub mod sdk {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.sdk.v1");
+            }
+        }
+        pub mod stream {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.stream.v1");
             }
         }
         pub mod taskqueue {
