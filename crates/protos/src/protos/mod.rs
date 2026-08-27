@@ -1493,6 +1493,12 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for SubscribeStream {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "SubscribeStream({})", self.stream_id)
+                }
+            }
+
             impl Display for StartTimer {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "StartTimer({})", self.seq)
@@ -1832,6 +1838,9 @@ pub mod temporal {
                                 CommandType::ScheduleActivityTask
                             }
                             Attributes::StartTimerCommandAttributes(_) => CommandType::StartTimer,
+                            Attributes::SubscribeStreamCommandAttributes(_) => {
+                                CommandType::SubscribeStream
+                            }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
                             }
@@ -1882,6 +1891,17 @@ pub mod temporal {
                     impl Display for command::Attributes {
                         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                             write!(f, "{:?}", self.as_type())
+                        }
+                    }
+
+                    impl From<workflow_commands::SubscribeStream> for command::Attributes {
+                        fn from(s: workflow_commands::SubscribeStream) -> Self {
+                            Self::SubscribeStreamCommandAttributes(
+                                SubscribeStreamCommandAttributes {
+                                    stream_id: s.stream_id,
+                                    start_offset: s.start_offset,
+                                },
+                            )
                         }
                     }
 
@@ -2344,6 +2364,7 @@ pub mod temporal {
                                 | EventType::TimerStarted
                                 | EventType::UpsertWorkflowSearchAttributes
                                 | EventType::WorkflowPropertiesModified
+                                | EventType::WorkflowStreamSubscribed
                                 | EventType::NexusOperationScheduled
                                 | EventType::NexusOperationCancelRequested
                                 | EventType::WorkflowExecutionCanceled
@@ -2443,6 +2464,7 @@ pub mod temporal {
                             // mark any new event types as ignorable or not.
                             if let Some(a) = self.attributes.as_ref() {
                                 match a {
+                                    Attributes::WorkflowStreamSubscribedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionStartedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionCompletedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionFailedEventAttributes(_) => false,
@@ -2530,6 +2552,7 @@ pub mod temporal {
                         pub fn event_type(&self) -> EventType {
                             // I just absolutely _love_ this
                             match self {
+                            Attributes::WorkflowStreamSubscribedEventAttributes(_) => { EventType::WorkflowStreamSubscribed }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
                             Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
                             Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }
