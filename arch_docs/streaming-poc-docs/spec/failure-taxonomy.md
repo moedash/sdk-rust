@@ -15,7 +15,7 @@ to metrics, and the operator response — not whether the task is retried.
 | Condition | Completion | Server behavior | Operator response |
 |---|---|---|---|
 | Backend unreachable, timing out, or erroring on replay | `Failure`, `force_cause = WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE`, **`StreamStorageError`** error type, its own metric | Retried | None — clears when the backend recovers |
-| Recorded offset missing, expired, reordered, or count mismatch — i.e. deletion, trimming, or retention expiry | `Failure`, same `force_cause`, **`StreamIntegrityError`** error type, distinct metric | Retried, and keeps failing | Repair or restore the backend, or terminate the Run |
+| Recorded offset or staged output missing, expired, reordered, or conflicting — i.e. deletion, trimming, retention expiry, or an impossible stage identity | `Failure`, same `force_cause`, **`StreamIntegrityError`** error type, distinct metric | Retried, and keeps failing | Repair or restore the backend, or terminate the Run |
 | Record bytes present and intact, but the DataConverter or codec cannot decode them | `Failure`, same `force_cause`, **`StreamDecodeError`** error type, its own metric | Retried, and keeps failing | Align the consumer's converter/codec with the producer's — the stream is fine |
 | Recorded annotation does not match the subscriptions Workflow code creates | `Failure` as a nondeterminism error, same class as a command mismatch | Retried, and keeps failing | Fix or version the Workflow code |
 
@@ -125,6 +125,17 @@ integrity loss does not. **Operators are expected to alert on the integrity metr
 
 - Backend failure during a live activation fails the Workflow Task with the external-storage failure
   cause; an uncommitted cursor is retried from the preceding marker.
+- Output staging failure before completion also fails the Workflow Task with the external-storage
+  cause. No commit command or marker is sent, and retry reuses the saved stage identity.
+- A provider stage conflict, a missing staged record, a changed immutable manifest, or History
+  retention loss needed to resolve a pending stage is `StreamIntegrityError`. These conditions are
+  never guessed through.
+- A pending output stage is an ordering barrier. If neither its exact token commit nor a later exact
+  Workflow Task boundary is yet visible, it remains pending. Backend or Temporal outages during
+  reconciliation are `StreamStorageError`; elapsed time is not an abort predicate.
+- A committed output payload that cannot be decoded is `StreamDecodeError`, under the same
+  range-validated rule as input. This may surface to an external output client rather than through a
+  Workflow Task completion.
 - Watcher failures are retried within provider policy. If readiness can no longer be monitored
   safely, Python reports the failure to Core rather than allowing the WFT to time out silently.
 - A worker crash discards uncommitted reads. Replay re-reads from the last committed marker.
@@ -141,6 +152,11 @@ integrity loss does not. **Operators are expected to alert on the integrity metr
   for a subscription set an annotation cannot carry (`annotation-format.md`), and
   `ConcurrentStreamConsumerError` at the wait, for a second coroutine blocking on one subscription
   (`python-runtime.md`).
+
+`OutputAppendNotAcknowledgedError` is also outside the four Workflow-Task rows. It is the direct
+producer's explicit statement that an append outcome is unknown. The caller must retry
+`resolve_append()` with the exact captured record; calling `publish()` again would allocate another
+sequence and could duplicate the value.
 
 ## Metrics summary
 

@@ -19,6 +19,7 @@ import "temporal/api/sdk/v1/event_group_marker.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
+import "temporal/sdk/core/external_data/external_data.proto";
 
 message WorkflowCommand {
     // User metadata that may or may not be persisted into history depending on the command type.
@@ -58,6 +59,8 @@ message WorkflowCommand {
         WorkflowStreamQuiescent workflow_stream_quiescent = 24;
         ExternalStreamParkResult external_stream_park_result = 25;
         ExternalStreamFinalized external_stream_finalized = 26;
+        WorkflowOutputStreamCommit workflow_output_stream_commit = 27;
+        WorkflowOutputStreamBuffered workflow_output_stream_buffered = 28;
     }
 }
 
@@ -131,6 +134,20 @@ message StreamSetBecameReady {}
 message ExternalStreamFinalized {
     uint64 quiescence_generation = 1;
     bytes final_observation_delta = 2;
+}
+
+// Reports that the output batch for this Workflow Task has been durably staged outside History.
+// Core records only this compact manifest in the shared external-stream marker.
+message WorkflowOutputStreamCommit {
+    coresdk.external_data.ExternalOutputStreamManifest manifest = 1;
+    // The deterministic output capacity was reached and this task must request a replacement.
+    bool request_rollover = 2;
+}
+
+// Reports that external output is buffered in lang but has not yet been staged. Core retains the
+// open Workflow Task until the earliest reported deadline and then asks lang to finalize it.
+message WorkflowOutputStreamBuffered {
+    google.protobuf.Duration max_publish_latency = 1;
 }
 
 message StartTimer {

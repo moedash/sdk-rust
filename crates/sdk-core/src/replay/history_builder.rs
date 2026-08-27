@@ -377,7 +377,13 @@ impl TestHistoryBuilder {
                 .collect(),
             replay_annotation: replay_annotation.to_vec(),
             terminal_boundary: terminal_boundary as i32,
+            output: None,
         };
+        self.add_external_stream_marker_data(data);
+    }
+
+    /// Add an External Workflow Stream marker with an exact test-provided envelope.
+    pub fn add_external_stream_marker_data(&mut self, data: ExternalStreamMarkerData) {
         let attrs = MarkerRecordedEventAttributes {
             marker_name: EXTERNAL_STREAM_MARKER_NAME.to_string(),
             details: build_external_stream_marker_details(&data),

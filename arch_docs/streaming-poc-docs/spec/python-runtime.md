@@ -135,6 +135,54 @@ is a store-context question rather than a serialization-context one, and it need
 what target an Activity-hosted producer names — itself, or the Workflow the record is for — which
 would change where blobs land.
 
+## Workflow output batching and staging
+
+`external_output_stream.topic(name, type=...)` gives Workflow code a publisher, never a backend
+handle. `publish()` and explicit `finish()` run only the deterministic payload-converter half on the
+Workflow thread, frame the logical record, and append it to per-Workflow-Task runtime state. They
+perform no codec, external-payload-store, provider, Temporal-client, clock, or random operation.
+Read-only Workflow contexts reject both operations.
+
+The runtime tracks topic order, finished topics, per-activation record-count vectors, and the minimum
+record, logical-byte, and latency policy of every non-empty topic in the retained batch. Record and
+logical-byte capacity is charged against canonical pre-codec frames for the whole Workflow Task.
+When another publish would exceed it, that publish blocks, the current batch requests a capacity
+rollover, and the replacement task releases the waiter. Replay ignores current live policies and
+validates against History's manifest instead (ADR-046).
+
+After the synchronous activation returns, `worker/_workflow.py` owns the asynchronous half. It binds
+the Workflow serialization context, applies the payload codec and external store, constructs one
+immutable stage per topic under a shared opaque token, and calls the output provider. It saves the
+logical attempt before the first await. A retry therefore repeats the same token and manifest even
+when newly encoded bytes differ; the provider returns the first staged bytes as authoritative.
+Provider conflict is integrity loss, while a transport or staging outage fails the Workflow Task as
+external storage failure.
+
+The Worker then chooses among three completion shapes:
+
+- stage immediately and emit `WorkflowOutputStreamCommit` when no retainable quiescent input
+  snapshot exists, a user/server command is present, or capacity requests rollover;
+- emit `WorkflowOutputStreamBuffered` without provider staging when input quiescence can retain the
+  task; or
+- on `FinalizeExternalStreams{OUTPUT_LATENCY}` or a confirmed park, stage before answering and put
+  the finalization/park result and commit on the same completion.
+
+If a park recheck becomes ready, output remains logical and Python reports `Buffered` before
+`became_ready`. If Core has already invalidated a park after output was staged, it carries that one
+commit through resolve/finalization rather than staging again. `output_stage_recorded()` advances to
+the next batch only after the compact commit command has been emitted.
+
+The reserved output Continue-As-New header is decoded before Workflow code runs and restores the
+finished-topic set without a backend read. Its provider binding must match. Workflow completion does
+not synthesize `FINISH`; only Workflow `finish()` or direct producer `finish_writing()` does
+(ADR-048).
+
+Direct external processes and Activities use `ExternalOutputStreamProducer`, which appends committed
+records under an idempotency session/sequence and requires retrying the exact record after an
+ambiguous acknowledgement. `ExternalOutputStreamClient` reads the committed prefix from the backend;
+only a pending head barrier makes it consult Temporal History for lazy exact-token reconciliation.
+Normal reads and `tail()` are backend-only.
+
 ## Four positions, one commit
 
 "Cursor" covers four different positions, owned by four different components, and conflating any two
@@ -305,7 +353,7 @@ that coverage back by keeping the phantom wait.
 
 ## Which side answers which activation job
 
-Two of the four stream jobs are themselves backend operations, so the dispatch splits in
+Runtime-internal stream jobs split in
 `_handle_activation` — already `async`, and already doing pre-activation await work — rather than
 running through the synchronous `_apply` chain (ADR-011):
 
@@ -313,8 +361,8 @@ running through the synchronous `_apply` chain (ADR-011):
 |---|---|---|
 | `ResolveExternalStreamWaits` | `_apply` | Readiness means "buffered", so the drain is a bounded buffer pop |
 | `ReplayExternalStreams` | *prepared* in `_handle_activation`, delivered in `_apply` | Inclusive range reads plus integrity validation over the whole recorded range |
-| `PrepareExternalStreamPark` | `_handle_activation` only | Installs intents and awaits the backend; runs no user Workflow code |
-| `FinalizeExternalStreams` | `_handle_activation` only | No backend work at all (ADR-010), but it must run no user code and be answered from out-of-sandbox state |
+| `PrepareExternalStreamPark` | `_handle_activation` only | Installs intents and awaits the input backend; if its result is terminal and output exists, the outer Worker stages before completion |
+| `FinalizeExternalStreams` | `_handle_activation` only | The finalization handler itself needs no input backend work (ADR-010); `OUTPUT_LATENCY` additionally makes the outer Worker stage output before completion |
 
 Routing the last three through `_apply` would put multi-second backend transactions inside a
 synchronous `activate()` under a 2-second timeout, failing the Workflow Task for a healthy backend

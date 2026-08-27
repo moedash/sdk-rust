@@ -1507,6 +1507,14 @@ impl Worker {
         }
     }
 
+    /// Test-only reach into the output deadline's serialized local input.
+    #[cfg(test)]
+    pub(crate) fn notify_external_output_flush_deadline(&self, run_id: &str) {
+        if let Some(workflows) = self.task_subsystems.workflows.as_ref() {
+            workflows.notify_external_output_flush_deadline(run_id);
+        }
+    }
+
     /// Test scaffolding: put a cached run's external stream wait set into a given state.
     #[cfg(test)]
     pub(crate) async fn seed_external_stream_waits(

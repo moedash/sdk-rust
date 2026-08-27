@@ -32,7 +32,7 @@ are partitioned in the same place:
 | Job | Handling |
 |---|---|
 | `PrepareExternalStreamPark` | Handled entirely there; the worker synthesizes `ExternalStreamParkResult` without calling `activate()` at all |
-| `FinalizeExternalStreams` | Same place, but no backend work — see ADR-010 |
+| `FinalizeExternalStreams` | Same place; its input terminal is manager-only, while `OUTPUT_LATENCY` may additionally stage output in the outer async layer — see ADR-010 and ADR-045 |
 | `ReplayExternalStreams` | *Prepared* there: buffers filled and validated, then the job passes through to `activate()` for in-memory delivery |
 | `ResolveExternalStreamWaits` | Passes straight through — readiness already means "buffered" |
 

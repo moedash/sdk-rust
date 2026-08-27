@@ -1,13 +1,15 @@
-# Proposals
+# Proposals and promotion records
 
-Candidate extensions live here while their contracts are still under review. They are not part of
-the accepted External Workflow Streams specification, and an implementation must not cite them as
-current behavior.
+Candidate extensions and promotion records live here. A candidate is not part of the accepted
+External Workflow Streams specification. A promotion record may retain the rationale for an
+implemented design, but current normative behavior must be cited from `spec/` and
+`decisions/`, not from this directory.
 
 | Proposal | Status | Adds |
 |---|---|---|
-| [Workflow-originated external output streams](workflow-originated-external-streams.md) | Proposed | Workflow/Activity publishers and an external client subscriber over externally stored output |
+| [Workflow-originated external output streams](workflow-originated-external-streams.md) | Implemented; feature-wide pre-production validation continues | Workflow/Activity publishers and an external client subscriber over externally stored output |
 
-Acceptance moves normative behavior into `spec/`, records each non-obvious choice in `decisions/`,
-and adds required-test cases. The proposal may then remain as a short pointer or be removed; it must
-not become a second copy of the specification.
+Promotion moves normative behavior into `spec/`, records each non-obvious choice in `decisions/`,
+and adds required-test cases. Open cases in the executable mapping are the validation backlog for
+the pre-production feature as a whole; they are not a separate maturity classification for the
+output direction.

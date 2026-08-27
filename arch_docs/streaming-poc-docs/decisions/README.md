@@ -18,7 +18,7 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [007](ADR-007-byte-budget-forces-rollover.md) | A hard byte budget forces rollover rather than growing a marker | `spec/annotation-format.md` |
 | [008](ADR-008-no-marker-without-a-terminal.md) | Core never writes a marker without a terminal from Python | `spec/core-lang-protocol.md` |
 | [009](ADR-009-shutdown-is-two-transitions.md) | Shutdown and eviction are two transitions | `spec/wft-lifecycle.md` |
-| [010](ADR-010-finalization-is-manager-state-only.md) | `FinalizeExternalStreams` is manager-state-only | `spec/python-runtime.md` |
+| [010](ADR-010-finalization-is-manager-state-only.md) | The input terminal in `FinalizeExternalStreams` is manager-state-only | `spec/python-runtime.md` |
 | [011](ADR-011-runtime-only-jobs-run-outside-the-workflow-thread.md) | Runtime-only jobs are handled in `_handle_activation`, not `_apply` | `spec/python-runtime.md` |
 | [012](ADR-012-park-intents-are-keyed-per-subscription.md) | Park intents are keyed per subscription, not per stream | `spec/backend-contract.md` |
 | [013](ADR-013-readiness-result-distinguishes-five-states.md) | The readiness result distinguishes a cached Run from a missing one | `spec/core-lang-protocol.md` |
@@ -51,6 +51,11 @@ load-bearing. Adding a decision means adding a file and a row below.
 | [041](ADR-041-a-reported-task-keeps-the-readiness-promise.md) | A task on its way to the server keeps the readiness promise it made | `spec/core-lang-protocol.md` |
 | [042](ADR-042-one-run-has-one-outstanding-wake-cycle.md) | One Run has one outstanding wake cycle | `spec/wake-signal.md` |
 | [043](ADR-043-a-second-workflow-task-is-buffered.md) | A second Workflow Task is buffered, never substituted | `spec/wft-lifecycle.md` |
+| [044](ADR-044-output-stage-tokens-and-exact-history-floors-prove-commit.md) | Output stage tokens and exact History floors prove commit | `spec/backend-contract.md` |
+| [045](ADR-045-output-latency-and-input-parking-share-one-terminal-race.md) | Output latency and input parking share one terminal race | `spec/wft-lifecycle.md` |
+| [046](ADR-046-output-capacity-is-logical-and-segmentation-is-shared.md) | Output capacity is logical and replay segmentation is shared with input | `spec/annotation-format.md` |
+| [047](ADR-047-pending-output-is-a-topic-ordering-barrier.md) | Pending output is a topic ordering barrier | `spec/backend-contract.md` |
+| [048](ADR-048-finished-output-topics-use-a-must-understand-header.md) | Finished output topics use a must-understand continuation header | `spec/annotation-format.md` |
 
 ## The decisions that constrain the most
 
@@ -65,3 +70,6 @@ If you read only a few, read these — the rest of the design leans on them:
   every readiness result that Core cannot accept locally.
 - **ADR-043** (buffer a second Workflow Task) is the task-token ownership invariant at Core
   admission.
+- **ADR-044** (unique stage token plus exact History floor) is the commit-proof invariant for every
+  Workflow-originated output batch.
+- **ADR-045** (one output/park terminal race) prevents a retained task from writing two boundaries.

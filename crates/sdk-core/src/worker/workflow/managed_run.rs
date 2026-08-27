@@ -45,7 +45,7 @@ use temporalio_common::protos::{
         },
         workflow_commands::{
             ExternalStreamFinalized, ExternalStreamParkResult, ExternalStreamWait,
-            FailWorkflowExecution, QueryResult, WorkflowStreamProgress,
+            FailWorkflowExecution, QueryResult, WorkflowOutputStreamCommit, WorkflowStreamProgress,
             external_stream_park_result,
         },
         workflow_completion,
@@ -256,6 +256,10 @@ impl ManagedRun {
         // set would make the next ordinary completion look like a lang protocol violation.
         self.waiting_on_local_work.pending_finalization = None;
         self.waiting_on_local_work.pending_park = None;
+        self.waiting_on_local_work.pending_output_commit = None;
+        self.clear_external_output_buffered();
+        self.waiting_on_local_work.output_latency_pending = false;
+        self.waiting_on_local_work.park_rollback_resolve_pending = false;
         // Same reasoning for a query answer held across that finalization: the task it was going
         // to be reported on is gone, and the server re-delivers the query on the replacement if it
         // is still outstanding. Reporting it on *this* task would answer a query nobody asked.
@@ -310,6 +314,33 @@ impl ManagedRun {
                 .external_wait_set
                 .set_wft_open(true);
             self.maybe_issue_external_stream_resolve();
+        }
+
+        // Output capacity is backpressure inside the Workflow, rather than an external event the
+        // server can put on the replacement task. The completion that staged the full batch asked
+        // the server for this task specifically so lang could enter a new activation and release
+        // its capacity waiters. Carry that one-shot intent across the report; any real job already
+        // guarantees the activation, otherwise materialize the existing runtime resume job. An
+        // empty hint set is intentional and safe -- hints have never been exhaustive, and lang
+        // probes every active input wait while its ordinary activation turn also releases the
+        // output waiters.
+        let output_capacity_activation_pending = mem::take(
+            &mut self
+                .waiting_on_local_work
+                .output_capacity_activation_pending,
+        );
+        if output_capacity_activation_pending && !self.wfm.machines.has_pending_jobs() {
+            self.wfm.machines.send_core_generated_job(
+                workflow_activation_job::Variant::ResolveExternalStreamWaits(
+                    ResolveExternalStreamWaits {
+                        quiescence_generation: self
+                            .waiting_on_local_work
+                            .external_wait_set
+                            .quiescence_generation(),
+                        ready_hints: vec![],
+                    },
+                ),
+            );
         }
 
         let activation = self.wfm.get_next_activation()?;
@@ -405,6 +436,10 @@ impl ManagedRun {
         {
             if let Some(id) = reset_last_started_to {
                 self.wfm.machines.reset_last_started_id(id);
+                // The server discarded the speculative task and its capacity marker, so its
+                // replacement is a redelivery, not the fresh task that may release lang's waiter.
+                self.waiting_on_local_work
+                    .output_capacity_activation_pending = false;
             }
             // Tell the LA manager that we're done with the WFT
             if let Some(ref local_act_request_sink) = self.local_activity_request_sink {
@@ -721,6 +756,9 @@ impl ManagedRun {
         is_auto_fail: bool,
         resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
     ) -> RunUpdateAct {
+        self.clear_external_output_buffered();
+        self.waiting_on_local_work.output_latency_pending = false;
+        self.waiting_on_local_work.park_rollback_resolve_pending = false;
         let (tt, attempt) = if let Some(t) = self.wft.as_ref() {
             (t.info.task_token.clone(), t.info.attempt)
         } else {
@@ -918,16 +956,154 @@ impl ManagedRun {
                 });
             }
         };
+        let output_was_buffered = self.waiting_on_local_work.output_buffered;
+        if let Some(commit) = stream_commands.output_commit.take() {
+            if self.waiting_on_local_work.pending_output_commit.is_some() {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "Lang sent more than one WorkflowOutputStreamCommit for one Workflow Task"
+                            .to_string(),
+                    ),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            let Some(manifest) = commit.manifest.as_ref() else {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "WorkflowOutputStreamCommit carried no staged output manifest".to_string(),
+                    ),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            };
+            let Some(history_floor_event_id) = self
+                .wfm
+                .machines
+                .current_wft_history_floor_event_id()
+                .filter(|id| *id > 0)
+            else {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "Refusing an external output commit because Core could not identify the \
+                         exact event preceding this Workflow Task's scheduled event"
+                            .to_string(),
+                    ),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            };
+            if manifest.history_floor_event_id != history_floor_event_id {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(format!(
+                        "External output manifest history floor {} does not match this Workflow \
+                         Task's exact floor {history_floor_event_id}",
+                        manifest.history_floor_event_id
+                    )),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            if manifest.run_id != self.wfm.machines.run_id {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(format!(
+                        "External output manifest names Run {} but this Workflow Task belongs to {}",
+                        manifest.run_id, self.wfm.machines.run_id
+                    )),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            if manifest.stage_token.is_empty() {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "External output manifest carried an empty stage token".to_string(),
+                    ),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            if manifest.schema_version != 1
+                || manifest.fingerprint_version != 1
+                || manifest.provider_id.is_empty()
+                || manifest.provider_format_version == 0
+                || manifest.topics.is_empty()
+                || manifest.segments.is_empty()
+                || <_ as prost::Message>::encoded_len(manifest) > 64 * 1024
+            {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "External output manifest has an unsupported version, missing provider, \
+                         empty schedule, or exceeds the 64 KiB marker budget"
+                            .to_string(),
+                    ),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            let mut topic_names = HashSet::new();
+            if manifest.topics.iter().any(|topic| {
+                topic.topic.is_empty()
+                    || !topic_names.insert(topic.topic.as_str())
+                    || topic.record_count == 0
+                    || topic.logical_byte_count == 0
+                    || topic.logical_fingerprint.len() != 32
+            }) || manifest
+                .segments
+                .iter()
+                .any(|segment| segment.record_counts_by_topic.len() != manifest.topics.len())
+                || manifest
+                    .topics
+                    .iter()
+                    .enumerate()
+                    .any(|(topic_index, topic)| {
+                        manifest
+                            .segments
+                            .iter()
+                            .map(|segment| u64::from(segment.record_counts_by_topic[topic_index]))
+                            .sum::<u64>()
+                            != u64::from(topic.record_count)
+                    })
+            {
+                return Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "External output manifest has duplicate or malformed topics, \
+                         fingerprints, or activation segment counts"
+                            .to_string(),
+                    ),
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+            self.waiting_on_local_work.pending_output_commit = Some(commit);
+            self.clear_external_output_buffered();
+        }
+        if let Some(max_publish_latency) = stream_commands.output_buffered_latency.take()
+            && !self.wfm.machines.replaying
+        {
+            self.note_external_output_buffered(max_publish_latency);
+        }
+        let output_commit_pending = self.waiting_on_local_work.pending_output_commit.is_some();
+        let completing_output_capacity = self
+            .waiting_on_local_work
+            .pending_output_commit
+            .as_ref()
+            .is_some_and(|commit| commit.request_rollover);
         let has_server_bound_commands = !lang_commands.is_empty();
 
         // Lang answered `PrepareExternalStreamPark`. Paired against the *issued* job for the same
         // reason finalization is: a park job answered without a result would leave Core holding a
         // boundary it decided with no terminal to write, and an unprompted result would let lang
         // close an annotation Core never asked it to close.
+        let output_latency_preempts_park = self.waiting_on_local_work.output_latency_pending
+            && self.waiting_on_local_work.pending_park.is_some();
         let park_outcome = match (
             self.waiting_on_local_work.pending_park,
             stream_commands.park_result,
         ) {
+            (Some(PendingPark::Queued(_)), None) if output_latency_preempts_park => {
+                self.waiting_on_local_work.pending_park = None;
+                self.wfm.machines.discard_pending_external_stream_park();
+                self.abort_external_stream_park_for_boundary();
+                Some(ParkApplication::Aborted)
+            }
+            (Some(PendingPark::Issued(_)), Some(_)) if output_latency_preempts_park => {
+                self.waiting_on_local_work.pending_park = None;
+                self.abort_external_stream_park_for_boundary();
+                Some(ParkApplication::Aborted)
+            }
             (Some(PendingPark::Issued(reason)), Some(result)) => {
                 self.waiting_on_local_work.pending_park = None;
                 Some(self.apply_park_result(reason, result))
@@ -963,6 +1139,17 @@ impl ManagedRun {
                 park_outcome,
                 Some(ParkApplication::Aborted | ParkApplication::Stale)
             );
+        let staged_output_from_losing_park = output_commit_pending
+            && matches!(
+                park_outcome,
+                Some(ParkApplication::Aborted | ParkApplication::Stale)
+            );
+        if staged_output_from_losing_park {
+            // Lang may already have staged output before Core discovers that readiness beat its
+            // confirmation. The park terminal cannot be used, so finish rolling the park back and
+            // obtain a valid terminal through finalization before recording the staged batch.
+            self.abort_external_stream_park_for_boundary();
+        }
 
         // A `FinalizeExternalStreams` job's only legal responses are `ExternalStreamFinalized` or
         // an activation failure. Anything else means Core asked for a terminal and did not get
@@ -974,6 +1161,17 @@ impl ManagedRun {
             &stream_commands.finalized,
         ) {
             (Some(reason), Some(finalized)) => {
+                if (reason == ParkReason::OutputLatency || output_was_buffered)
+                    && !output_commit_pending
+                {
+                    return Err(RunUpdateErr {
+                        source: WFMachinesError::Fatal(format!(
+                            "Lang answered FinalizeExternalStreams({reason:?}) while external \
+                             output was buffered but supplied no WorkflowOutputStreamCommit"
+                        )),
+                        complete_resp_chan: completion.resp_chan,
+                    });
+                }
                 self.waiting_on_local_work
                     .external_wait_set
                     .accumulate_annotation(&finalized.final_observation_delta);
@@ -1030,6 +1228,20 @@ impl ManagedRun {
         let completing_rollover = completing_deadline_rollover
             || completing_budget_rollover
             || finalized_boundary == Some(ParkReason::Rollover);
+        let output_latency_was_pending =
+            mem::take(&mut self.waiting_on_local_work.output_latency_pending);
+        let completing_output_latency =
+            output_latency_was_pending || finalized_boundary == Some(ParkReason::OutputLatency);
+        let completing_park_rollback = finalized_boundary.is_some()
+            && mem::take(&mut self.waiting_on_local_work.park_rollback_resolve_pending);
+        if completing_park_rollback {
+            // The mixed resolve/finalize activation removes the losing park's backend intents,
+            // but finalization deliberately does not run Workflow code. Re-publishing readiness
+            // makes the forced replacement task perform the drain the losing park interrupted.
+            self.waiting_on_local_work
+                .external_wait_set
+                .mark_all_ready_after_aborted_park();
+        }
 
         // Registering the wait set and retaining the Workflow Task are two separate questions, and
         // they are decided separately here. Both are decided before anything is pushed into the
@@ -1042,6 +1254,8 @@ impl ManagedRun {
         let boundary_closes_the_run = data.activation_was_eviction
             || completing_rollover
             || completing_shutdown
+            || completing_output_latency
+            || staged_output_from_losing_park
             || finalized_boundary.is_some();
         // A pending rollover overrides a retention request. Lang asked to be held open without
         // knowing the deadline had already expired, and honouring that would restart the deadline
@@ -1051,8 +1265,10 @@ impl ManagedRun {
         // A teardown overrides it for a harder reason still: lang asked to be held open on a
         // Worker that is going away, and honouring that would leave a Workflow Task retained with
         // nothing left to release it and no replacement task ever coming.
-        let retention_requested =
-            (stream_commands.quiescence.is_some() || park_retains) && !boundary_closes_the_run;
+        let retention_requested = (stream_commands.quiescence.is_some()
+            || park_retains
+            || self.waiting_on_local_work.output_buffered)
+            && !boundary_closes_the_run;
         // Replay runs no timers. A replayed Run still has to *register* its wait set -- that set
         // is per-Worker runtime state, not History, so nothing else rebuilds it -- but retaining a
         // replayed task would arm the idle and rollover deadlines against wall-clock time that has
@@ -1061,8 +1277,11 @@ impl ManagedRun {
         // boundary instead; there is nothing here for a timer to decide.
         let replaying = self.wfm.machines.replaying;
         let answering_a_query = !data.query_responses.is_empty();
-        let will_retain =
-            retention_requested && !has_server_bound_commands && !answering_a_query && !replaying;
+        let will_retain = retention_requested
+            && !has_server_bound_commands
+            && !answering_a_query
+            && !replaying
+            && !output_commit_pending;
 
         // Registering is not retaining. A completion that also produced a timer, activity, child
         // workflow or signal must be reported so the server can act on it -- but the subscriptions
@@ -1088,7 +1307,8 @@ impl ManagedRun {
         // annotation at risk was accumulated before either.
         let stream_waits_still_pending = stream_commands.quiescence.is_some()
             || park_retains
-            || self.waiting_on_local_work.external_wait_set.retains_wft();
+            || self.waiting_on_local_work.external_wait_set.retains_wft()
+            || self.waiting_on_local_work.output_buffered;
         let query_refused_retention = stream_waits_still_pending
             && !boundary_closes_the_run
             && !has_server_bound_commands
@@ -1109,19 +1329,40 @@ impl ManagedRun {
         } else if let Some(reason) = finalized_boundary {
             // Core decided this boundary and lang has now supplied its terminal.
             Some(reason)
-        } else if completing_budget_rollover {
-            Some(ParkReason::BudgetRollover)
         } else if lang_commands.iter().any(|c| c.variant.is_terminal()) {
             Some(ParkReason::WorkflowCompleted)
+        } else if completing_output_capacity {
+            Some(ParkReason::OutputCapacity)
+        } else if completing_budget_rollover {
+            Some(ParkReason::BudgetRollover)
         } else if has_server_bound_commands {
             Some(ParkReason::CommandsProduced)
-        } else if completing_deadline_rollover || completing_shutdown || query_refused_retention {
+        } else if completing_deadline_rollover
+            || completing_shutdown
+            || completing_output_latency
+            || staged_output_from_losing_park
+            || query_refused_retention
+        {
             // Core decided this boundary and lang was never asked for a terminal. Nothing may be
             // written until the finalization round trip below supplies one.
             None
         } else {
             Some(ParkReason::TaskCompleted)
         };
+
+        if terminal.is_some()
+            && self.waiting_on_local_work.output_buffered
+            && !output_commit_pending
+        {
+            return Err(RunUpdateErr {
+                source: WFMachinesError::Fatal(
+                    "A Workflow Task reached a durable boundary while external output was still \
+                     buffered; lang must stage it and send WorkflowOutputStreamCommit first"
+                        .to_string(),
+                ),
+                complete_resp_chan: completion.resp_chan,
+            });
+        }
 
         if let Some(terminal) = terminal
             && let Err(source) = self.emit_external_stream_marker(terminal)
@@ -1130,6 +1371,12 @@ impl ManagedRun {
                 source,
                 complete_resp_chan: completion.resp_chan,
             });
+        }
+        if terminal == Some(ParkReason::OutputCapacity) {
+            // `force_new_wft` obtains the task, and this one-shot flag makes that otherwise-empty
+            // task observable to lang. It is consumed only when the replacement is admitted.
+            self.waiting_on_local_work
+                .output_capacity_activation_pending = true;
         }
 
         // Recorded *after* the marker, so a marker still closes the snapshot that was in effect
@@ -1147,14 +1394,24 @@ impl ManagedRun {
         // wanted is the same one the teardown asks for, and one boundary gets one marker.
         let awaiting_finalization = terminal.is_none()
             && !will_retain
-            && (completing_deadline_rollover || completing_shutdown || query_refused_retention)
+            && (completing_deadline_rollover
+                || completing_shutdown
+                || completing_output_latency
+                || staged_output_from_losing_park
+                || query_refused_retention)
             && self.begin_external_stream_finalization(if completing_shutdown {
                 ParkReason::Shutdown
             } else if completing_deadline_rollover {
                 ParkReason::Rollover
+            } else if completing_output_latency {
+                ParkReason::OutputLatency
             } else {
                 ParkReason::TaskCompleted
             });
+
+        if awaiting_finalization {
+            self.cancel_external_output_flush_timer();
+        }
 
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
@@ -1243,7 +1500,12 @@ impl ManagedRun {
                 Ok(Some(self.prepare_complete_resp(
                     completion.resp_chan,
                     data,
-                    completing_heartbeat_autocomplete || completing_rollover || completing_shutdown,
+                    completing_heartbeat_autocomplete
+                        || completing_rollover
+                        || completing_shutdown
+                        || completing_output_capacity
+                        || completing_output_latency
+                        || (output_commit_pending && stream_waits_still_pending),
                 )))
             }
             Ok(Some((start_t, wft_timeout))) => {
@@ -1362,8 +1624,13 @@ impl ManagedRun {
         &mut self,
         terminal_boundary: ParkReason,
     ) -> Result<(), WFMachinesError> {
+        let output = self
+            .waiting_on_local_work
+            .pending_output_commit
+            .take()
+            .and_then(|commit| commit.manifest);
         let set = &mut self.waiting_on_local_work.external_wait_set;
-        if set.replay_annotation().is_empty() {
+        if set.replay_annotation().is_empty() && output.is_none() {
             // Nothing was observed, so there is nothing to record. Not an error: a Workflow Task
             // that touched no stream is the ordinary case.
             return Ok(());
@@ -1389,6 +1656,7 @@ impl ManagedRun {
                 waits,
                 replay_annotation,
                 terminal_boundary: terminal_boundary as i32,
+                output,
             })
     }
 
@@ -1409,7 +1677,10 @@ impl ManagedRun {
             return true;
         }
         let set = &self.waiting_on_local_work.external_wait_set;
-        if set.replay_annotation().is_empty() {
+        if set.replay_annotation().is_empty()
+            && !self.waiting_on_local_work.output_buffered
+            && self.waiting_on_local_work.pending_output_commit.is_none()
+        {
             return false;
         }
         let quiescence_generation = set.quiescence_generation();
@@ -1465,13 +1736,15 @@ impl ManagedRun {
         // `wft` is Core's own record of holding the task; the probe additionally distinguishes a
         // parked set, which holds no task open even though the Run may still be cached.
         if self.wft.is_none()
-            || !matches!(
-                self.external_stream_run_status(),
-                ExternalStreamRunStatus::WftOpen
-            )
+            || (!self.waiting_on_local_work.output_buffered
+                && !matches!(
+                    self.external_stream_run_status(),
+                    ExternalStreamRunStatus::WftOpen
+                ))
         {
             return false;
         }
+        self.cancel_external_output_flush_timer();
         self.waiting_on_local_work.shutdown_pending = true;
         true
     }
@@ -1565,6 +1838,13 @@ impl ManagedRun {
             // was never reached.
             ParkResolution::StaleGeneration => ParkApplication::Stale,
         }
+    }
+
+    fn abort_external_stream_park_for_boundary(&mut self) {
+        self.waiting_on_local_work
+            .external_wait_set
+            .abort_park_for_boundary();
+        self.waiting_on_local_work.park_rollback_resolve_pending = true;
     }
 
     /// Records a quiescent snapshot, and nothing else.
@@ -1680,6 +1960,43 @@ impl ManagedRun {
         }
     }
 
+    fn note_external_output_buffered(&mut self, max_publish_latency: Duration) {
+        self.waiting_on_local_work.output_buffered = true;
+
+        if let Some(wft_timeout) = self.wft_timeout() {
+            self.start_wft_rollover_timer(self.current_wft_start_time(), wft_timeout);
+        }
+
+        let deadline = Instant::now().add(max_publish_latency);
+        if self
+            .waiting_on_local_work
+            .output_flush_timer
+            .as_ref()
+            .is_some_and(|timer| timer.deadline <= deadline)
+        {
+            return;
+        }
+        self.cancel_external_output_flush_timer();
+        self.waiting_on_local_work.output_flush_timer = Some(OutputFlushTimer {
+            deadline,
+            handle: self.run_timers.start(
+                deadline,
+                LocalInputs::ExternalOutputFlushDeadline(self.wfm.machines.run_id.clone()),
+            ),
+        });
+    }
+
+    fn cancel_external_output_flush_timer(&mut self) {
+        if let Some(timer) = self.waiting_on_local_work.output_flush_timer.take() {
+            timer.handle.abort();
+        }
+    }
+
+    fn clear_external_output_buffered(&mut self) {
+        self.cancel_external_output_flush_timer();
+        self.waiting_on_local_work.output_buffered = false;
+    }
+
     // --- Run-level timers --------------------------------------------------
 
     /// The local-activity heartbeat deadline, now scheduled through the run's own timer facility.
@@ -1738,6 +2055,25 @@ impl ManagedRun {
             None
         };
         self.update_to_acts(Ok(maybe_act.into()))
+    }
+
+    /// The earliest max-publish-latency deadline for buffered output expired.
+    pub(super) fn external_output_flush_deadline(&mut self) -> RunUpdateAct {
+        self.waiting_on_local_work.output_flush_timer = None;
+        if !self.waiting_on_local_work.output_buffered || self.wft.is_none() {
+            return None;
+        }
+
+        if self.activation.is_some() {
+            self.waiting_on_local_work.output_latency_pending = true;
+            return None;
+        }
+
+        if !self.begin_external_stream_finalization(ParkReason::OutputLatency) {
+            return None;
+        }
+        let res = self._check_more_activations();
+        self.update_to_acts(res.map(Into::into))
     }
 
     // --- External Workflow Streams -----------------------------------------
@@ -1898,6 +2234,7 @@ impl ManagedRun {
                 waits: vec![],
                 replay_annotation: b"no terminal here".to_vec(),
                 terminal_boundary: ParkReason::Unspecified as i32,
+                output: None,
             })
             .is_err()
     }
@@ -2522,6 +2859,8 @@ struct ExternalStreamCommands {
     progress: Vec<WorkflowStreamProgress>,
     park_result: Option<ExternalStreamParkResult>,
     finalized: Option<ExternalStreamFinalized>,
+    output_commit: Option<WorkflowOutputStreamCommit>,
+    output_buffered_latency: Option<Duration>,
 }
 
 /// Splits lang's commands, leaving everything else in `commands`.
@@ -2573,6 +2912,33 @@ fn take_external_stream_commands(
             }
             WFCommandVariant::ExternalStreamParkResult(p) => taken.park_result = Some(p),
             WFCommandVariant::ExternalStreamFinalized(f) => taken.finalized = Some(f),
+            WFCommandVariant::ExternalOutputStreamCommit(commit) => {
+                if taken.output_commit.replace(commit).is_some() {
+                    return Err(WFMachinesError::Fatal(
+                        "Lang sent more than one WorkflowOutputStreamCommit in one completion"
+                            .to_string(),
+                    ));
+                }
+            }
+            WFCommandVariant::ExternalOutputStreamBuffered(buffered) => {
+                let max_publish_latency = buffered
+                    .max_publish_latency
+                    .map(|duration| duration.try_into().unwrap_or(Duration::ZERO))
+                    .unwrap_or(Duration::ZERO);
+                if max_publish_latency.is_zero() {
+                    return Err(WFMachinesError::Fatal(
+                        "WorkflowOutputStreamBuffered carried a non-positive max publish latency"
+                            .to_string(),
+                    ));
+                }
+                taken.output_buffered_latency = Some(
+                    taken
+                        .output_buffered_latency
+                        .map_or(max_publish_latency, |current| {
+                            current.min(max_publish_latency)
+                        }),
+                );
+            }
             _ => {
                 seen_other_command = true;
                 remaining.push(command);
@@ -2606,6 +2972,11 @@ struct LocalActivityHeartbeatState {
     heartbeat_timeout_pending: bool,
 }
 
+struct OutputFlushTimer {
+    deadline: Instant,
+    handle: AbortHandle,
+}
+
 /// Local work that may retain the open workflow task.
 ///
 /// Retention used to be a local-activity concept, expressed as `Option<WaitingOnLAs>` and keyed
@@ -2637,6 +3008,16 @@ struct WaitingOnLocalWork {
     /// One timer for the whole set. Readiness for any member cancels it, which is what makes an
     /// idle stream unable to park a workflow task another stream is still driving.
     idle_timer: Option<AbortHandle>,
+    /// Earliest deadline reported for output buffered in lang but not yet staged.
+    output_flush_timer: Option<OutputFlushTimer>,
+    /// Whether lang still owns unstaged external output for this Workflow Task.
+    output_buffered: bool,
+    /// The flush timer expired while a lang activation was outstanding. The completion of that
+    /// activation queues the finalization job rather than expecting an answer to an unseen job.
+    output_latency_pending: bool,
+    /// A losing park's resolve job removed backend intents but did not run Workflow code. Once
+    /// finalization is durable, its forced replacement must issue the resolve again.
+    park_rollback_resolve_pending: bool,
     /// The boundary a `FinalizeExternalStreams` job is outstanding for.
     ///
     /// Core is annotation-blind, so it cannot manufacture a terminal. Between issuing the job and
@@ -2652,6 +3033,11 @@ struct WaitingOnLocalWork {
     /// back, and the marker must say which one it actually was. Its presence is also what stops a
     /// second handshake being started for a set already in one.
     pending_park: Option<PendingPark>,
+    /// The compact manifest for output already staged by lang but not yet recorded in History.
+    pending_output_commit: Option<WorkflowOutputStreamCommit>,
+    /// The accepted output-capacity boundary requested an otherwise-empty replacement Workflow
+    /// Task. That task must enter lang once so it can release the publisher's capacity waiter.
+    output_capacity_activation_pending: bool,
     /// Set when the Run is being torn down -- Worker shutdown or an eviction -- while it still
     /// holds a Workflow Task.
     ///
@@ -2685,6 +3071,9 @@ impl Drop for WaitingOnLocalWork {
         }
         if let Some(handle) = self.wft_rollover_timer.take() {
             handle.abort();
+        }
+        if let Some(timer) = self.output_flush_timer.take() {
+            timer.handle.abort();
         }
     }
 }

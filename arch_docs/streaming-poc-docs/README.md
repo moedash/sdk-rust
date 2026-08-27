@@ -15,7 +15,7 @@ narrative, and where an alternative was considered and rejected the reasoning is
 | If you want to… | Read |
 |---|---|
 | Understand what the feature is | [`overview.md`](overview.md) |
-| Review proposed complementary stream directions | [`proposals/`](proposals/) |
+| Review candidate or not-yet-accepted stream directions | [`proposals/`](proposals/) |
 | Know why something is shaped the way it is | [`decisions/`](decisions/README.md) |
 | Know what a Workflow Task does from open to marker | [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) |
 | Implement a backend provider | [`spec/backend-contract.md`](spec/backend-contract.md) |
@@ -30,20 +30,19 @@ narrative, and where an alternative was considered and rejected the reasoning is
 
 | File | Answers |
 |---|---|
-| [`spec/backend-contract.md`](spec/backend-contract.md) | What a provider must implement, cursor semantics, the immutability precondition, producer binding, park intents, write fences, retention |
-| [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) | Lossless Workflow Task admission; when a task is retained and when its wait set is merely registered; the idle timeout, rollover, parking, shutdown, eviction, and durability boundary |
-| [`spec/annotation-format.md`](spec/annotation-format.md) | The replay annotation grammar, runs, segments, the byte budget and the four rules that make it a bound, replay validation, cursor origin |
+| [`spec/backend-contract.md`](spec/backend-contract.md) | Input and output provider capabilities, cursor semantics, immutability, staging barriers, producer binding, park intents, write fences, retention |
+| [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) | Lossless Workflow Task admission; input retention and parking; output visibility deadlines and their terminal race; rollover, shutdown, eviction, and durability boundaries |
+| [`spec/annotation-format.md`](spec/annotation-format.md) | The input replay grammar, shared input/output segmentation, logical output manifests, byte budgets, replay validation, continuation state |
 | [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md) | Every proto message, activation job, readiness call, and piece of Core state |
-| [`spec/python-runtime.md`](spec/python-runtime.md) | The out-of-sandbox manager, the split decode path and the serialization context both halves carry, the four cursor positions, why the reposition after a replay is synchronous, the two delivery budgets, how `merge()` stays fair across activations, what closing a subscription ends and what it keeps, which side answers which activation job |
+| [`spec/python-runtime.md`](spec/python-runtime.md) | The out-of-sandbox manager; split input decode; Workflow output logical batching and async staging; direct output producers and clients; cursor ownership, delivery budgets, merge fairness, subscription close, and activation-job dispatch |
 | [`spec/wake-signal.md`](spec/wake-signal.md) | The reserved Signal's name, envelope, request-ID derivation, interception, and Run-wide outstanding wake cycle |
 | [`spec/failure-taxonomy.md`](spec/failure-taxonomy.md) | The four failure classes, their error types, metrics, and operator responses |
 
 ## The rest of the set
 
-- [`proposals/`](proposals/) — candidate extensions that are not part of the accepted specification.
-  Each proposal names the unresolved decisions and must become specs plus accepted ADRs before code
-  may claim its behavior.
-- [`decisions/`](decisions/README.md) — 42 current design decisions, each with the alternatives that
+- [`proposals/`](proposals/) — candidate extensions and promotion records whose acceptance gate is
+  still open. Normative implemented behavior lives in specs and ADRs even while validation is pending.
+- [`decisions/`](decisions/README.md) — 47 current design decisions, each with the alternatives that
   were rejected. A spec states what is true; a decision record states why the other shape was not
   taken.
 - [`required-tests/`](required-tests/) — the two required-test lists. These are not prose: the Python

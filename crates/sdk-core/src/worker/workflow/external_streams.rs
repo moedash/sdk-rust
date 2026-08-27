@@ -477,6 +477,12 @@ impl ExternalWaitSet {
         }
     }
 
+    /// Invalidates the current park because another local boundary won its race.
+    pub(crate) fn abort_park_for_boundary(&mut self) {
+        self.abort_parking();
+        self.mark_all_ready_after_aborted_park();
+    }
+
     /// Marks every wait ready because a wake Signal arrived.
     ///
     /// All of them, not just the one the Signal names: the Signal's stream is a hint, and lang
@@ -789,6 +795,25 @@ mod tests {
         assert_eq!(set.wait(1).unwrap().wait_generation, 1);
         assert_eq!(set.wait(1).unwrap().status, ExternalWaitStatus::Ready);
         // Nothing was parked, so no generation is left for a producer to claim.
+        assert_eq!(set.park_generation(), None);
+    }
+
+    #[test]
+    fn a_boundary_winner_invalidates_the_park_and_late_confirmation() {
+        let mut set = quiescent_set(&[1, 2]);
+        let quiesc = set.quiescence_generation();
+        set.start_parking(quiesc, ParkTrigger::AllWriteFenced);
+
+        set.abort_park_for_boundary();
+
+        assert_eq!(set.take_ready_wait_ids(), vec![1, 2]);
+        assert_eq!(set.wait(1).unwrap().wait_generation, 1);
+        assert_eq!(set.wait(2).unwrap().status, ExternalWaitStatus::Ready);
+        assert_eq!(
+            set.resolve_park(quiesc, true),
+            ParkResolution::StaleGeneration,
+            "a late result for the losing park must not create a second boundary"
+        );
         assert_eq!(set.park_generation(), None);
     }
 

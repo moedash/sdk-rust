@@ -43,6 +43,25 @@ local activities already have this property, but a stream can hold a task open f
 latency for those inputs is bounded by the rollover deadline and nothing else, so callers who need
 lower latency must lower the Workflow Task timeout rather than the idle timeout.
 
+## Output visibility has its own deadline
+
+Workflow-originated output cannot wait for an arbitrarily long input idle timeout. Each output topic
+has `max_publish_latency`, defaulting to 100 milliseconds in the first release. A retained batch uses
+the minimum policy of every non-empty topic in that batch; Core preserves the earliest deadline and
+clamps it below ordinary Workflow Task rollover (ADR-045).
+
+Python sends `WorkflowOutputStreamBuffered` only when the completion has a quiescent input snapshot,
+no user/server command, and no output-capacity rollover. Core retains the task and arms the output
+deadline. When it expires, Core issues `FinalizeExternalStreams{OUTPUT_LATENCY}`; Python stages the
+batch and returns both the existing finalization command and `WorkflowOutputStreamCommit`. Core then
+writes the shared marker and forces a replacement task.
+
+Without a quiescent input snapshot — including an output-only Workflow — or when an ordinary command
+already requires reporting the task, output is staged immediately. Capacity also bypasses buffering:
+the commit requests a replacement so a blocked `publish()` can continue in a fresh batch. The
+latency bound is a healthy-path visibility guarantee, not an availability SLA while the provider or
+Temporal service is unavailable.
+
 ## Workflow Task admission is lossless
 
 A Run owns the task token of its current Workflow Task until that task is reported. A polled
@@ -55,7 +74,7 @@ panic, while its release path defensively queues the replacement and returns wit
 original slot. The original token is reported first, and only then does the replacement drain
 (ADR-043). Substitution is never recovery: it loses the token for a task the Worker still owns.
 
-## Two independent questions at every activation return
+## Three independent questions at every activation return
 
 1. **Did replay-visible stream state change?** If yes, a `WorkflowStreamProgress` command carries the
    observation delta, on *every* completion path. This is what commits the cursor boundary, and it is
@@ -66,9 +85,13 @@ original slot. The original token is reported first, and only then does the repl
 2. **Is the Workflow blocked on streams?** If yes, a `WorkflowStreamQuiescent` command reports the
    complete quiescent snapshot. This registers the wait set with Core and — on the completions that
    can be held open — starts the idle timer.
+3. **Does this Workflow Task hold logical output?** If yes, Python either stages it and sends
+   `WorkflowOutputStreamCommit`, or sends `WorkflowOutputStreamBuffered` when and only when the
+   quiescent completion is retainable. Output and input use the same marker and activation-segment
+   schedule.
 
-A completion may carry either command, both, or neither. `WorkflowStreamProgress` never implies
-retention, and `WorkflowStreamQuiescent` carries no annotation data (ADR-004).
+A completion may carry any compatible combination of those commands. `WorkflowStreamProgress` never
+implies retention, and `WorkflowStreamQuiescent` carries no annotation data (ADR-004).
 
 | Condition at return | Python sends | Core does |
 |---|---|---|
@@ -78,6 +101,9 @@ retention, and `WorkflowStreamQuiescent` carries no annotation data (ADR-004).
 | Stream waits pending **and** server-bound commands (timer, activity, child workflow, signal) | `WorkflowStreamProgress` ordered before those commands, then `WorkflowStreamQuiescent` with the same complete snapshot | Records the marker, **registers the waits, arms no timer**, reports the WFT |
 | Stream waits pending, no other command, **nothing consumed** | `WorkflowStreamProgress` carrying the header on first observation plus an **empty segment**, then `WorkflowStreamQuiescent` | Accumulates the delta, registers the waits, retains the WFT, starts the idle timer |
 | Stream waits pending, no other command, records consumed | `WorkflowStreamProgress`, then `WorkflowStreamQuiescent` with the **complete** set | Accumulates the delta, `ActivationCompleteOutcome::DoNothing`, retains the WFT, starts **one** idle timer for the set |
+| Logical output, no retainable quiescent snapshot or a user/server command | `WorkflowOutputStreamCommit` after provider staging | Records the output manifest in the shared marker and reports the WFT |
+| Logical output with a retainable quiescent snapshot and no command or capacity rollover | `WorkflowOutputStreamBuffered`, plus the ordinary input progress/quiescence commands | Retains the WFT and arms the earliest output deadline without provider staging |
+| Logical output reaches record or logical-byte capacity | `WorkflowOutputStreamCommit{request_rollover=true}` after staging | Records the shared marker, reports the WFT, and requests a replacement |
 
 **Command ordering is normative**: `WorkflowStreamProgress` precedes every command whose value could
 depend on consumed data, and so does the marker recording it. On replay that is what guarantees a
@@ -127,6 +153,29 @@ uses a generation-based handshake coordinated through the backend:
    appends it, records the marker, and completes the WFT.
 5. Any stream ready → Python removes every installed intent and returns `StreamSetBecameReady`. Core
    aborts that parking generation and issues `ResolveExternalStreamWaits`.
+
+### Output and parking use the same terminal race
+
+If the runtime holds logical output while it answers `PrepareExternalStreamPark`, the answer depends
+on the backend recheck (ADR-045):
+
+- Park confirmed: Python stages output and orders `WorkflowOutputStreamCommit` before
+  `ExternalStreamParkResult(confirmed)`. Core records one shared park marker and does not force a
+  replacement.
+- Stream became ready: Python sends `WorkflowOutputStreamBuffered` before
+  `ExternalStreamParkResult(became_ready)`. No output is staged and Core retains the original
+  earliest deadline.
+- Readiness wins after Python has already staged for a confirmation: Core rejects the stale park
+  terminal, resolves the abandoned park to remove every installed intent, then finalizes with
+  `TASK_COMPLETED`, records the already staged commit once, and forces a replacement.
+- The output deadline wins while preparation is outstanding: Core invalidates the park generation,
+  resolves it for the same cleanup, then finalizes with `OUTPUT_LATENCY`. A commit already carried by
+  the losing result is retained; otherwise Python stages during finalization. Core records it once
+  and forces a replacement.
+
+The output timer remains armed during park preparation. Suppressing it would let a stalled park
+provider violate the output visibility bound indefinitely. Late timer and park results are stale and
+cannot produce another terminal or marker.
 
 An attempt that ends before Core confirms it withdraws every intent it installed — whether an
 install raised, a recheck raised, or **the attempt was cancelled**. Cancellation is not the exotic

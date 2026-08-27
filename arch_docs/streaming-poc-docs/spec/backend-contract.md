@@ -2,7 +2,25 @@
 
 What a stream provider must implement to be registrable, and what the producer side must supply.
 
-## Required operations
+## Independent provider capabilities
+
+Input and output are separate ABCs and conformance suites:
+
+- `StreamBackend` supplies append, inclusive replay reads, exclusive live reads, and input
+  park/wake coordination.
+- `OutputStreamBackend` supplies staged output, direct committed append, barrier-aware reads,
+  committed tail, stage inspection, and offset comparison.
+
+An input-only provider remains valid. An output-only provider can serve
+`ExternalOutputStreamProducer` and `ExternalOutputStreamClient`. The first-release Worker option is
+validated as `StreamBackend`, so Workflow-originated output requires the configured provider to
+implement **both** contracts. Capability separation prevents output staging from becoming a
+breaking requirement for existing input providers.
+
+Every implemented capability declares structural immutability, `provider_id`, and
+`provider_format_version`.
+
+## Input operations
 
 A backend implementation must provide:
 
@@ -23,6 +41,38 @@ A backend implementation must provide:
 
 Control records and data records share the same offset sequence. Control records are consumed by
 the runtime and are not yielded to Workflow code.
+
+## Output staging and reads
+
+Workflow output is staged per topic sub-batch under an immutable `OutputStageManifest` carrying the
+output `StreamKey`, provider binding, unique stage token, current Run, exact History floor,
+sub-batch index, fingerprint version and digest, record count, and logical byte count (ADR-044).
+The provider exposes:
+
+- `stage_output(manifest, records)`: atomically places an ordered `PENDING` sub-batch. Repeating the
+  exact logical manifest returns the first placed offsets and bytes; another manifest under the
+  same `(stage_token, sub_batch_id)` is a conflict.
+- `commit_output(manifest)` and `abort_output(manifest)`: idempotent terminal transitions that
+  cannot be reversed.
+- `output_stage(manifest)`: exact stage inspection for reconciliation.
+- `append_output(key, record)`: an immediately committed singleton used by Activities and external
+  processes.
+- `read_output_after(key, boundary, ...)`: the committed prefix strictly after the boundary plus,
+  when present, the first unresolved `PendingOutputBarrier`.
+- `output_tail(key)`: the boundary after the readable committed prefix. It does not cross pending
+  data.
+
+A pending stage occupies provider order but is not readable. No read may return a record at or
+beyond its first offset until ADR-044 commits or aborts it (ADR-047). Aborted records are skipped;
+committed records are yielded in offset order. Commit and abort are coordination metadata and never
+rewrite record bytes.
+
+Workers reconcile their own pending stages after reporting when possible. Every
+`ExternalOutputStreamClient` also performs built-in lazy reconciliation at a pending head: it reads
+the exact producing Run's complete History strictly above `history_floor_event_id`, commits on the
+exact marker token, aborts on the first durable Workflow Task closing boundary or Workflow closure,
+and otherwise leaves the barrier pending. A backend or Temporal outage is transient storage
+failure; unavailable deciding History is integrity loss.
 
 ## Cursor semantics
 
@@ -83,8 +133,12 @@ damaged stream (ADR-015). See `failure-taxonomy.md`.
 **Distinct `StreamKey` values must map to distinct physical keys**, and to distinct keys for every
 structure derived from one: records, idempotency state, park intents, and claims.
 
-Every component of a stream identity — namespace, Workflow ID, first execution Run ID, stream name —
-is a user-chosen string, in which a provider's delimiter is an ordinary character. Joining them raw
+Every string component of a stream identity — namespace, Workflow ID, first execution Run ID, and
+stream name — is user-chosen, and direction is an additional enum component. All five participate
+in physical identity. An input and output topic with the same four strings must not share records,
+idempotency state, park metadata, stage status, or claims.
+
+Each string may contain a provider's delimiter. Joining them raw
 is therefore not injective: with `:` as the delimiter, `("ns", "wf", r1, f"{r2}:tokens")` and
 `("ns", f"wf:{r1}", r2, "tokens")` render identically. Two unrelated Workflows then share one
 stream, one idempotency hash, one park intent and one claim. Each reads the other's records, which
@@ -115,7 +169,15 @@ The suite is the deliverable, not the interface. It must contain, at minimum:
 - a case that conditionally removes an intent by Run ID and park generation, refuses mismatches,
   leaves a replacement intent intact, and reports an absent key as absent rather than as a
   mismatch; and
-- a claim that never expires failing the leased-claim case.
+- a claim that never expires failing the leased-claim case;
+- output staging repeated with the exact manifest returning the first placed records and actual
+  terminal status, including a retry after commit or abort;
+- reuse of `(stage_token, sub_batch_id)` with a changed manifest failing atomically without partial
+  records;
+- committed direct output after a pending stage remaining unreadable until that stage commits or
+  aborts;
+- repeated output commit and abort being idempotent while reversal is rejected; and
+- input and output keys with otherwise identical components remaining physically isolated.
 
 ## Parking operations
 
@@ -216,6 +278,14 @@ Workflow *chain* key — namespace, Workflow ID, first execution Run ID — and 
 completes it into the full stream identity, so one connection serves several topics and no two
 arguments can disagree about the name.
 
+The direct output producer uses the same explicit `WorkflowChainKey`, chain verification,
+Workflow-bound serialization context, stable session ID, and invocation-order sequence rule. It
+sends no wake Signal: output clients watch the backend. An append with no reported outcome raises
+`OutputAppendNotAcknowledgedError`; recovery repeats the exact carried record through
+`resolve_append()` rather than drawing a new sequence. `finish_writing()` waits for every earlier
+publish on that topic and then appends `FINISH`; unlike the input producer's write fence, it closes
+the producer's topic handles.
+
 ## Write-fence semantics
 
 `finish_writing()` means:
@@ -290,3 +360,10 @@ stronger archival policy guarantees replayability.
 
 This is an operational prerequisite, not a code deliverable. Violations surface as stream-integrity
 failures.
+
+Output providers additionally retain committed records for their advertised client-resume window
+and retain pending-stage resolution metadata for at least as long as the deciding Temporal History.
+The SDK chooses no default retention period and exposes no operator force-commit/force-abort API.
+Garbage collection is safe only after History proves abort, after the resume and History windows
+both expire without a remaining reference, or as part of explicit integrity-incident repair.
+Elapsed time alone never resolves a pending stage.

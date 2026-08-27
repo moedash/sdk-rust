@@ -1,4 +1,4 @@
-# ADR-010 — `FinalizeExternalStreams` is manager-state-only
+# ADR-010 — The input terminal in `FinalizeExternalStreams` is manager-state-only
 
 **Status:** Accepted · **Affects:** C15a, P19 · **Spec:** `spec/python-runtime.md`
 
@@ -27,19 +27,26 @@ position replay must not reproduce.
 A would additionally require specifying the transaction, its race against readiness, and a retry
 policy for transient failure, all to reproduce a value already in hand.
 
+This decision is specifically about producing `final_observation_delta`. The later output direction
+reuses the job with reason `OUTPUT_LATENCY`; in that case the Worker's outer async layer also stages
+buffered output and sends `WorkflowOutputStreamCommit` on the same completion (ADR-045). That output
+operation does not refresh or otherwise change the input terminal.
+
 ## Consequences
 
-- **There is no transaction to race.**
+- **There is no input-provider transaction to race while encoding the terminal.** Output staging,
+  when required, has its own failure and retry contract.
 - **Watchers keep running during finalization**, exactly as they do during park preparation. A record
   arriving mid-finalization changes nothing about the terminal: it belongs to the next Workflow Task
   and reaches Core through the normal readiness path or, if none is open by then, through the wake
   Signal.
-- **The only failure mode is missing state** — the Run's manager entry is gone or unreadable. There is
-  no transient class here, because there is nothing to be transiently unavailable. Python fails the
-  activation, Core writes no marker, and the Workflow Task is retried (ADR-008).
+- **The terminal encoder's only failure mode is missing state** — the Run's manager entry is gone or
+  unreadable. There is no transient class in that encoder. A separate output stage may fail as
+  `StreamStorageError`; either failure means Core writes no marker and the Workflow Task is retried
+  (ADR-008).
 - It is still dispatched outside the synchronous Workflow thread, but **for a different reason than
   the other runtime-only jobs**: it must run no user code and must be answered from out-of-sandbox
   state, not because it blocks. See ADR-011.
-- A test asserts the choice rather than trusting it: a provider that raises on every method is
-  registered, a finalization is driven, and the marker must still be written — proving no provider
-  call happens on this path from any layer.
+- A test asserts the choice rather than trusting it: for a finalization with no buffered output, a
+  provider that raises on every input method is registered, the finalization is driven, and the
+  terminal must still be produced — proving its encoding makes no provider call.
