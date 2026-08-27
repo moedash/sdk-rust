@@ -1,3 +1,11 @@
+---
+doc_id: EWS-SPEC-BACKEND
+status: normative-pre-production
+audience: [implementers, coding-agents, reviewers]
+canonical_for: backend-provider-contract
+related_adrs: [ADR-002, ADR-003, ADR-012, ADR-019, ADR-020, ADR-040, ADR-044, ADR-047]
+---
+
 # Backend contract
 
 What a stream provider must implement to be registrable, and what the producer side must supply.
@@ -108,7 +116,7 @@ component changes width.
 
 **Every provider must guarantee that a record's bytes cannot change once written.** A backend that
 cannot make the guarantee does not satisfy this contract and is rejected when it is registered on
-the Worker (P17), rather than compensated for at runtime. Redis Streams qualifies: an entry can be
+the Worker, rather than compensated for at runtime. Redis Streams qualifies: an entry can be
 deleted by `XDEL` or removed by trimming, but its fields cannot be rewritten in place.
 
 Given that guarantee, replay needs to detect exactly one class of damage — a record that is **no

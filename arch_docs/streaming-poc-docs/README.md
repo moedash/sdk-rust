@@ -1,69 +1,94 @@
+---
+doc_id: EWS-DOCS-INDEX
+status: pre-production
+audience: [all]
+---
+
 # External Workflow Streams — documentation map
 
-Adding External Workflow Streams to the Temporal Python SDK: high-volume stream payloads live in a
-pluggable external backend, never in Temporal History, while deterministic replay is preserved with
-compact markers.
+External Workflow Streams keep high-volume input and output payloads in a pluggable backend rather
+than Temporal History while compact markers preserve deterministic replay. No Temporal Server
+changes are required.
 
-**These documents describe the design, not the code.** They hold what a reader cannot get from the
-implementation itself: invariants that span Core, the Python runtime, and the provider; rules that no
-single file owns; and the shape of the lifecycle as a whole. Anything a function's own comment
-already explains is deliberately absent — read the code for that. These documents carry no revision
-narrative, and where an alternative was considered and rejected the reasoning is in `decisions/`.
+The documentation is deliberately split by reading mode:
 
-## Start here
+| You need | Start here | Authority |
+|---|---|---|
+| A mental model, diagrams, guarantees, and operational tradeoffs | [`guide/`](guide/README.md) | Explanatory; intentionally simplified |
+| Exact implementation behavior and every edge case | [`spec/`](spec/README.md) | Normative for accepted behavior |
+| Why a non-obvious design was chosen | [`decisions/`](decisions/README.md) | Accepted rationale |
+| Candidate or not-yet-accepted behavior | [`proposals/`](proposals/README.md) | Non-normative until promoted |
+| Required observable coverage | [`required-tests/`](required-tests/) | Executable validation contract |
 
-| If you want to… | Read |
+The old [`overview.md`](overview.md) URL remains as a short compatibility landing page.
+
+## Human guide
+
+Read these in order when learning or reviewing the feature:
+
+| Guide | Answers |
 |---|---|
-| Understand what the feature is | [`overview.md`](overview.md) |
-| Review candidate or not-yet-accepted stream directions | [`proposals/`](proposals/) |
-| Know why something is shaped the way it is | [`decisions/`](decisions/README.md) |
-| Know what a Workflow Task does from open to marker | [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) |
-| Implement a backend provider | [`spec/backend-contract.md`](spec/backend-contract.md) |
-| Understand replay markers and continuation state | [`spec/annotation-format.md`](spec/annotation-format.md) |
-| Understand Worker-side delivery and merge behavior | [`spec/python-runtime.md`](spec/python-runtime.md) |
-| Understand readiness and wake deduplication | [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md), then [`spec/wake-signal.md`](spec/wake-signal.md) |
-| Understand failures and operator-visible outcomes | [`spec/failure-taxonomy.md`](spec/failure-taxonomy.md) |
-| Know what behavior is required by tests | [`required-tests/`](required-tests/) |
-| Trust a test result before acting on it | [`verification-hazards.md`](verification-hazards.md) |
+| [`guide/architecture.md`](guide/architecture.md) | Which components own data, coordination, History, serialization, and provider state? |
+| [`guide/input-lifecycle.md`](guide/input-lifecycle.md) | How does a Workflow Task move through active, quiescent, parking, parked, and no-open-task states? |
+| [`guide/output-commit.md`](guide/output-commit.md) | How does output move from logical buffering through staging and History proof to visibility? |
+| [`guide/replay-and-recovery.md`](guide/replay-and-recovery.md) | What is recorded, how exact-range replay works, and what survives retry, eviction, and Continue-As-New? |
+| [`guide/operations.md`](guide/operations.md) | Which failures retry, which require intervention, and what must a production deployment operate? |
 
-## Specs — one subsystem per file
+Diagrams explain the shape of the system but never define an edge case by themselves. Each guide
+links to the specification sections that own its exact behavior.
 
-| File | Answers |
+## Normative implementation reference
+
+Use the structured [`spec/` index](spec/README.md) to route by subsystem or stable document ID.
+
+| If you need to… | Read |
 |---|---|
-| [`spec/backend-contract.md`](spec/backend-contract.md) | Input and output provider capabilities, cursor semantics, immutability, staging barriers, producer binding, park intents, write fences, retention |
-| [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) | Lossless Workflow Task admission; input retention and parking; output visibility deadlines and their terminal race; rollover, shutdown, eviction, and durability boundaries |
-| [`spec/annotation-format.md`](spec/annotation-format.md) | The input replay grammar, shared input/output segmentation, logical output manifests, byte budgets, replay validation, continuation state |
-| [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md) | Every proto message, activation job, readiness call, and piece of Core state |
-| [`spec/python-runtime.md`](spec/python-runtime.md) | The out-of-sandbox manager; split input decode; Workflow output logical batching and async staging; direct output producers and clients; cursor ownership, delivery budgets, merge fairness, subscription close, and activation-job dispatch |
-| [`spec/wake-signal.md`](spec/wake-signal.md) | The reserved Signal's name, envelope, request-ID derivation, interception, and Run-wide outstanding wake cycle |
-| [`spec/failure-taxonomy.md`](spec/failure-taxonomy.md) | The four failure classes, their error types, metrics, and operator responses |
+| Change public names, handle roles, Worker configuration, or feature boundaries | [`spec/public-surface.md`](spec/public-surface.md) |
+| Implement or evaluate a backend provider | [`spec/backend-contract.md`](spec/backend-contract.md) |
+| Change Workflow Task retention, parking, rollover, shutdown, or output arbitration | [`spec/wft-lifecycle.md`](spec/wft-lifecycle.md) |
+| Change replay markers, segmentation, budgets, or continuation state | [`spec/annotation-format.md`](spec/annotation-format.md) |
+| Change proto messages, activation jobs, readiness calls, or Core state | [`spec/core-lang-protocol.md`](spec/core-lang-protocol.md) |
+| Change Worker-side delivery, conversion, merge, close, or staging | [`spec/python-runtime.md`](spec/python-runtime.md) |
+| Change wake encoding, deduplication, acknowledgement, or producer recovery | [`spec/wake-signal.md`](spec/wake-signal.md) |
+| Classify errors, metrics, retries, or operator response | [`spec/failure-taxonomy.md`](spec/failure-taxonomy.md) |
 
-## The rest of the set
+Every normative spec carries machine-readable front matter with a stable `doc_id`, status, audience,
+canonical scope, and related ADRs.
 
-- [`proposals/`](proposals/) — candidate extensions and promotion records whose acceptance gate is
-  still open. Normative implemented behavior lives in specs and ADRs even while validation is pending.
-- [`decisions/`](decisions/README.md) — 47 current design decisions, each with the alternatives that
-  were rejected. A spec states what is true; a decision record states why the other shape was not
-  taken.
-- [`required-tests/`](required-tests/) — the two required-test lists. These are not prose: the Python
-  suite parses them, checks the declared case counts, and requires every case to map to a test that
-  exists. Editing a bullet or a heading count changes what that gate demands.
-- [`verification-hazards.md`](verification-hazards.md) — seven constraints on trustworthy
-  validation, from native-extension freshness and submodule alignment to sandbox isolation and
+## Proposals and promotion records
+
+Each proposal has two entry points:
+
+- a short overview for deciding whether the direction is desirable; and
+- a detailed design for API, protocol, failure, compatibility, and validation review.
+
+The implemented output direction has been promoted into `spec/`; its detailed proposal remains a
+non-normative rationale record. Workflow-to-Workflow subscriptions remain a future enhancement and
+must not be inferred as available. See [`proposals/README.md`](proposals/README.md) for current status.
+
+## Supporting sets
+
+- [`decisions/`](decisions/README.md) contains 47 current ADRs. A specification says what is true; an
+  ADR says why the rejected alternatives were not chosen.
+- [`required-tests/`](required-tests/) contains the parsed Milestone 1 and Milestone 2 case lists.
+  Editing their counted headings or bullets changes what the validation gate demands.
+- [`verification-hazards.md`](verification-hazards.md) records seven constraints on trustworthy test
+  evidence, including native-extension freshness, repository alignment, sandbox isolation, and
   controlled fault injection.
 
-This directory intentionally contains current design, clearly labelled candidate proposals,
-accepted decisions, required behavior, and validation constraints. Status reports, review rounds,
-implementation plans, and investigation handoffs are not part of the design set; their durable
-conclusions belong in the documents above.
+Status reports, review rounds, implementation plans, and investigation handoffs do not belong in the
+design set. Their durable conclusions must be promoted into a specification, ADR, required test, or
+proposal.
 
-## Conventions these documents hold to
+## Documentation rules
 
-- **One fact, one home.** Each concept is specified in exactly one file; everything else links to it.
-  If you find the same rule stated in two places, one of them is a bug.
-- **No line numbers, and no restatement of code.** Specs name files and symbols; `grep` resolves them
-  and cannot go stale. A claim that a single function's own comment already carries does not belong
-  here.
-- **Every claim is paired with what breaks without it.** A rule with no failure attached to it is
-  either obvious or unverified, and neither is worth a reader's time.
-- **Rejected alternatives live in `decisions/`.** A spec states what is true.
+- **One normative fact, one home.** Other specifications link to the owning document. Human guides
+  may summarize it but are explicitly non-normative.
+- **Exact details stay textual.** Every diagram has a nearby explanation and specification link, so
+  no transition exists only as an image.
+- **No line-number references or restatement of local code.** Specifications name stable symbols and
+  files; repository search resolves their current locations.
+- **Every rule explains its failure consequence.** That consequence is what distinguishes a
+  load-bearing invariant from an implementation preference.
+- **Rejected alternatives live in ADRs.** Candidate behavior lives in proposals. Accepted current
+  truth lives in specifications.

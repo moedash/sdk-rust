@@ -9,7 +9,7 @@ load-bearing. Adding a decision means adding a file and a row below.
 
 | ADR | Decision | Primary spec |
 |---|---|---|
-| [001](ADR-001-coexist-with-contrib-workflow-streams.md) | Coexist with `contrib.workflow_streams` rather than replacing it | `overview.md` |
+| [001](ADR-001-coexist-with-contrib-workflow-streams.md) | Coexist with `contrib.workflow_streams` rather than replacing it | `spec/public-surface.md` |
 | [002](ADR-002-cursor-is-a-position-boundary.md) | A cursor is a position boundary, not a record identity | `spec/backend-contract.md` |
 | [003](ADR-003-structural-immutability-is-required.md) | Structural immutability is required of every provider | `spec/backend-contract.md` |
 | [004](ADR-004-progress-and-quiescence-are-separate-commands.md) | Progress and quiescence are separate commands | `spec/wft-lifecycle.md` |

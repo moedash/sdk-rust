@@ -1,3 +1,11 @@
+---
+doc_id: EWS-SPEC-ANNOTATION
+status: normative-pre-production
+audience: [implementers, coding-agents, reviewers]
+canonical_for: replay-annotation-and-continuation-format
+related_adrs: [ADR-005, ADR-006, ADR-007, ADR-018, ADR-022, ADR-027, ADR-033, ADR-039, ADR-046, ADR-048]
+---
+
 # Replay annotation format
 
 The opaque bytes Python encodes, Core stores in a marker, and Python decodes on replay. Core never
