@@ -17,6 +17,7 @@ import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/update.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
@@ -379,6 +380,10 @@ message WorkflowTaskCompletedEventAttributes {
     // The Worker Deployment Version that completed this task. Must be set if `versioning_behavior`
     // is set. This value updates workflow execution's `versioning_info.deployment_version`.
     temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 11;
+
+    // The offsets this task consumed, without the payloads. Recorded so replay
+    // can reproduce what the task saw, including a range that was empty.
+    repeated temporal.api.stream.v1.StreamCursor stream_cursors = 20;
 }
 
 message WorkflowTaskTimedOutEventAttributes {
