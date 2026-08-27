@@ -17,9 +17,15 @@ use crate::{
 use temporalio_common::protos::{
     coresdk::{
         workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+        workflow_commands::SubscribeStream,
         workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::{enums::v1::EventType, stream::v1::StreamCursor},
+    temporal::api::{
+        command::v1::command,
+        enums::v1::{CommandType, EventType},
+        stream::v1::StreamCursor,
+        workflowservice::v1::RespondWorkflowTaskCompletedResponse,
+    },
 };
 
 fn cursor(stream_id: &str, from: i64, to: i64) -> StreamCursor {
@@ -187,4 +193,60 @@ async fn replays_recorded_ranges_in_order_before_the_current_one() {
         ],
         "recorded ranges come back in event order, then the live one"
     );
+}
+
+// A workflow subscribing itself. The command exists at all because every SDK
+// matches issued commands against command-generated events in order, so a
+// command producing no event would put that matching out of step. This asserts
+// the command goes out and that replaying its event does not trip that check.
+#[tokio::test]
+async fn subscribe_command_round_trips_through_replay() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_stream_subscribed("s1", 4);
+    t.add_full_wf_task();
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|resp| {
+            // The subscribe has to reach the server as a real command, not be
+            // swallowed by core.
+            if let Some(cmd) = resp.commands.first()
+                && cmd.command_type() == CommandType::SubscribeStream
+            {
+                let attrs = cmd.attributes.as_ref().unwrap();
+                if let command::Attributes::SubscribeStreamCommandAttributes(a) = attrs {
+                    assert_eq!(a.stream_id, "s1");
+                    assert_eq!(a.start_offset, -1);
+                }
+            }
+            Ok(RespondWorkflowTaskCompletedResponse::default())
+        });
+
+    mock_client
+        .expect_fail_workflow_task()
+        .returning(|_, _, f| panic!("core rejected the task: {f:?}"));
+
+    let mock = MockPollCfg::from_resp_batches("wfid", t, [ResponseType::AllHistory], mock_client);
+    let core = mock_worker(build_mock_pollers(mock));
+
+    // Full history, so this activation replays the recorded subscription. Lang
+    // reissues the command, and core has to match it to that event rather than
+    // calling it nondeterministic.
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            SubscribeStream {
+                stream_id: "s1".to_string(),
+                start_offset: -1,
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
 }

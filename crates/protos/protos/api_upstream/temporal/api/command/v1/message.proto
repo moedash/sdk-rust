@@ -286,6 +286,13 @@ message RequestCancelNexusOperationCommandAttributes {
     int64 scheduled_event_id = 1;
 }
 
+message SubscribeStreamCommandAttributes {
+    string stream_id = 1;
+    // Negative means from wherever the stream is when the subscription is
+    // registered. The server resolves that once and records it.
+    int64 start_offset = 2;
+}
+
 message Command {
     temporal.api.enums.v1.CommandType command_type = 1;
     // Metadata on the command. This is sometimes carried over to the history event if one is
@@ -324,5 +331,6 @@ message Command {
 
         ScheduleNexusOperationCommandAttributes schedule_nexus_operation_command_attributes = 18;
         RequestCancelNexusOperationCommandAttributes request_cancel_nexus_operation_command_attributes = 19;
+        SubscribeStreamCommandAttributes subscribe_stream_command_attributes = 21;
     }
 }
