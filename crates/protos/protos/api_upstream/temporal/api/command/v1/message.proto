@@ -15,6 +15,7 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/enums/v1/command_type.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
@@ -286,6 +287,12 @@ message RequestCancelNexusOperationCommandAttributes {
     int64 scheduled_event_id = 1;
 }
 
+message AddStreamMessagesCommandAttributes {
+    // Empty means the Workflow's default output stream.
+    string stream_id = 1;
+    repeated temporal.api.stream.v1.StreamMessage messages = 2;
+}
+
 message SubscribeStreamCommandAttributes {
     string stream_id = 1;
     // Negative means from wherever the stream is when the subscription is
@@ -331,6 +338,7 @@ message Command {
 
         ScheduleNexusOperationCommandAttributes schedule_nexus_operation_command_attributes = 18;
         RequestCancelNexusOperationCommandAttributes request_cancel_nexus_operation_command_attributes = 19;
+        AddStreamMessagesCommandAttributes add_stream_messages_command_attributes = 20;
         SubscribeStreamCommandAttributes subscribe_stream_command_attributes = 21;
     }
 }

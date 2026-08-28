@@ -8,6 +8,7 @@ use super::{
     continue_as_new_workflow_state_machine::continue_as_new,
     fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
+    add_stream_messages_state_machine::add_stream_messages,
     subscribe_stream_state_machine::subscribe_stream, timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
@@ -1572,6 +1573,16 @@ impl WorkflowMachines {
                 WFCommandVariant::ModifyWorkflowProperties(attrs) => {
                     self.add_cmd_to_wf_task(
                         modify_workflow_properties(attrs),
+                        annotations,
+                        CommandIdKind::NeverResolves,
+                    );
+                }
+                WFCommandVariant::AddStreamMessages(attrs) => {
+                    // Never resolves: the event names the offset range the
+                    // server assigned and hands nothing back. A workflow that
+                    // wants to know where its batch landed reads the stream.
+                    self.add_cmd_to_wf_task(
+                        add_stream_messages(attrs),
                         annotations,
                         CommandIdKind::NeverResolves,
                     );
