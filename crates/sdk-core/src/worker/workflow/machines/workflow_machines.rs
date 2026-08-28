@@ -2,13 +2,13 @@ mod local_acts;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
+    add_stream_messages_state_machine::add_stream_messages,
     cancel_external_state_machine::new_external_cancel,
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
     continue_as_new_workflow_state_machine::continue_as_new,
     fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
-    add_stream_messages_state_machine::add_stream_messages,
     subscribe_stream_state_machine::subscribe_stream, timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
@@ -861,10 +861,18 @@ impl WorkflowMachines {
         // replaying workflow observes them exactly as it did the first time.
         replayed_slice_events.sort_unstable();
         for event_id in replayed_slice_events {
-            if let Some(slices) = self.stream_slices_by_event.remove(&event_id) {
-                for slice in slices {
-                    self.drive_me.send_job(deliver_stream_messages_job(slice));
-                }
+            let Some(slices) = self.stream_slices_by_event.remove(&event_id) else {
+                // History says a task consumed a range and the server sent no
+                // bytes for it. Replaying with less data than the original run
+                // had produces different commands, and the mismatch would
+                // surface later as an unrelated nondeterminism error.
+                return Err(WFMachinesError::Nondeterminism(format!(
+                    "Event {event_id} records consumed stream offsets, \
+                     but the server sent no messages for them"
+                )));
+            };
+            for slice in slices {
+                self.drive_me.send_job(deliver_stream_messages_job(slice));
             }
         }
         // Then the range for the task about to run, which is only meaningful
