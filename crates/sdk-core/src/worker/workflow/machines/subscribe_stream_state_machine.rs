@@ -31,8 +31,6 @@ pub(super) fn subscribe_stream(lang_cmd: SubscribeStream) -> NewMachineWithComma
     }
 }
 
-type SharedState = ();
-
 #[derive(Debug, derive_more::Display)]
 pub(super) enum SubscribeStreamMachineCommand {}
 

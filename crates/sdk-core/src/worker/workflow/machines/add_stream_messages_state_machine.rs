@@ -32,8 +32,6 @@ pub(super) fn add_stream_messages(lang_cmd: AddStreamMessages) -> NewMachineWith
     }
 }
 
-type SharedState = ();
-
 #[derive(Debug, derive_more::Display)]
 pub(super) enum AddStreamMessagesMachineCommand {}
 
