@@ -96,6 +96,14 @@ pub(crate) struct WorkflowMachines {
     stream_slices_by_event: HashMap<i64, Vec<StreamSlice>>,
     /// Ranges for the task about to run, which no event records yet.
     current_stream_slices: Vec<StreamSlice>,
+    /// Workflow Task Started id of the last task this instance ran live, or 0.
+    ///
+    /// A task that ran here was handed its stream messages as it ran, and the
+    /// completion event recording what it consumed arrives in the next task's
+    /// history. That event needs no bytes from the server, and `replaying` does
+    /// not say so: it is true for a cache hit as well, because the history
+    /// begins after an earlier task.
+    stream_slices_delivered_through: i64,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
@@ -288,6 +296,7 @@ impl WorkflowMachines {
             drive_me: driven_wf,
             stream_slices_by_event: Default::default(),
             current_stream_slices: Default::default(),
+            stream_slices_delivered_through: 0,
             replaying,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -859,8 +868,21 @@ impl WorkflowMachines {
 
         // Ranges an earlier task consumed, in the order those tasks ran, so a
         // replaying workflow observes them exactly as it did the first time.
+        //
+        // Only while replaying. A cache hit is handed the previous task's
+        // completion in its history as well, and that event carries the range
+        // that task consumed, but that task ran here and its messages were
+        // delivered live at the time. There is nothing to re-supply, the server
+        // sends nothing, and re-supplying would hand the workflow the same
+        // messages twice.
         replayed_slice_events.sort_unstable();
         for event_id in replayed_slice_events {
+            // Delivered live to this instance when the task ran, so there is
+            // nothing to re-supply and the server sent nothing.
+            if event_id <= self.stream_slices_delivered_through + 1 {
+                self.stream_slices_by_event.remove(&event_id);
+                continue;
+            }
             let Some(slices) = self.stream_slices_by_event.remove(&event_id) else {
                 // History says a task consumed a range and the server sent no
                 // bytes for it. Replaying with less data than the original run
@@ -881,6 +903,9 @@ impl WorkflowMachines {
             for slice in std::mem::take(&mut self.current_stream_slices) {
                 self.drive_me.send_job(deliver_stream_messages_job(slice));
             }
+            // This task is running here, so whatever it consumes is already in
+            // hand and its completion event will not need re-supplying.
+            self.stream_slices_delivered_through = self.next_started_event_id;
         }
 
         // Only record replay latency if we actually did replay work. This avoids recording
