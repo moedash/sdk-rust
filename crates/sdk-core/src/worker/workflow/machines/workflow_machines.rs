@@ -96,6 +96,14 @@ pub(crate) struct WorkflowMachines {
     stream_slices_by_event: HashMap<i64, Vec<StreamSlice>>,
     /// Ranges for the task about to run, which no event records yet.
     current_stream_slices: Vec<StreamSlice>,
+    /// Highest completion event whose recorded range was delivered by looking
+    /// ahead, or 0.
+    ///
+    /// A task's consumed range is recorded on the completion that closes it, so
+    /// it is found one batch early. That same completion is then seen again as
+    /// an ordinary event in the next batch, where its slices are already spent
+    /// and must not be asked for twice.
+    stream_slices_lookahead_through: i64,
     /// Workflow Task Started id of the last task this instance ran live, or 0.
     ///
     /// A task that ran here was handed its stream messages as it ran, and the
@@ -284,7 +292,7 @@ impl WorkflowMachines {
             basics.sdk_version.to_owned(),
         );
         // Peek ahead to determine used flags in the first WFT.
-        if let Some(attrs) = basics.history.peek_next_wft_completed(0) {
+        if let Some((_, attrs)) = basics.history.peek_next_wft_completed(0) {
             observed_internal_flags.add_from_complete(attrs);
         };
         Self {
@@ -297,6 +305,7 @@ impl WorkflowMachines {
             stream_slices_by_event: Default::default(),
             current_stream_slices: Default::default(),
             stream_slices_delivered_through: 0,
+            stream_slices_lookahead_through: 0,
             replaying,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -667,11 +676,20 @@ impl WorkflowMachines {
                 }
             }
             if peeked_events.peek().is_none()
-                && let Some(wtc) = self
+                && let Some((wtc_id, wtc)) = self
                     .last_history_from_server
                     .peek_next_wft_completed(event.event_id)
             {
                 apply_wft_complete_data!(self, wtc);
+                // The range this batch's task consumed is recorded on the
+                // completion that closes it, which lands in the *next* batch.
+                // Collecting it only when it appears would hand the workflow
+                // its input one activation after the commands that input
+                // caused, so a read-then-publish task replays with nothing to
+                // decide from and reissues no command. Look ahead for it here.
+                if !wtc.stream_cursors.is_empty() {
+                    replayed_slice_events.push(wtc_id);
+                }
             }
         }
 
@@ -883,6 +901,11 @@ impl WorkflowMachines {
                 self.stream_slices_by_event.remove(&event_id);
                 continue;
             }
+            // Already handed over when this task was looked ahead to.
+            if event_id <= self.stream_slices_lookahead_through {
+                self.stream_slices_by_event.remove(&event_id);
+                continue;
+            }
             let Some(slices) = self.stream_slices_by_event.remove(&event_id) else {
                 // History says a task consumed a range and the server sent no
                 // bytes for it. Replaying with less data than the original run
@@ -895,6 +918,9 @@ impl WorkflowMachines {
             };
             for slice in slices {
                 self.drive_me.send_job(deliver_stream_messages_job(slice));
+            }
+            if event_id > self.stream_slices_lookahead_through {
+                self.stream_slices_lookahead_through = event_id;
             }
         }
         // Then the range for the task about to run, which is only meaningful
