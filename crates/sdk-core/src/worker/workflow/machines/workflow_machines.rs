@@ -663,6 +663,11 @@ impl WorkflowMachines {
             }};
         }
         let mut replayed_slice_events = vec![];
+        // Kept apart from the in-batch ones. An in-batch event whose bytes are
+        // missing is a real inconsistency; a looked-ahead one may simply not
+        // have been sent yet, and demanding it would turn an early delivery
+        // into a new way to fail.
+        let mut lookahead_slice_event: Option<i64> = None;
         let mut peeked_events = events.iter().peekable();
         while let Some(event) = peeked_events.next() {
             if let Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(ref wtc)) =
@@ -688,7 +693,7 @@ impl WorkflowMachines {
                 // caused, so a read-then-publish task replays with nothing to
                 // decide from and reissues no command. Look ahead for it here.
                 if !wtc.stream_cursors.is_empty() {
-                    replayed_slice_events.push(wtc_id);
+                    lookahead_slice_event = Some(wtc_id);
                 }
             }
         }
@@ -919,9 +924,20 @@ impl WorkflowMachines {
             for slice in slices {
                 self.drive_me.send_job(deliver_stream_messages_job(slice));
             }
-            if event_id > self.stream_slices_lookahead_through {
-                self.stream_slices_lookahead_through = event_id;
+        }
+        // The task about to be replayed, whose range is only visible by looking
+        // ahead to the completion that closes it. Absent bytes mean the server
+        // has not re-supplied them on this response, which the ordinary path
+        // above will still catch when that completion arrives as an event.
+        if let Some(event_id) = lookahead_slice_event
+            && event_id > self.stream_slices_delivered_through + 1
+            && event_id > self.stream_slices_lookahead_through
+            && let Some(slices) = self.stream_slices_by_event.remove(&event_id)
+        {
+            for slice in slices {
+                self.drive_me.send_job(deliver_stream_messages_job(slice));
             }
+            self.stream_slices_lookahead_through = event_id;
         }
         // Then the range for the task about to run, which is only meaningful
         // once we have caught up to it.
