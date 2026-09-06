@@ -412,6 +412,37 @@ fn worker_counting_completions(
 }
 
 #[tokio::test]
+async fn zero_cache_keeps_a_retained_stream_task_until_its_boundary() {
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 0;
+    });
+    let worker = mock_worker(mock);
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id;
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted,
+        "disabling cache must not evict an incomplete retained Workflow Task"
+    );
+    assert_eq!(consume_resolve_activation(&worker, &run_id).await, vec![1]);
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
 async fn quiescence_holds_the_workflow_task_open() {
     let completions = Arc::new(AtomicUsize::new(0));
     let worker = worker_recording_completions(completions.clone());
