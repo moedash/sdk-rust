@@ -33,6 +33,14 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* External stream wake Signals encountered while replay advances through a History page now
+  resume reconstructed subscriptions. Workers with caching disabled no longer complete repeated
+  empty tasks while unread records remain in the external store.
+* Workflow-originated external output no longer forces an empty replacement task from an old
+  stream wait after Workflow code has resumed and is awaiting an Activity or timer. This avoids
+  delaying that result behind an unnecessary task timeout.
+
 ### Added
 * Added the Core protocol for replay-safe Workflow-originated external stream output, including
   exact Workflow Task History floors, compact staged-output marker proofs, and shared input/output
