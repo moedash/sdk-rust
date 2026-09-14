@@ -13,6 +13,7 @@ import "google/protobuf/empty.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
@@ -139,11 +140,32 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // A range of a stream the workflow subscribed to.
+        DeliverStreamMessages deliver_stream_messages = 17;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
         RemoveFromCache remove_from_cache = 50;
     }
+}
+
+// Hand a workflow the next range of a stream it subscribed to.
+//
+// The range is delivered once, on the task the server decided it belongs to,
+// and the offsets it covered are recorded in History rather than the payloads.
+// On replay the server re-supplies the same range by reading the stream again,
+// so this job appears at the same point with the same contents both times.
+//
+// An empty range is still delivered: a task where the subscription saw nothing
+// is a fact replay has to reproduce, not an absence of one.
+message DeliverStreamMessages {
+    // Id of the stream this range came from.
+    string stream_id = 1;
+    // Inclusive.
+    int64 from_offset = 2;
+    // Exclusive. Equal to from_offset when the subscription saw nothing.
+    int64 to_offset = 3;
+    repeated temporal.api.stream.v1.StreamMessage messages = 4;
 }
 
 // Initialize a new workflow

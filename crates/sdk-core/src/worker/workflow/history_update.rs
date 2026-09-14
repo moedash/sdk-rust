@@ -162,6 +162,7 @@ impl HistoryPaginator {
             query_requests: wft.query_requests,
             update,
             messages: wft.messages,
+            stream_slices: wft.stream_slices,
         };
         Ok((paginator, prepared))
     }
@@ -640,17 +641,21 @@ impl HistoryUpdate {
         true
     }
 
-    /// Returns the next WFT completed event attributes, if any, starting at (inclusive) the
-    /// `from_id`
+    /// Returns the next WFT completed event, if any, starting at (inclusive) the
+    /// `from_id`, as its event id and attributes.
+    ///
+    /// The id matters to callers that need to key something on the event rather
+    /// than only read its contents, such as the stream range a task consumed,
+    /// which is recorded on the completion that closes that task.
     pub(crate) fn peek_next_wft_completed(
         &self,
         from_id: i64,
-    ) -> Option<&WorkflowTaskCompletedEventAttributes> {
+    ) -> Option<(i64, &WorkflowTaskCompletedEventAttributes)> {
         self.events
             .iter()
             .skip_while(|e| e.event_id < from_id)
             .find_map(|e| match &e.attributes {
-                Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) => Some(a),
+                Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) => Some((e.event_id, a)),
                 _ => None,
             })
     }
