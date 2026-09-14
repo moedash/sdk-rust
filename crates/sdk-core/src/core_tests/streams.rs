@@ -385,3 +385,168 @@ fn publish_two(stream_id: &str) -> AddStreamMessages {
         ],
     }
 }
+
+/// A task that reads a range and publishes because of what it read.
+///
+/// This is the shape the product requires: workflow code observes stream input,
+/// decides, and writes. Replaying it means the workflow has to be handed the
+/// input again *before* core matches the command that input caused, otherwise
+/// lang has nothing to decide from and reissues nothing.
+///
+/// The recorded range lives on the WorkflowTaskCompleted that closes the task,
+/// which is the event *after* the one that started it. So the range for the
+/// task about to be replayed is only visible by looking ahead, and a lookahead
+/// that reads the completion for its flags but not for its cursors delivers the
+/// input one activation too late.
+#[tokio::test]
+async fn read_then_publish_replays_when_the_range_is_only_visible_by_lookahead() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    // The task that reads [0,1) and publishes because of it.
+    let read_completed =
+        t.add_workflow_task_completed_with_stream_cursors(vec![cursor("in", 0, 1)]);
+    t.add_stream_messages_added("out", 0, 1);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    poll_resp.add_stream_slice("in", read_completed, 0, &["go"]);
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_complete_workflow_task()
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
+    mock_client
+        .expect_fail_workflow_task()
+        .returning(|_, _, f| panic!("core rejected the reissued read-caused publish: {f:?}"));
+
+    let mock =
+        MockPollCfg::from_resp_batches("wfid", t, [ResponseType::Raw(poll_resp.resp)], mock_client);
+    let mut mock = build_mock_pollers(mock);
+    // Cold: nothing cached, so this is reconstruction from History.
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 0);
+    let core = mock_worker(mock);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    let got_input = task.jobs.iter().any(|j| {
+        matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+        )
+    });
+    assert!(
+        got_input,
+        "the replayed task must receive the range it consumed before its \
+         resulting publish is matched; jobs were {:?}",
+        task.jobs
+    );
+
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            AddStreamMessages {
+                stream_id: "out".to_string(),
+                messages: vec![StreamMessage {
+                    body: Some(b"accept".to_vec().into()),
+                    ..Default::default()
+                }],
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    core.shutdown().await;
+}
+
+/// The real shape: a subscribe task with no consumed range, then a task that
+/// reads and publishes, then a third task replaying both.
+///
+/// The first completion carries no cursors, so the lookahead that finds the
+/// range has to keep looking past it rather than stopping at the first
+/// completion it sees.
+#[tokio::test]
+async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    // Task 1 subscribes and consumes nothing.
+    t.add_workflow_task_completed();
+    t.add_stream_subscribed("in", 0);
+    t.add_workflow_task_scheduled_and_started();
+    // Task 2 reads [0,3) and publishes because of it.
+    let read_completed =
+        t.add_workflow_task_completed_with_stream_cursors(vec![cursor("in", 0, 3)]);
+    t.add_stream_messages_added("out", 0, 1);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    poll_resp.add_stream_slice("in", read_completed, 0, &["a", "b", "c"]);
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_complete_workflow_task()
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
+    mock_client
+        .expect_fail_workflow_task()
+        .returning(|_, _, f| panic!("core rejected the replayed read-caused publish: {f:?}"));
+
+    let mock =
+        MockPollCfg::from_resp_batches("wfid", t, [ResponseType::Raw(poll_resp.resp)], mock_client);
+    let mut mock = build_mock_pollers(mock);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 0);
+    let core = mock_worker(mock);
+
+    // Task 1: subscribe, no input yet.
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            SubscribeStream {
+                stream_id: "in".to_string(),
+                start_offset: 0,
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    // Task 2: the recorded range has to arrive before its publish is matched.
+    let task = core.poll_workflow_activation().await.unwrap();
+    let bodies: Vec<Vec<u8>> = task
+        .jobs
+        .iter()
+        .filter(|j| {
+            matches!(
+                j.variant,
+                Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+            )
+        })
+        .flat_map(|j| delivered(j).3.into_iter().map(|b| b.to_vec()))
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+        "the replayed task must be handed the range it consumed; jobs were {:?}",
+        task.jobs
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            AddStreamMessages {
+                stream_id: "out".to_string(),
+                messages: vec![StreamMessage {
+                    body: Some(b"accept".to_vec().into()),
+                    ..Default::default()
+                }],
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    core.shutdown().await;
+}
