@@ -958,6 +958,20 @@ message ActivityPropertiesModifiedExternallyEventAttributes {
     temporal.api.common.v1.RetryPolicy new_retry_policy = 2;
 }
 
+message WorkflowStreamMessagesAddedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command published this
+    // batch.
+    int64 workflow_task_completed_event_id = 1;
+    // Stream the Workflow published to.
+    string stream_id = 2;
+    // Offset the first message of the batch landed at.
+    int64 first_offset = 3;
+    // How many messages the batch held. With first_offset this names the range
+    // without carrying any of it, which is what keeps this event a fixed size
+    // no matter how large the batch or its payloads are.
+    int64 message_count = 4;
+}
+
 message WorkflowStreamSubscribedEventAttributes {
     int64 workflow_task_completed_event_id = 1;
     string stream_id = 2;
@@ -1290,6 +1304,7 @@ message HistoryEvent {
         WorkflowExecutionUnpausedEventAttributes workflow_execution_unpaused_event_attributes = 64;
         WorkflowExecutionTimeSkippingTransitionedEventAttributes workflow_execution_time_skipping_transitioned_event_attributes = 65;
         WorkflowStreamSubscribedEventAttributes workflow_stream_subscribed_event_attributes = 66;
+        WorkflowStreamMessagesAddedEventAttributes workflow_stream_messages_added_event_attributes = 67;
     }
 }
 

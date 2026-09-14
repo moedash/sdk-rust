@@ -1,3 +1,4 @@
+mod add_stream_messages_state_machine;
 mod workflow_machines;
 
 mod activity_state_machine;
@@ -47,6 +48,7 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt::{Debug, Display},
 };
+use add_stream_messages_state_machine::AddStreamMessagesMachine;
 use subscribe_stream_state_machine::SubscribeStreamMachine;
 use temporalio_common::{
     fsm_trait::{StateMachine, TransitionResult},
@@ -83,6 +85,7 @@ enum Machines {
     UpsertSearchAttributesMachine,
     ModifyWorkflowPropertiesMachine,
     SubscribeStreamMachine,
+    AddStreamMessagesMachine,
     UpdateMachine,
     NexusOperationMachine,
 }
