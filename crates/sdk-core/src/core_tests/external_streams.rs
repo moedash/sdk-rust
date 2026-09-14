@@ -412,6 +412,37 @@ fn worker_counting_completions(
 }
 
 #[tokio::test]
+async fn zero_cache_keeps_a_retained_stream_task_until_its_boundary() {
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 0;
+    });
+    let worker = mock_worker(mock);
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id;
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted,
+        "disabling cache must not evict an incomplete retained Workflow Task"
+    );
+    assert_eq!(consume_resolve_activation(&worker, &run_id).await, vec![1]);
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
 async fn quiescence_holds_the_workflow_task_open() {
     let completions = Arc::new(AtomicUsize::new(0));
     let worker = worker_recording_completions(completions.clone());
@@ -3614,6 +3645,34 @@ async fn an_output_only_marker_is_emitted_replayed_and_not_rewritten() {
 }
 
 #[tokio::test]
+async fn output_commit_does_not_force_a_task_for_a_stale_wait_snapshot() {
+    let (history, manifest) = output_only_marker_history();
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_recording_rollovers(markers, forced.clone(), history, vec![1]);
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .seed_external_stream_waits(&activation.run_id, vec![1], None, true)
+        .await;
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id,
+            vec![
+                output_commit_command(manifest),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        *forced.lock(),
+        vec![false],
+        "a previous stream wait does not justify an empty task while lang now awaits a timer"
+    );
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
 async fn output_capacity_replacement_enters_lang_instead_of_autocompleting() {
     // Capacity backpressure blocks the publishing Workflow in lang. Its staged commit has no
     // server command that could create a job on the forced replacement, so absent a Core-carried
@@ -5577,6 +5636,54 @@ fn replayable_marker_then_signal_history() -> TestHistoryBuilder {
     t.add_full_wf_task();
     t.add_workflow_execution_completed();
     t
+}
+
+#[tokio::test]
+async fn a_wake_reached_during_replay_resumes_the_reconstructed_waits() {
+    let mut history = TestHistoryBuilder::default();
+    let mut started = crate::replay::default_wes_attribs();
+    started.first_execution_run_id = started.original_execution_run_id.clone();
+    started.workflow_task_timeout = Some(Duration::from_secs(300).try_into().unwrap());
+    history.add(started);
+    history.add_full_wf_task();
+    history.add_external_stream_marker_covering(
+        1,
+        ParkReason::Idle,
+        b"header.segment.terminal",
+        &[(1, 0)],
+    );
+    history.add_we_signaled(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(wake(0, history.get_orig_run_id()))],
+    );
+    history.add_workflow_task_scheduled_and_started();
+    let worker =
+        worker_recording_rollovers(Default::default(), Default::default(), history, vec![2]);
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(replay_jobs(&replayed).len(), 1);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            replayed.run_id,
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+
+    let live = tokio::time::timeout(Duration::from_secs(1), worker.poll_workflow_activation())
+        .await
+        .expect("the wake in the same History page must survive replay")
+        .unwrap();
+    assert_eq!(resolve_hints(&live), vec![1]);
+    assert!(!live.is_replaying);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            live.run_id,
+            CompleteWorkflowExecution::default().into(),
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
