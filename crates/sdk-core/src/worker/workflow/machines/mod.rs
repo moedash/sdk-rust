@@ -33,6 +33,7 @@ use crate::{
     worker::workflow::{WFMachinesError, fatal, nondeterminism},
 };
 use activity_state_machine::ActivityMachine;
+use add_stream_messages_state_machine::AddStreamMessagesMachine;
 use cancel_external_state_machine::CancelExternalMachine;
 use cancel_workflow_state_machine::CancelWorkflowMachine;
 use child_workflow_state_machine::ChildWorkflowMachine;
@@ -48,7 +49,6 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt::{Debug, Display},
 };
-use add_stream_messages_state_machine::AddStreamMessagesMachine;
 use subscribe_stream_state_machine::SubscribeStreamMachine;
 use temporalio_common::{
     fsm_trait::{StateMachine, TransitionResult},
