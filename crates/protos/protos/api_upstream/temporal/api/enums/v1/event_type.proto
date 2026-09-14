@@ -179,4 +179,8 @@ enum EventType {
     // message: consumed offsets ride WorkflowTaskCompleted and payloads never
     // enter History.
     EVENT_TYPE_WORKFLOW_STREAM_SUBSCRIBED = 61;
+    // A Workflow published a batch of messages to a stream. Recorded per
+    // batch, and carrying only the offset range it landed at: the bodies go to
+    // the stream's own log, never into History.
+    EVENT_TYPE_WORKFLOW_STREAM_MESSAGES_ADDED = 62;
 }
