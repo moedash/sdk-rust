@@ -1499,6 +1499,17 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for AddStreamMessages {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "AddStreamMessages({}, {} messages)",
+                        self.stream_id,
+                        self.messages.len()
+                    )
+                }
+            }
+
             impl Display for StartTimer {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "StartTimer({})", self.seq)
@@ -1841,6 +1852,9 @@ pub mod temporal {
                             Attributes::SubscribeStreamCommandAttributes(_) => {
                                 CommandType::SubscribeStream
                             }
+                            Attributes::AddStreamMessagesCommandAttributes(_) => {
+                                CommandType::AddStreamMessages
+                            }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
                             }
@@ -1891,6 +1905,17 @@ pub mod temporal {
                     impl Display for command::Attributes {
                         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                             write!(f, "{:?}", self.as_type())
+                        }
+                    }
+
+                    impl From<workflow_commands::AddStreamMessages> for command::Attributes {
+                        fn from(s: workflow_commands::AddStreamMessages) -> Self {
+                            Self::AddStreamMessagesCommandAttributes(
+                                AddStreamMessagesCommandAttributes {
+                                    stream_id: s.stream_id,
+                                    messages: s.messages,
+                                },
+                            )
                         }
                     }
 
@@ -2365,6 +2390,7 @@ pub mod temporal {
                                 | EventType::UpsertWorkflowSearchAttributes
                                 | EventType::WorkflowPropertiesModified
                                 | EventType::WorkflowStreamSubscribed
+                                | EventType::WorkflowStreamMessagesAdded
                                 | EventType::NexusOperationScheduled
                                 | EventType::NexusOperationCancelRequested
                                 | EventType::WorkflowExecutionCanceled
@@ -2465,6 +2491,9 @@ pub mod temporal {
                             if let Some(a) = self.attributes.as_ref() {
                                 match a {
                                     Attributes::WorkflowStreamSubscribedEventAttributes(_) => false,
+                                    Attributes::WorkflowStreamMessagesAddedEventAttributes(_) => {
+                                        false
+                                    }
                                     Attributes::WorkflowExecutionStartedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionCompletedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionFailedEventAttributes(_) => false,
@@ -2553,6 +2582,7 @@ pub mod temporal {
                             // I just absolutely _love_ this
                             match self {
                             Attributes::WorkflowStreamSubscribedEventAttributes(_) => { EventType::WorkflowStreamSubscribed }
+                            Attributes::WorkflowStreamMessagesAddedEventAttributes(_) => { EventType::WorkflowStreamMessagesAdded }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
                             Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
                             Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }

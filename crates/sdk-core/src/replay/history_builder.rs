@@ -156,6 +156,22 @@ impl TestHistoryBuilder {
         self.add(attrs)
     }
 
+    /// Add the event an add-stream-messages command produces.
+    pub fn add_stream_messages_added(
+        &mut self,
+        stream_id: &str,
+        first_offset: i64,
+        message_count: i64,
+    ) -> i64 {
+        let attrs = WorkflowStreamMessagesAddedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            stream_id: stream_id.to_string(),
+            first_offset,
+            message_count,
+        };
+        self.add(attrs)
+    }
+
     /// Add a workflow task timed out event.
     pub fn add_workflow_task_timed_out(&mut self) {
         let attrs = WorkflowTaskTimedOutEventAttributes {

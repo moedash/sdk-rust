@@ -6,25 +6,26 @@ use crate::worker::workflow::{
     machines::{EventInfo, HistEventData, WFMachinesAdapter},
 };
 use temporalio_common::protos::{
-    coresdk::workflow_commands::SubscribeStream,
+    coresdk::workflow_commands::AddStreamMessages,
     temporal::api::enums::v1::{CommandType, EventType},
 };
 
 fsm! {
-    pub(super) name SubscribeStreamMachine;
-    command SubscribeStreamMachineCommand;
+    pub(super) name AddStreamMessagesMachine;
+    command AddStreamMessagesMachineCommand;
     error WFMachinesError;
 
     Created --(CommandScheduled) --> CommandIssued;
     CommandIssued --(CommandRecorded) --> Done;
 }
 
-/// Subscribe this workflow to a stream. The command carries only the stream id
-/// and a start offset; the server resolves the addressing, because a workflow
-/// cannot look it up without doing I/O and a value it carried would be a
-/// reading rather than a fact.
-pub(super) fn subscribe_stream(lang_cmd: SubscribeStream) -> NewMachineWithCommand {
-    let sm = SubscribeStreamMachine::from_parts(Created {}.into(), ());
+/// Publish a batch of messages to a stream this workflow owns.
+///
+/// The bodies go to the stream's own log, and History gets one event naming the
+/// offset range the batch landed at. The offsets are assigned by the server, so
+/// nothing here predicts them.
+pub(super) fn add_stream_messages(lang_cmd: AddStreamMessages) -> NewMachineWithCommand {
+    let sm = AddStreamMessagesMachine::from_parts(Created {}.into(), ());
     NewMachineWithCommand {
         command: lang_cmd.into(),
         machine: sm.into(),
@@ -32,7 +33,7 @@ pub(super) fn subscribe_stream(lang_cmd: SubscribeStream) -> NewMachineWithComma
 }
 
 #[derive(Debug, derive_more::Display)]
-pub(super) enum SubscribeStreamMachineCommand {}
+pub(super) enum AddStreamMessagesMachineCommand {}
 
 #[derive(Debug, Default, Clone, derive_more::Display)]
 pub(super) struct Created {}
@@ -43,42 +44,42 @@ pub(super) struct CommandIssued {}
 #[derive(Debug, Default, Clone, derive_more::Display)]
 pub(super) struct Done {}
 
-impl WFMachinesAdapter for SubscribeStreamMachine {
+impl WFMachinesAdapter for AddStreamMessagesMachine {
     fn adapt_response(
         &self,
         _my_command: Self::Command,
         _event_info: Option<EventInfo>,
     ) -> Result<Vec<MachineResponse>, Self::Error> {
         Err(Self::Error::Nondeterminism(
-            "SubscribeStream does not use state machine commands".to_string(),
+            "AddStreamMessages does not use state machine commands".to_string(),
         ))
     }
 }
 
-impl TryFrom<HistEventData> for SubscribeStreamMachineEvents {
+impl TryFrom<HistEventData> for AddStreamMessagesMachineEvents {
     type Error = WFMachinesError;
 
     fn try_from(e: HistEventData) -> Result<Self, Self::Error> {
         let e = e.event;
         match e.event_type() {
-            EventType::WorkflowStreamSubscribed => {
-                Ok(SubscribeStreamMachineEvents::CommandRecorded)
+            EventType::WorkflowStreamMessagesAdded => {
+                Ok(AddStreamMessagesMachineEvents::CommandRecorded)
             }
             _ => Err(Self::Error::Nondeterminism(format!(
-                "SubscribeStreamMachine does not handle {e}"
+                "AddStreamMessagesMachine does not handle {e}"
             ))),
         }
     }
 }
 
-impl TryFrom<CommandType> for SubscribeStreamMachineEvents {
+impl TryFrom<CommandType> for AddStreamMessagesMachineEvents {
     type Error = WFMachinesError;
 
     fn try_from(c: CommandType) -> Result<Self, Self::Error> {
         match c {
-            CommandType::SubscribeStream => Ok(SubscribeStreamMachineEvents::CommandScheduled),
+            CommandType::AddStreamMessages => Ok(AddStreamMessagesMachineEvents::CommandScheduled),
             _ => Err(Self::Error::Nondeterminism(format!(
-                "SubscribeStreamMachine does not handle command type {c:?}"
+                "AddStreamMessagesMachine does not handle command type {c:?}"
             ))),
         }
     }
