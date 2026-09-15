@@ -2,7 +2,7 @@ use crate::{
     MetricsContext, WorkerConfig,
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
-    protosext::WorkflowActivationExt,
+    protosext::{WorkflowActivationExt, protocol_messages::IncomingProtocolMessage},
     telemetry::metrics,
     worker::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
