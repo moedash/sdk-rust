@@ -34,8 +34,55 @@ relevant information.
 ## Unreleased
 
 ### Added
+* `WorkflowContext::all_handlers_finished` and `SyncWorkflowContext::all_handlers_finished` let
+  Rust workflows wait for active signal and update handler chains before completing or continuing
+  as new.
+* `WorkflowStartOptions::memo` attaches a non-indexed memo when starting a workflow, using the
+  same `MemoValues` type already used by continue-as-new and `WorkflowContext::upsert_memo`.
+  Values are serialized with the client's payload converter and codec, matching how `describe`
+  and `list` read them back.
+* `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
+  `temporalio_workflow`, so the same types can be used from clients and workflows.
+* The `temporal_activity_execution_failed` and `temporal_local_activity_execution_failed` worker
+  metrics now carry a `failure_reason` attribute. Each is now split into one time series per
+  reason, which may affect existing dashboards.
+
+### Breaking Changes :boom:
+* Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
+  `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
+  client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
+  holding an `Rc` or `RefCell`.
+
+* `Client::signal_with_start_workflow` starts a workflow and sends a typed signal atomically.
+
+### Breaking Changes :boom:
+
+* Signal-with-start is now invoked with `Client::signal_with_start_workflow`; remove uses of
+  `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
+
+### Fixed
+* An activity failure caused by oversized final heartbeat details is now counted in the
+  `temporal_activity_execution_failed` metric as `failure_reason="PayloadsTooLarge"`. Previously it
+  was counted under the reason for the failure the activity itself reported, and was not counted at
+  all when that failure was benign, even though the worker reported a payload-limit failure to the
+  server.
+
+## [0.7.0] - 2026-08-17
+
+### Added
+* Support for running Standalone Activities in Rust SDK Worker.
+* Client methods for starting and managing execution of Standalone Activities. 
+* `WorkflowTermination::cancelled_with_details` for recording structured details when a Workflow
+  Execution completes as cancelled.
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
   filters continue to apply to JSON output.
+* The Rust SDK now has an optional `testing` feature with a typed activity test environment and
+  local or external workflow test environments. Local workflow environments manage a Temporal CLI
+  dev server and expose shutdown through their local-server type state.
+* Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
+  architecture once per worker, retrying until the first successful delivery. Runtime options can
+  disable this reporting, and language SDK bridges can supply their own runtime details. The Rust
+  SDK exposes separate runtime options that omit bridge-only runtime overrides.
 * `RpcOptions::builder()` for constructing per-call RPC options.
 * `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
 * Experimental plugin APIs for packaging reusable client and worker configuration, including data
@@ -66,6 +113,14 @@ relevant information.
   `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* `WorkflowTermination::Cancelled` now has an optional `details` field. Use
+  `WorkflowTermination::cancelled()` to construct a cancellation without details.
+* Changes to `ActivityInfo`: instead of `workflow_namespace`, `workflow_execution` and `run_id`,
+  there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`. 
+  Also, `workflow_type` is now `Option<String>`.
+* `ActivityIdentifier::ById` was split into 2 variants, `ByIdWorkflow` and `ByIdStandalone`.
+  `ActivityIdentifier::by_id` method was renamed to `by_id_workflow`, and `by_id_standalone`
+  was added.
 * `anyhow::Error` no longer converts directly into `WorkflowTermination`. Wrap an error in
   `ApplicationFailure` to explicitly fail the Workflow Execution.
 * `OutgoingWorkflowError` now has a dedicated `PayloadConversion` variant. Converting activity,
@@ -73,6 +128,12 @@ relevant information.
   `OutgoingError`, `OutgoingActivityError`, and `OutgoingWorkflowError` are now non-exhaustive;
   downstream matches must include a wildcard arm.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
+* Ephemeral server APIs now return `EphemeralServerError` instead of `anyhow::Error`, and dev-server
+  log format and level use the non-exhaustive `DevServerLogFormat` and `DevServerLogLevel` enums.
+* Ephemeral server APIs now return the operation-oriented `EphemeralServerError` instead of
+  `anyhow::Error`.
+* Activity macro support now exposes instance requirements through `ExecutableActivity`; the
+  redundant `HasOnlyStaticMethods` marker trait has been removed.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 * `Logger::Console` now requires a `format: Option<LoggerFormat>` field. Use `None` to preserve the
@@ -126,6 +187,9 @@ relevant information.
 * Workflow workers now preserve the outstanding workflow-task token if an internal admission
   invariant is violated, buffering the replacement task instead of overwriting the task in flight
   in release builds.
+* Rust SDK workers now warn when autoscaling task polling encounters errors continuously for one
+  minute. Repeated warnings use exponential backoff up to 15-minute intervals and stop after
+  polling recovers.
 * Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
   of failing the Workflow Execution. Workflows may still explicitly handle these errors.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before

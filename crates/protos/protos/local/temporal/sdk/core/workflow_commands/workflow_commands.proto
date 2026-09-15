@@ -15,6 +15,8 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
+import "temporal/api/stream/v1/message.proto";
+import "temporal/api/sdk/v1/event_group_marker.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
@@ -25,6 +27,11 @@ message WorkflowCommand {
     // Lang layers are expected to expose the setting of the internals of this metadata on a
     // per-command basis where applicable.
     temporal.api.sdk.v1.UserMetadata user_metadata = 100;
+
+    // Event group markers attached to the command. These are forwarded onto
+    // the corresponding server-side Command, and consequently surfaced on the
+    // resulting HistoryEvent. See `temporal/api/sdk/v1/event_group_marker.proto`.
+    repeated temporal.api.sdk.v1.EventGroupMarker event_group_markers = 101;
 
     oneof variant {
         StartTimer start_timer = 1;
@@ -142,6 +149,33 @@ message WorkflowOutputStreamCommit {
 // open Workflow Task until the earliest reported deadline and then asks lang to finalize it.
 message WorkflowOutputStreamBuffered {
     google.protobuf.Duration max_publish_latency = 1;
+        SubscribeStream subscribe_stream = 29;
+        AddStreamMessages add_stream_messages = 30;
+    }
+}
+
+// Subscribe this workflow to a stream, so later Workflow Tasks carry the
+// ranges it has not consumed yet.
+//
+// The stream's addressing is resolved by the server. A workflow cannot look it
+// up without doing I/O, and a value it carried would be a reading rather than a
+// fact, so it could differ on replay.
+// Publish a batch of messages to a stream this workflow owns.
+//
+// The bodies go to the stream's own log rather than into History, which gets
+// one fixed-size event naming the offset range. That is what makes the batch
+// size free: a thousand messages cost the same in History as one.
+message AddStreamMessages {
+    // Empty means the workflow's default output stream.
+    string stream_id = 1;
+    repeated temporal.api.stream.v1.StreamMessage messages = 2;
+}
+
+message SubscribeStream {
+    string stream_id = 1;
+    // Negative means from wherever the stream is when the subscription is
+    // registered. The server resolves that once and records it.
+    int64 start_offset = 2;
 }
 
 message StartTimer {
@@ -318,7 +352,9 @@ message ContinueAsNewWorkflowExecution {
 
 // Indicate a workflow has completed as cancelled. Generally sent as a response to an activation
 // containing a cancellation job.
-message CancelWorkflowExecution {}
+message CancelWorkflowExecution {
+    temporal.api.common.v1.Payloads details = 1;
+}
 
 // A request to set/check if a certain patch is present or not
 message SetPatchMarker {

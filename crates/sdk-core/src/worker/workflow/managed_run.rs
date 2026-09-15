@@ -53,6 +53,7 @@ use temporalio_common::protos::{
     temporal::api::{
         enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
+        stream::v1::StreamSlice,
     },
 };
 use tokio::sync::oneshot;
@@ -302,7 +303,7 @@ impl ManagedRun {
             }
             self.wfm
                 .machines
-                .new_work_from_server(work.update, work.messages)?;
+                .new_work_from_server(work.update, work.messages, work.stream_slices)?;
         }
 
         // A wake Signal reaches Core as a history event, so it can only be classified once that
@@ -823,12 +824,11 @@ impl ManagedRun {
                 warn!(failure=?failure, "Failing workflow due to nondeterminism error");
                 return self
                     .successful_completion(
-                        vec![WFCommand {
-                            variant: WFCommandVariant::FailWorkflow(FailWorkflowExecution {
+                        vec![WFCommand::new(WFCommandVariant::FailWorkflow(
+                            FailWorkflowExecution {
                                 failure: failure.failure,
-                            }),
-                            metadata: None,
-                        }],
+                            },
+                        ))],
                         vec![],
                         VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
                         resp_chan,
@@ -3160,6 +3160,22 @@ impl WorkflowManager {
         }
     }
 
+    /// Given info that was just obtained from a new WFT from server, pipe it into this workflow's
+    /// machines.
+    ///
+    /// Should only be called when a workflow has caught up on replay (or is just beginning). It
+    /// will return a workflow activation if one is needed.
+    fn new_work_from_server(
+        &mut self,
+        update: HistoryUpdate,
+        messages: Vec<IncomingProtocolMessage>,
+        stream_slices: Vec<StreamSlice>,
+    ) -> Result<WorkflowActivation> {
+        self.machines
+            .new_work_from_server(update, messages, stream_slices)?;
+        self.get_next_activation()
+    }
+
     /// Update the machines with some events from fetching another page of history. Does *not*
     /// attempt to pull the next activation, unlike [Self::get_next_activation].
     fn feed_history_from_new_page(&mut self, update: HistoryUpdate) -> Result<()> {
@@ -3810,39 +3826,29 @@ mod tests {
         use super::*;
 
         pub(crate) fn complete() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::CompleteWorkflow(CompleteWorkflowExecution {
-                    result: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::CompleteWorkflow(
+                CompleteWorkflowExecution { result: None },
+            ))
         }
 
         pub(crate) fn cancel() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::CancelWorkflow(CancelWorkflowExecution {}),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::CancelWorkflow(
+                CancelWorkflowExecution::default(),
+            ))
         }
 
         pub(crate) fn query_response() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::QueryResponse(QueryResult {
-                    query_id: "".into(),
-                    variant: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::QueryResponse(QueryResult {
+                query_id: "".into(),
+                variant: None,
+            }))
         }
 
         pub(crate) fn update_response() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::UpdateResponse(UpdateResponse {
-                    protocol_instance_id: "".into(),
-                    response: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::UpdateResponse(UpdateResponse {
+                protocol_instance_id: "".into(),
+                response: None,
+            }))
         }
 
         pub(crate) fn command_types(commands: &[WFCommand]) -> Vec<Discriminant<WFCommand>> {

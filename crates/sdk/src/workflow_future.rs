@@ -340,6 +340,15 @@ impl WorkflowFuture {
                         .context("Nexus operation must have result")?;
                     push_polled_context!(ActivationJobContext::Passive);
                 }
+                Variant::DeliverStreamMessages(slice) => {
+                    // No stream API in this SDK. Bailing rather than ignoring:
+                    // the server has recorded this range as consumed and will
+                    // not send it again, so dropping it loses data silently.
+                    bail!(
+                        "received stream messages for {}, which this SDK cannot deliver",
+                        slice.stream_id
+                    );
+                }
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
                 }
@@ -593,10 +602,10 @@ impl WorkflowFuture {
                                     ),
                                 );
                             }
-                            TerminalOutcome::Cancelled => {
+                            TerminalOutcome::Cancelled(details) => {
                                 self.host.push_command_variant(
                                     workflow_command::Variant::CancelWorkflowExecution(
-                                        CancelWorkflowExecution {},
+                                        CancelWorkflowExecution { details },
                                     ),
                                 );
                             }

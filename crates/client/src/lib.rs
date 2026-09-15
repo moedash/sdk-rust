@@ -7,6 +7,7 @@
 #[macro_use]
 extern crate tracing;
 
+mod activity;
 mod async_activity_handle;
 pub mod callback_based;
 mod dns;
@@ -41,6 +42,7 @@ pub use crate::{
     request_extensions::PayloadErrorLimits,
     retry::{CallType, RETRYABLE_ERROR_CODES},
 };
+pub use activity::*;
 pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
@@ -56,9 +58,9 @@ pub use interceptors::{
     ListSchedulesPageOutput, ListWorkflowsPageInput, ListWorkflowsPageOutput, Next,
     PauseScheduleInput, PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput,
     QueryWorkflowOutput, ReportAsyncActivityCancellationInput, SendScheduleUpdateInput,
-    SignalWorkflowInput, StartWorkflowInput, StartWorkflowOutput, StartWorkflowUpdateInput,
-    StartWorkflowUpdateOutput, TemporalClientValue, TerminateWorkflowInput, TriggerScheduleInput,
-    UnpauseScheduleInput, UpdateScheduleInput,
+    SignalWithStartWorkflowInput, SignalWorkflowInput, StartWorkflowInput, StartWorkflowOutput,
+    StartWorkflowUpdateInput, StartWorkflowUpdateOutput, TemporalClientValue,
+    TerminateWorkflowInput, TriggerScheduleInput, UnpauseScheduleInput, UpdateScheduleInput,
 };
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
@@ -118,6 +120,7 @@ use http::Uri;
 use parking_lot::RwLock;
 use std::{
     collections::{HashMap, VecDeque},
+    error::Error,
     fmt::Debug,
     pin::Pin,
     str::FromStr,
@@ -126,11 +129,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common::{
-    HasWorkflowDefinition,
-    data_converters::{
-        DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
-        SerializationContextData,
-    },
+    ActivityDefinition, HasWorkflowDefinition, SignalDefinition, UntypedActivity,
+    data_converters::{DataConverter, SerializationContext, SerializationContextData},
     payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
@@ -138,8 +138,11 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::WorkflowType,
-            enums::v1::TaskQueueKind,
+            common::v1::{ActivityType, Payloads, WorkflowType},
+            enums::v1::{
+                ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
+                ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
+            },
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
             sdk::v1::UserMetadata,
@@ -1150,6 +1153,34 @@ impl Client {
         WorkflowClientTrait::start_workflow(self, workflow, input, options).await
     }
 
+    /// Atomically signal a workflow as it starts.
+    ///
+    /// The workflow receives the signal before its first workflow task.
+    pub async fn signal_with_start_workflow<W, S>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        signal: S,
+        signal_input: S::Input,
+        options: WorkflowStartOptions,
+    ) -> Result<WorkflowHandle<Self, W>, WorkflowStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        S: SignalDefinition<Workflow = W::Run>,
+        S::Input: Send,
+    {
+        WorkflowClientTrait::signal_with_start_workflow(
+            self,
+            workflow,
+            workflow_input,
+            signal,
+            signal_input,
+            options,
+        )
+        .await
+    }
+
     /// Get a handle to an existing workflow.
     ///
     /// For untyped access, use `get_workflow_handle::<UntypedWorkflow>(...)`.
@@ -1184,11 +1215,92 @@ impl Client {
     /// Get a handle to complete an activity asynchronously.
     ///
     /// An activity returning `ActivityError::WillCompleteAsync` can be completed with this handle.
+    ///
+    /// To get a handle to a standalone activity that can be used to wait for result and manage
+    /// the execution, see [`get_activity_handle`](Self::get_activity_handle).
     pub fn get_async_activity_handle(
         &self,
         identifier: ActivityIdentifier,
     ) -> AsyncActivityHandle<Self> {
         WorkflowClientTrait::get_async_activity_handle(self, identifier)
+    }
+
+    /// Start a standalone activity.
+    ///
+    /// Returns [`ActivityHandle`] that can be used to wait for result or to perform other
+    /// operations on the activity.
+    pub async fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> Result<ActivityHandle<Self, A>, StartActivityError>
+    where
+        A: ActivityDefinition,
+    {
+        WorkflowClientTrait::start_activity(self, activity, input, options).await
+    }
+
+    /// Get a handle to an existing standalone activity execution. If `run_id` is not specified,
+    /// the handle always targets the latest execution with matching ID.
+    ///
+    /// Note that the validity of the handle is not checked until a method is called on it.
+    /// If invalid ID or run ID is used, the method will return `NotFound` error.
+    ///
+    /// To get an untyped handle, use [`get_untyped_activity_handle`](Self::get_untyped_activity_handle).
+    ///
+    /// To get a handle that can be used to complete an activity asynchronously,
+    /// see [`get_async_activity_handle`](Self::get_async_activity_handle).
+    pub fn get_activity_handle<A>(
+        &self,
+        activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        WorkflowClientTrait::get_activity_handle(self, activity, id, run_id)
+    }
+
+    /// Get an untyped handle to an existing standalone activity execution. If `run_id` is not
+    /// specified, the handle always targets the latest execution with matching ID.
+    ///
+    /// Note that the validity of the handle is not checked until a method is called on it.
+    /// If invalid ID or run ID is used, the method will return `NotFound` error.
+    ///
+    /// To get a typed handle, use [`get_activity_handle`](Self::get_activity_handle).
+    ///
+    /// To get a handle that can be used to complete an activity asynchronously,
+    /// see [`get_async_activity_handle`](Self::get_async_activity_handle).
+    pub fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized,
+    {
+        WorkflowClientTrait::get_untyped_activity_handle(self, id, run_id)
+    }
+
+    /// List activities matching a query. Returns a stream that lazily paginates through results.
+    pub fn list_activities(
+        &self,
+        query: impl Into<String>,
+        options: ActivityListOptions,
+    ) -> ListActivitiesStream {
+        WorkflowClientTrait::list_activities(self, query, options)
+    }
+
+    /// Count activities matching a query.
+    pub async fn count_activities(
+        &self,
+        query: impl Into<String>,
+        options: ActivityCountOptions,
+    ) -> Result<ActivityExecutionCount, ClientError> {
+        WorkflowClientTrait::count_activities(self, query, options).await
     }
 }
 
@@ -1234,6 +1346,22 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
         W: HasWorkflowDefinition,
         W::Input: Send;
 
+    /// Start a workflow and atomically send it a signal.
+    fn signal_with_start_workflow<W, S>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        signal: S,
+        signal_input: S::Input,
+        options: WorkflowStartOptions,
+    ) -> impl Future<Output = Result<WorkflowHandle<Self, W>, WorkflowStartError>>
+    where
+        Self: Sized,
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        S: SignalDefinition<Workflow = W::Run>,
+        S::Input: Send;
+
     /// Get a handle to an existing workflow. `run_id` may be left blank to specify the most recent
     /// execution having the provided `workflow_id`.
     ///
@@ -1272,6 +1400,51 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
     ) -> AsyncActivityHandle<Self>
     where
         Self: Sized;
+
+    /// Start a standalone activity.
+    fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> impl Future<Output = Result<ActivityHandle<Self, A>, StartActivityError>>
+    where
+        Self: Sized,
+        A: ActivityDefinition;
+
+    /// Get a handle to a previously started standalone activity.
+    fn get_activity_handle<A>(
+        &self,
+        activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition;
+
+    /// Get an untyped handle to a previously started standalone activity.
+    fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized;
+
+    /// List activities matching a query. Returns a stream that lazily paginates through results.
+    fn list_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityListOptions,
+    ) -> ListActivitiesStream;
+
+    /// Count activities matching a query.
+    fn count_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityCountOptions,
+    ) -> impl Future<Output = Result<ActivityExecutionCount, ClientError>>;
 }
 
 /// A client that is bound to a namespace
@@ -1570,77 +1743,11 @@ where
                         let workflow_id = options.workflow_id.clone();
                         let task_queue_name = options.task_queue.clone();
 
-                        let user_metadata = if options.static_summary.is_some()
-                            || options.static_details.is_some()
-                        {
-                            let payload_converter = PayloadConverter::default();
-                            let context = SerializationContext {
-                                data: &SerializationContextData::Workflow,
-                                converter: &payload_converter,
-                            };
-                            Some(UserMetadata {
-                                summary: options.static_summary.map(|summary| {
-                                    payload_converter.to_payload(&context, &summary).expect(
-                                        "String-to-JSON payload serialization is infallible",
-                                    )
-                                }),
-                                details: options.static_details.map(|details| {
-                                    payload_converter.to_payload(&context, &details).expect(
-                                        "String-to-JSON payload serialization is infallible",
-                                    )
-                                }),
-                            })
-                        } else {
-                            None
-                        };
+                        let user_metadata = options.user_metadata();
 
-                        let run_id = if let Some(start_signal) = options.start_signal {
-                            let mut request = SignalWithStartWorkflowExecutionRequest {
-                                namespace,
-                                workflow_id: workflow_id.clone(),
-                                workflow_type: Some(WorkflowType {
-                                    name: workflow_type,
-                                }),
-                                task_queue: Some(TaskQueue {
-                                    name: task_queue_name,
-                                    kind: TaskQueueKind::Normal as i32,
-                                    normal_name: String::new(),
-                                }),
-                                input: payloads.into_payloads(),
-                                signal_name: start_signal.signal_name,
-                                signal_input: start_signal.input,
-                                identity: client.identity(),
-                                request_id: Uuid::new_v4().to_string(),
-                                workflow_id_reuse_policy: options.id_reuse_policy as i32,
-                                workflow_id_conflict_policy: options.id_conflict_policy as i32,
-                                workflow_execution_timeout: options
-                                    .execution_timeout
-                                    .and_then(|duration| duration.try_into().ok()),
-                                workflow_run_timeout: options
-                                    .run_timeout
-                                    .and_then(|duration| duration.try_into().ok()),
-                                workflow_task_timeout: options
-                                    .task_timeout
-                                    .and_then(|duration| duration.try_into().ok()),
-                                search_attributes: options
-                                    .search_attributes
-                                    .map(|attributes| attributes.into_proto()),
-                                cron_schedule: options.cron_schedule.unwrap_or_default(),
-                                retry_policy: options.retry_policy.map(Into::into),
-                                header: options.header.or(start_signal.header),
-                                user_metadata,
-                                ..Default::default()
-                            }
-                            .into_request();
-                            rpc_options.apply_to(&mut request);
-                            WorkflowService::signal_with_start_workflow_execution(
-                                &mut client,
-                                request,
-                            )
-                            .await?
-                            .into_inner()
-                            .run_id
-                        } else {
+                        let memo = options.encoded_memo(&data_converter).await?;
+
+                        let run_id = {
                             let mut request = StartWorkflowExecutionRequest {
                                 namespace,
                                 input: payloads.into_payloads(),
@@ -1674,6 +1781,7 @@ where
                                 links: options.links,
                                 completion_callbacks: options.completion_callbacks,
                                 priority: Some(options.priority.into()),
+                                memo,
                                 header: options.header,
                                 user_metadata,
                                 ..Default::default()
@@ -1700,9 +1808,144 @@ where
                                     }
                                 })?
                                 .into_inner()
-                                .run_id
+                            .run_id
                         };
 
+                        Ok(StartWorkflowOutput::new(workflow_id, run_id))
+                    })
+                }
+            }),
+        )
+        .await?;
+        let StartWorkflowOutput {
+            workflow_id,
+            run_id,
+        } = interceptor_output;
+
+        Ok(WorkflowHandle::new(
+            self.clone(),
+            WorkflowExecutionInfo {
+                namespace,
+                workflow_id,
+                run_id: Some(run_id.clone()),
+                first_execution_run_id: Some(run_id),
+            },
+        ))
+    }
+
+    async fn signal_with_start_workflow<W, S>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        signal: S,
+        signal_input: S::Input,
+        options: WorkflowStartOptions,
+    ) -> Result<WorkflowHandle<Self, W>, WorkflowStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        S: SignalDefinition<Workflow = W::Run>,
+        S::Input: Send,
+    {
+        let namespace = self.namespace();
+        let interceptor_output = interceptors::call_signal_with_start_workflow(
+            self.client_interceptors(),
+            SignalWithStartWorkflowInput::new(
+                workflow.name().to_owned(),
+                workflow_input,
+                signal.name().to_owned(),
+                signal_input,
+                options,
+            ),
+            Next::new({
+                let client = (*self).clone();
+                move |input: SignalWithStartWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<StartWorkflowOutput, WorkflowStartError>,
+                > {
+                    let mut client = client;
+                    Box::pin(async move {
+                        let (
+                            workflow_type,
+                            workflow_args,
+                            signal_name,
+                            signal_args,
+                            options,
+                            rpc_options,
+                        ) = input.into_parts();
+                        let data_converter = client.data_converter().clone();
+                        let payload_converter = data_converter.payload_converter();
+                        let context = SerializationContext {
+                            data: &SerializationContextData::Workflow,
+                            converter: payload_converter,
+                        };
+                        let workflow_payloads = workflow_args.serialize_payloads(&context);
+                        let signal_payloads = signal_args.serialize_payloads(&context);
+                        drop(workflow_args);
+                        drop(signal_args);
+                        let workflow_payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow, workflow_payloads?)
+                            .await?;
+                        let signal_payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow, signal_payloads?)
+                            .await?;
+                        let workflow_id = options.workflow_id.clone();
+                        let task_queue_name = options.task_queue.clone();
+
+                        let user_metadata = options.user_metadata();
+
+                        let memo = options.encoded_memo(&data_converter).await?;
+
+                        let mut request = SignalWithStartWorkflowExecutionRequest {
+                            namespace: client.namespace(),
+                            workflow_id: workflow_id.clone(),
+                            workflow_type: Some(WorkflowType {
+                                name: workflow_type,
+                            }),
+                            task_queue: Some(TaskQueue {
+                                name: task_queue_name,
+                                kind: TaskQueueKind::Normal as i32,
+                                normal_name: String::new(),
+                            }),
+                            input: workflow_payloads.into_payloads(),
+                            signal_name,
+                            signal_input: Some(Payloads {
+                                payloads: signal_payloads,
+                            }),
+                            identity: client.identity(),
+                            request_id: Uuid::new_v4().to_string(),
+                            workflow_id_reuse_policy: options.id_reuse_policy as i32,
+                            workflow_id_conflict_policy: options.id_conflict_policy as i32,
+                            workflow_execution_timeout: options
+                                .execution_timeout
+                                .and_then(|duration| duration.try_into().ok()),
+                            workflow_run_timeout: options
+                                .run_timeout
+                                .and_then(|duration| duration.try_into().ok()),
+                            workflow_task_timeout: options
+                                .task_timeout
+                                .and_then(|duration| duration.try_into().ok()),
+                            search_attributes: options
+                                .search_attributes
+                                .map(|attributes| attributes.into_proto()),
+                            cron_schedule: options.cron_schedule.unwrap_or_default(),
+                            retry_policy: options.retry_policy.map(Into::into),
+                            memo,
+                            header: options.header,
+                            user_metadata,
+                            ..Default::default()
+                        }
+                        .into_request();
+                        rpc_options.apply_to(&mut request);
+                        let run_id = WorkflowService::signal_with_start_workflow_execution(
+                            &mut client,
+                            request,
+                        )
+                        .await?
+                        .into_inner()
+                        .run_id;
                         Ok(StartWorkflowOutput::new(workflow_id, run_id))
                     })
                 }
@@ -1913,6 +2156,183 @@ where
     {
         AsyncActivityHandle::new(self.clone(), identifier)
     }
+
+    async fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> Result<ActivityHandle<Self, A>, StartActivityError>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        let mut client = self.clone();
+        let dc = client.data_converter();
+        let sc = &SerializationContextData::Activity;
+
+        let user_metadata = {
+            let summary = match &options.summary {
+                Some(summary) => Some(dc.to_payload(sc, summary).await?),
+                None => None,
+            };
+            let details = match &options.static_details {
+                Some(details) => Some(dc.to_payload(sc, details).await?),
+                None => None,
+            };
+            (summary.is_some() || details.is_some()).then_some(UserMetadata { summary, details })
+        };
+
+        let resp = client
+            .start_activity_execution(
+                StartActivityExecutionRequest {
+                    namespace: client.namespace(),
+                    identity: client.identity(),
+                    request_id: Uuid::new_v4().to_string(),
+                    activity_id: options.id.clone(),
+                    activity_type: Some(ActivityType {
+                        name: activity.name().to_string(),
+                    }),
+                    task_queue: Some(TaskQueue {
+                        name: options.task_queue,
+                        kind: TaskQueueKind::Normal.into(),
+                        normal_name: "".to_string(),
+                    }),
+                    schedule_to_close_timeout: try_into_or_box_err(
+                        options.close_timeouts.schedule_to_close(),
+                        StartActivityError::Other,
+                    )?,
+                    schedule_to_start_timeout: try_into_or_box_err(
+                        options.schedule_to_start_timeout,
+                        StartActivityError::Other,
+                    )?,
+                    start_to_close_timeout: try_into_or_box_err(
+                        options.close_timeouts.start_to_close(),
+                        StartActivityError::Other,
+                    )?,
+                    heartbeat_timeout: try_into_or_box_err(
+                        options.heartbeat_timeout,
+                        StartActivityError::Other,
+                    )?,
+                    retry_policy: options.retry_policy.map(Into::into),
+                    input: dc.to_payloads(sc, &input).await?.into_payloads(),
+                    id_reuse_policy: ProtoActivityIdReusePolicy::from(options.id_reuse_policy)
+                        .into(),
+                    id_conflict_policy: ProtoActivityIdConflictPolicy::from(
+                        options.id_conflict_policy,
+                    )
+                    .into(),
+                    search_attributes: options.search_attributes.map(SearchAttributes::into_proto),
+                    header: options.header,
+                    user_metadata,
+                    priority: Some(options.priority.into()),
+                    start_delay: try_into_or_box_err(
+                        options.start_delay,
+                        StartActivityError::Other,
+                    )?,
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await?
+            .into_inner();
+
+        Ok(ActivityHandle::new(
+            client,
+            options.id,
+            (!resp.run_id.is_empty()).then_some(resp.run_id),
+        ))
+    }
+
+    fn get_activity_handle<A>(
+        &self,
+        _activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        ActivityHandle::new(self.clone(), id.into(), run_id)
+    }
+
+    fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized,
+    {
+        ActivityHandle::new(self.clone(), id.into(), run_id)
+    }
+
+    fn list_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityListOptions,
+    ) -> ListActivitiesStream {
+        let client = self.clone();
+        let namespace = client.namespace();
+        let query = query.into();
+
+        ListActivitiesStream::new(stream::unfold(
+            Some(vec![]), // empty token for initial query, None if done
+            move |next_page_token| {
+                let mut client = client.clone();
+                let namespace = namespace.clone();
+                let query = query.clone();
+
+                async move {
+                    // making it more visible that we're terminating stream here
+                    #[allow(clippy::question_mark)]
+                    let Some(token): Option<Vec<u8>> = next_page_token else {
+                        return None;
+                    };
+
+                    match WorkflowService::list_activity_executions(
+                        &mut client,
+                        ListActivityExecutionsRequest {
+                            namespace,
+                            page_size: 0, // Use server default
+                            next_page_token: token.clone(),
+                            query,
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .map(|r| r.into_inner())
+                    {
+                        Ok(resp) => Some((
+                            Ok(resp.executions),
+                            (!resp.next_page_token.is_empty()).then_some(resp.next_page_token),
+                        )),
+                        Err(e) => Some((Err(e.into()), Some(token))),
+                    }
+                }
+            },
+        ))
+    }
+
+    async fn count_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityCountOptions,
+    ) -> Result<ActivityExecutionCount, ClientError> {
+        let mut client = self.clone();
+        let resp = client
+            .count_activity_executions(
+                CountActivityExecutionsRequest {
+                    namespace: client.namespace(),
+                    query: query.into(),
+                }
+                .into_request(),
+            )
+            .await?
+            .into_inner();
+        Ok(ActivityExecutionCount::from_response(resp))
+    }
 }
 
 macro_rules! dbg_panic {
@@ -1923,6 +2343,17 @@ macro_rules! dbg_panic {
   };
 }
 pub(crate) use dbg_panic;
+
+fn try_into_or_box_err<A, B, E, MapErr>(val: Option<A>, map_err: MapErr) -> Result<Option<B>, E>
+where
+    A: TryInto<B>,
+    <A as TryInto<B>>::Error: Error + Send + Sync + 'static,
+    MapErr: FnOnce(Box<dyn Error + Send + Sync + 'static>) -> E,
+{
+    val.map(TryInto::try_into)
+        .transpose()
+        .map_err(|e| map_err(Box::from(e)))
+}
 
 #[cfg(test)]
 mod tests {
@@ -2531,39 +2962,48 @@ mod tests {
 
     mod start_workflow_interceptor_tests {
         use super::*;
-        use crate::request_extensions::RetryConfigForCall;
+        use crate::{request_extensions::RetryConfigForCall, test_helpers::XorCodec};
         use parking_lot::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::{
-            HasWorkflowDefinition, WorkflowDefinition,
+            MemoValues, SignalDefinition,
             data_converters::{
-                DefaultFailureConverter, PayloadCodec, PayloadConversionError,
-                SerializationContext, SerializationContextData, TemporalSerializable,
+                DefaultFailureConverter, PayloadCodec, PayloadConversionError, PayloadConverter,
+                SerializationContext, SerializationContextData, TemporalDeserializable,
+                TemporalSerializable,
             },
-            protos::temporal::api::common::v1::Payload,
+            protos::temporal::api::common::v1::{Memo as ProtoMemo, Payload},
         };
+        use temporalio_macros::{workflow, workflow_methods};
+        use temporalio_workflow::{SyncWorkflowContext, WorkflowContext, WorkflowResult};
         use tonic::{Request, Response};
 
+        #[workflow]
+        #[derive(Default)]
         struct TestWorkflow;
 
-        impl WorkflowDefinition for TestWorkflow {
-            type Input = Vec<String>;
-            type Output = ();
-
-            fn name(&self) -> &str {
-                "test-workflow"
+        #[workflow_methods]
+        impl TestWorkflow {
+            #[run]
+            async fn run(
+                _ctx: &mut WorkflowContext<Self>,
+                _input: Vec<String>,
+            ) -> WorkflowResult<()> {
+                Ok(())
             }
-        }
 
-        impl HasWorkflowDefinition for TestWorkflow {
-            type Run = Self;
+            #[signal]
+            fn test_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _input: Vec<String>) {}
         }
 
         #[derive(Default)]
         struct RecordedStart {
             calls: usize,
             workflow_type: String,
+            memo: Option<ProtoMemo>,
             payloads: Vec<Payload>,
+            signal_name: String,
+            signal_payloads: Vec<Payload>,
             ascii_metadata: Option<String>,
             binary_metadata: Option<Vec<u8>>,
             grpc_timeout: Option<String>,
@@ -2647,6 +3087,7 @@ mod tests {
                 let mut recorded = self.recorded.lock();
                 recorded.calls += 1;
                 recorded.workflow_type = request.workflow_type.unwrap().name;
+                recorded.memo = request.memo;
                 recorded.payloads = request.input.unwrap_or_default().payloads;
                 recorded.ascii_metadata = ascii_metadata;
                 recorded.binary_metadata = binary_metadata;
@@ -2688,7 +3129,10 @@ mod tests {
                 let mut recorded = self.recorded.lock();
                 recorded.calls += 1;
                 recorded.workflow_type = request.workflow_type.unwrap().name;
+                recorded.memo = request.memo;
                 recorded.payloads = request.input.unwrap_or_default().payloads;
+                recorded.signal_name = request.signal_name;
+                recorded.signal_payloads = request.signal_input.unwrap_or_default().payloads;
                 recorded.ascii_metadata = ascii_metadata;
                 recorded.binary_metadata = binary_metadata;
                 recorded.grpc_timeout = grpc_timeout;
@@ -2852,6 +3296,56 @@ mod tests {
             }
         }
 
+        struct ReplacingSignalWithStartInterceptor;
+
+        impl ClientInterceptor for ReplacingSignalWithStartInterceptor {
+            fn signal_with_start_workflow<'a>(
+                &'a self,
+                mut input: SignalWithStartWorkflowInput,
+                next: Next<
+                    'a,
+                    SignalWithStartWorkflowInput,
+                    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+                >,
+            ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+                assert_eq!(
+                    input.workflow_args_ref::<Vec<String>>().unwrap(),
+                    &["workflow".to_owned()]
+                );
+                assert_eq!(
+                    input.signal_args_ref::<Vec<String>>().unwrap(),
+                    &["signal".to_owned()]
+                );
+                input.replace_workflow_args(vec!["replaced-workflow".to_owned()]);
+                input.replace_signal_args(vec!["replaced-signal".to_owned()]);
+                next.run(input)
+            }
+        }
+
+        struct FailingSignal;
+
+        impl SignalDefinition for FailingSignal {
+            type Workflow = test_workflow::Run;
+            type Input = FailingSignalInput;
+
+            fn name(&self) -> &str {
+                "failing-signal"
+            }
+        }
+
+        struct FailingSignalInput;
+
+        impl TemporalDeserializable for FailingSignalInput {}
+
+        impl TemporalSerializable for FailingSignalInput {
+            fn to_payloads(
+                &self,
+                _context: &SerializationContext<'_>,
+            ) -> Result<Vec<Payload>, PayloadConversionError> {
+                Err(PayloadConversionError::WrongEncoding)
+            }
+        }
+
         fn mock_client(
             interceptors: Vec<Arc<dyn ClientInterceptor>>,
             encode_calls: Arc<AtomicUsize>,
@@ -2876,6 +3370,146 @@ mod tests {
             )
         }
 
+        /// A mock client whose data converter uses `codec`, for asserting on what reaches the
+        /// wire.
+        fn mock_client_with_codec(
+            codec: impl PayloadCodec + Send + Sync + 'static,
+        ) -> (MockStartWorkflowClient, Arc<Mutex<RecordedStart>>) {
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let data_converter =
+                DataConverter::new(PayloadConverter::default(), DefaultFailureConverter, codec);
+            (
+                MockStartWorkflowClient {
+                    recorded: recorded.clone(),
+                    data_converter,
+                },
+                recorded,
+            )
+        }
+
+        /// Decode a sent memo the same way `describe`/`list` do, and read it back.
+        async fn read_back(sent: ProtoMemo) -> Memo {
+            let mut sent = sent;
+            decode_payloads(&mut sent, &XorCodec, &SerializationContextData::Workflow)
+                .await
+                .unwrap();
+            Memo::from_raw(
+                Some(sent),
+                PayloadConverter::default(),
+                SerializationContextData::Workflow,
+            )
+        }
+
+        #[tokio::test]
+        async fn start_workflow_encodes_memo_with_payload_converter_and_codec() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("memo-key", "memo-value".to_owned());
+
+            client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo)
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            let sent = recorded.lock().memo.clone().expect("memo should be sent");
+            assert_eq!(
+                read_back(sent).await.get::<String>("memo-key").unwrap(),
+                Some("memo-value".to_owned())
+            );
+        }
+
+        #[tokio::test]
+        async fn signal_with_start_workflow_encodes_memo() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("memo-key", "memo-value".to_owned());
+
+            client
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    TestWorkflow::test_signal,
+                    vec!["signal".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo)
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            let sent = recorded.lock().memo.clone().expect("memo should be sent");
+            assert_eq!(
+                read_back(sent).await.get::<String>("memo-key").unwrap(),
+                Some("memo-value".to_owned())
+            );
+        }
+
+        #[tokio::test]
+        async fn start_workflow_without_memo_sends_none() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+
+            client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(recorded.lock().memo, None);
+        }
+
+        #[tokio::test]
+        async fn start_workflow_reports_memo_serialization_errors() {
+            #[derive(Debug)]
+            struct FailingMemoValue;
+
+            impl TemporalSerializable for FailingMemoValue {
+                fn to_payload(
+                    &self,
+                    _ctx: &SerializationContext<'_>,
+                ) -> Result<Payload, PayloadConversionError> {
+                    Err(PayloadConversionError::EncodingError(
+                        std::io::Error::other("memo serialization failure").into(),
+                    ))
+                }
+            }
+
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("invalid", FailingMemoValue);
+
+            let err = client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo)
+                        .build(),
+                )
+                .await
+                .map(|_| ())
+                .expect_err("memo serialization errors should be surfaced");
+
+            assert!(
+                matches!(err, WorkflowStartError::PayloadConversion(_)),
+                "expected a payload conversion error, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("memo serialization failure"),
+                "error should surface the underlying cause, got {err}"
+            );
+            // The request must not have been sent.
+            assert_eq!(recorded.lock().calls, 0);
+        }
+
         #[tokio::test]
         async fn interceptors_order_mutate_replace_and_defer_conversion() {
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -2896,7 +3530,7 @@ mod tests {
 
             let handle = client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id").build(),
                 )
@@ -2932,7 +3566,7 @@ mod tests {
             );
             let handle = client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "ignored-workflow-id").build(),
                 )
@@ -2969,7 +3603,7 @@ mod tests {
 
             client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id").build(),
                 )
@@ -2992,7 +3626,7 @@ mod tests {
 
             client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id").build(),
                 )
@@ -3018,7 +3652,7 @@ mod tests {
             options.rpc_options = rpc_options.clone();
 
             client
-                .start_workflow(TestWorkflow, vec!["initial".to_owned()], options)
+                .start_workflow(TestWorkflow::run, vec!["initial".to_owned()], options)
                 .await
                 .unwrap();
 
@@ -3031,10 +3665,15 @@ mod tests {
             }
 
             let mut options = WorkflowStartOptions::new("task-queue", "signal-workflow-id").build();
-            options.start_signal = Some(WorkflowStartSignal::new("signal-name").build());
             options.rpc_options = rpc_options;
             let handle = client
-                .start_workflow(TestWorkflow, vec!["initial".to_owned()], options)
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    TestWorkflow::test_signal,
+                    vec!["signal".to_owned()],
+                    options,
+                )
                 .await
                 .unwrap();
 
@@ -3044,7 +3683,75 @@ mod tests {
             assert_eq!(recorded.binary_metadata.as_deref(), Some(&[0, 255][..]));
             assert_eq!(recorded.grpc_timeout.as_deref(), Some("250000u"));
             assert_eq!(recorded.retry_options, Some(RetryOptions::no_retries()));
+            assert_eq!(recorded.signal_name, "test_signal");
+            assert_eq!(recorded.signal_payloads.len(), 1);
             assert_eq!(handle.run_id(), Some("signal-server-run-id"));
+        }
+
+        #[tokio::test]
+        async fn signal_with_start_interceptor_can_replace_both_argument_sets() {
+            let (client, recorded) = mock_client(
+                vec![Arc::new(ReplacingSignalWithStartInterceptor)],
+                Arc::new(AtomicUsize::new(0)),
+            );
+
+            client
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
+                    vec!["workflow".to_owned()],
+                    TestWorkflow::test_signal,
+                    vec!["signal".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            let data_converter = DataConverter::default();
+            let (workflow_payloads, signal_payloads) = {
+                let recorded = recorded.lock();
+                (recorded.payloads.clone(), recorded.signal_payloads.clone())
+            };
+            assert_eq!(
+                data_converter
+                    .from_payloads::<Vec<String>>(
+                        &SerializationContextData::Workflow,
+                        workflow_payloads,
+                    )
+                    .await
+                    .unwrap(),
+                vec!["replaced-workflow".to_owned()]
+            );
+            assert_eq!(
+                data_converter
+                    .from_payloads::<Vec<String>>(
+                        &SerializationContextData::Workflow,
+                        signal_payloads,
+                    )
+                    .await
+                    .unwrap(),
+                vec!["replaced-signal".to_owned()]
+            );
+        }
+
+        #[tokio::test]
+        async fn signal_with_start_payload_conversion_failure_does_not_call_service() {
+            let (client, recorded) = mock_client(Vec::new(), Arc::new(AtomicUsize::new(0)));
+
+            let result = client
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
+                    vec!["workflow".to_owned()],
+                    FailingSignal,
+                    FailingSignalInput,
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(WorkflowStartError::PayloadConversion(_))
+            ));
+            assert_eq!(recorded.lock().calls, 0);
         }
 
         #[test]
@@ -3125,7 +3832,7 @@ mod tests {
         use futures_util::{FutureExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::{
-            data_converters::DefaultFailureConverter,
+            data_converters::{DefaultFailureConverter, PayloadConverter},
             protos::temporal::api::common::v1::{
                 Memo as ProtoMemo, Payload, WorkflowExecution as ProtoWorkflowExecution,
             },
