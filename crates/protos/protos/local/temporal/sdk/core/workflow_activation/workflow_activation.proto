@@ -219,6 +219,8 @@ message FinalizeExternalStreams {
     repeated coresdk.workflow_commands.ExternalStreamWait waits = 2;
     // One of PARK_REASON_ROLLOVER or PARK_REASON_SHUTDOWN.
     coresdk.external_data.ParkReason reason = 3;
+}
+
 // Hand a workflow the next range of a stream it subscribed to.
 //
 // The range is delivered once, on the task the server decided it belongs to,
