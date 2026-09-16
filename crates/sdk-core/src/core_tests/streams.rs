@@ -213,7 +213,7 @@ async fn subscribe_command_round_trips_through_replay() {
     // signals that by failing the task.
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
     mock_client
         .expect_fail_workflow_task()
         .returning(|_, _, f| panic!("core rejected the reissued subscribe: {f:?}"));
@@ -253,7 +253,7 @@ async fn publish_command_reaches_the_server_with_its_payloads() {
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(|resp| {
+        .returning(|resp, _| {
             let cmd = resp.commands.first().expect("a command was sent");
             assert_eq!(cmd.command_type(), CommandType::AddStreamMessages);
             match cmd.attributes.as_ref().unwrap() {
@@ -303,7 +303,7 @@ async fn publish_command_round_trips_through_replay() {
     let mut mock_client = mock_worker_client();
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
     mock_client
         .expect_fail_workflow_task()
         .returning(|_, _, f| panic!("core rejected the reissued publish: {f:?}"));
@@ -336,7 +336,7 @@ async fn subscribe_command_reaches_the_server() {
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(|resp| {
+        .returning(|resp, _| {
             let cmd = resp.commands.first().expect("a command was sent");
             assert_eq!(cmd.command_type(), CommandType::SubscribeStream);
             match cmd.attributes.as_ref().unwrap() {
@@ -415,7 +415,7 @@ async fn read_then_publish_replays_when_the_range_is_only_visible_by_lookahead()
     let mut mock_client = mock_worker_client();
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
     mock_client
         .expect_fail_workflow_task()
         .returning(|_, _, f| panic!("core rejected the reissued read-caused publish: {f:?}"));
@@ -487,7 +487,7 @@ async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
     let mut mock_client = mock_worker_client();
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
     mock_client
         .expect_fail_workflow_task()
         .returning(|_, _, f| panic!("core rejected the replayed read-caused publish: {f:?}"));
