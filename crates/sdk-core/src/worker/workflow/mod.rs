@@ -83,7 +83,9 @@ use temporalio_common::{
             },
         },
         temporal::api::{
-            command::v1::{Command as ProtoCommand, Command, command::Attributes},
+            command::v1::{
+                Command as ProtoCommand, Command, CommandAttributesExt, command::Attributes,
+            },
             common::v1::{
                 Memo, MeteringMetadata, RetryPolicy, SearchAttributes, WorkflowExecution,
             },
@@ -91,7 +93,7 @@ use temporalio_common::{
             failure::v1::{ApplicationFailureInfo, failure::FailureInfo},
             protocol::v1::Message as ProtocolMessage,
             query::v1::WorkflowQuery,
-            sdk::v1::{UserMetadata, WorkflowTaskCompletedMetadata},
+            sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
             taskqueue::v1::StickyExecutionAttributes,
             workflowservice::v1::{PollActivityTaskQueueResponse, get_system_info_response},
         },
@@ -1686,7 +1688,61 @@ struct EmptyWorkflowCommandErr;
 #[display("{}", variant)]
 struct WFCommand {
     variant: WFCommandVariant,
+    annotations: CommandAnnotations,
+}
+
+impl WFCommand {
+    fn new(variant: WFCommandVariant) -> Self {
+        Self {
+            variant,
+            annotations: CommandAnnotations::default(),
+        }
+    }
+}
+
+/// The lang-supplied decorations that ride along on a [WFCommand] and end up on the [ProtoCommand]
+/// we send to the server. They are kept together because a command machine must remember them in
+/// order to repeat them on any further command it issues, most notably a cancellation.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CommandAnnotations {
     metadata: Option<UserMetadata>,
+    event_group_markers: Vec<EventGroupMarker>,
+}
+
+impl CommandAnnotations {
+    /// Apply annotations lang attached to a cancellation command on top of the ones the command
+    /// being cancelled carried. Anything lang set explicitly wins; anything it left out is
+    /// inherited, which is what makes a cancellation land in the same event group as the command
+    /// it cancels even when it is issued from somewhere no group is active.
+    fn override_with(&mut self, other: Self) {
+        if let Some(other_metadata) = other.metadata {
+            let metadata = self.metadata.get_or_insert_with(UserMetadata::default);
+            if let Some(summary) = other_metadata.summary {
+                metadata.summary = Some(summary);
+            }
+            if let Some(details) = other_metadata.details {
+                metadata.details = Some(details);
+            }
+        }
+        if !other.event_group_markers.is_empty() {
+            self.event_group_markers = other.event_group_markers;
+        }
+    }
+}
+
+trait ProtoCommandExt {
+    fn new(attributes: Attributes, annotations: CommandAnnotations) -> Self;
+}
+
+impl ProtoCommandExt for ProtoCommand {
+    fn new(attributes: Attributes, annotations: CommandAnnotations) -> Self {
+        Self {
+            command_type: attributes.as_type() as i32,
+            attributes: Some(attributes),
+            user_metadata: annotations.metadata,
+            event_group_markers: annotations.event_group_markers,
+        }
+    }
 }
 
 #[derive(Debug, derive_more::From, derive_more::Display)]
@@ -1810,7 +1866,10 @@ impl TryFrom<WorkflowCommand> for WFCommand {
         };
         Ok(Self {
             variant,
-            metadata: c.user_metadata,
+            annotations: CommandAnnotations {
+                metadata: c.user_metadata,
+                event_group_markers: c.event_group_markers,
+            },
         })
     }
 }

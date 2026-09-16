@@ -134,6 +134,7 @@ impl From<CompleteLocalActivityData> for ResolveDat {
                     } else {
                         LocalActivityExecutionResult::Failed(ActFail {
                             failure: Some(fail),
+                            ..Default::default()
                         })
                     }
                 }
@@ -616,7 +617,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                         maybe_failure = fail.failure;
                     }
                     LocalActivityExecutionResult::Cancelled(Cancellation { failure })
-                    | LocalActivityExecutionResult::TimedOut(ActFail { failure }) => {
+                    | LocalActivityExecutionResult::TimedOut(ActFail { failure, .. }) => {
                         will_not_run_again = true;
                         maybe_failure = failure;
                     }
@@ -731,6 +732,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                     };
                     let command = ProtoCommand {
                         user_metadata: self.shared_state.attrs.user_metadata.clone(),
+                        event_group_markers: self.shared_state.attrs.event_group_markers.clone(),
                         ..command::Attributes::RecordMarkerCommandAttributes(marker_data).into()
                     };
                     responses.push(MachineResponse::IssueNewCommand(command));

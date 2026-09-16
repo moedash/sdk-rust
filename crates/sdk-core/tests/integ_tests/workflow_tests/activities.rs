@@ -135,7 +135,7 @@ struct ActivityInterceptorRecord {
     interceptor: &'static str,
     phase: ActivityInterceptorPhase,
     activity_type: String,
-    workflow_type: String,
+    workflow_type: Option<String>,
     is_local: bool,
     input: Option<String>,
     output: Option<String>,
@@ -495,7 +495,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "outer",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input.clone()),
                 output: None,
@@ -505,7 +505,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "inner",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input.clone()),
                 output: None,
@@ -515,7 +515,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "inner",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: Some(input.clone()),
@@ -525,7 +525,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "outer",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: Some(input.clone()),
@@ -574,7 +574,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
                 interceptor: "local",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: true,
                 input: Some(input.clone()),
                 output: None,
@@ -584,7 +584,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
                 interceptor: "local",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: true,
                 input: None,
                 output: Some(input.clone()),
@@ -710,7 +710,7 @@ async fn activity_interceptor_observes_activity_error() {
                 interceptor: "failure",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "FailingActivities::fail".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input),
                 output: None,
@@ -720,7 +720,7 @@ async fn activity_interceptor_observes_activity_error() {
                 interceptor: "failure",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "FailingActivities::fail".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: None,
@@ -806,7 +806,7 @@ async fn activity_interceptor_observes_activity_panic() {
                 interceptor: "panic",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "PanickingActivities::panic_activity".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input),
                 output: None,
@@ -816,7 +816,7 @@ async fn activity_interceptor_observes_activity_panic() {
                 interceptor: "panic",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "PanickingActivities::panic_activity".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: None,
@@ -1076,7 +1076,7 @@ async fn activity_non_retryable_failure() {
                 variant: Some(workflow_activation_job::Variant::ResolveActivity(
                     ResolveActivity {seq, result: Some(ActivityResolution{
                     status: Some(act_res::Status::Failed(activity_result::Failure{
-                        failure: Some(f),
+                        failure: Some(f), ..
                     }))}),..}
                 )),
             },
@@ -1143,7 +1143,7 @@ async fn activity_non_retryable_failure_with_error() {
                 variant: Some(workflow_activation_job::Variant::ResolveActivity(
                     ResolveActivity {seq, result: Some(ActivityResolution{
                     status: Some(act_res::Status::Failed(activity_result::Failure{
-                        failure: Some(f),
+                        failure: Some(f), ..
                     }))}),..}
                 )),
             },
@@ -1499,7 +1499,7 @@ async fn started_activity_timeout() {
                         result: Some(ActivityResolution{
                             status: Some(
                                 act_res::Status::Failed(
-                                    activity_result::Failure{failure: Some(_)}
+                                    activity_result::Failure{failure: Some(_), ..}
                                 )
                             ),
                             ..
