@@ -532,7 +532,7 @@ impl WorkflowMachines {
         }
         let key = self.add_cmd_to_wf_task(
             ExternalStreamMachine::record_marker(data),
-            None,
+            Default::default(),
             CommandIdKind::CoreInternal,
         );
         self.external_stream_marker_machines.push_back(key);
@@ -1778,9 +1778,8 @@ impl WorkflowMachines {
                 | WFCommandVariant::ExternalOutputStreamCommit(_)
                 | WFCommandVariant::ExternalOutputStreamBuffered(_) => {
                     return Err(fatal!(
-                        "External stream command {} reached the state machines; it should have \
-                         been consumed by the run's external wait set",
-                        cmd.variant
+                        "An external stream command reached the state machines; it should have \
+                         been consumed by the run's external wait set"
                     ));
                 }
                 WFCommandVariant::NoCommandsFromLang => (),
