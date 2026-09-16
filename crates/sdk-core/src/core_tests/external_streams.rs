@@ -3993,7 +3993,8 @@ async fn three_output_flush_windows_cost_three_markers_and_workflow_tasks() {
         }
     }
 
-    let lifecycle: Arc<Mutex<Vec<(Vec<ExternalStreamMarkerData>, bool)>>> = Default::default();
+    type CompletionRecord = (Vec<ExternalStreamMarkerData>, bool);
+    let lifecycle: Arc<Mutex<Vec<CompletionRecord>>> = Default::default();
     let mut mock_cfg =
         MockPollCfg::from_resp_batches("fakeid", history, [1, 2, 3], mock_worker_client());
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
