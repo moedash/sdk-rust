@@ -105,12 +105,14 @@ pub(crate) async fn get_text(endpoint: String) -> String {
 #[rstest::rstest]
 #[tokio::test]
 async fn prometheus_metrics_exported(
+    #[values(true, false)] counters_total_suffix: bool,
     #[values(true, false)] use_seconds_latency: bool,
     #[values(true, false)] custom_buckets: bool,
 ) {
     let opts = PrometheusExporterOptions::builder()
         .global_tags(HashMap::from([("global".to_string(), "hi!".to_string())]))
         .socket_addr(ANY_PORT.parse().unwrap())
+        .counters_total_suffix(counters_total_suffix)
         .use_seconds_for_durations(use_seconds_latency)
         .histogram_bucket_overrides(if custom_buckets {
             HistogramBucketOverrides {
@@ -159,8 +161,12 @@ async fn prometheus_metrics_exported(
              operation=\"GetSystemInfo\",service_name=\"temporal-core-sdk\",global=\"hi!\",le=\"50\"}"
         ));
     }
-    // Verify counter names are appropriate (don't end w/ '_total')
-    assert!(body.contains("temporal_request{"));
+    let request_metric_name = if counters_total_suffix {
+        "temporal_request_total"
+    } else {
+        "temporal_request"
+    };
+    assert!(body.contains(&format!("{request_metric_name}{{")));
     // Verify non-temporal metrics meter does not prefix
     let mm = rt.telemetry().get_metric_meter().unwrap();
     let g = mm.gauge(MetricParameters::from("mygauge"));
@@ -652,20 +658,19 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
     // Query the now-closed workflow
     let client = starter.get_core_client().await;
     let queryer = async {
-        WorkflowExecutionInfo {
-            namespace: client.namespace(),
-            workflow_id: starter.get_wf_id().to_string(),
-            run_id: Some(run_id),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client.clone())
-        .query(
-            UntypedQuery::new("fake_query"),
-            RawValue::empty(),
-            WorkflowQueryOptions::default(),
-        )
-        .await
-        .unwrap();
+        WorkflowExecutionInfo::builder()
+            .namespace(client.namespace())
+            .workflow_id(starter.get_wf_id().to_string())
+            .maybe_run_id(Some(run_id))
+            .build()
+            .bind_untyped(client.clone())
+            .query(
+                UntypedQuery::new("fake_query"),
+                RawValue::empty(),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .unwrap();
     };
     let query_reply = async {
         // Need to re-complete b/c replay

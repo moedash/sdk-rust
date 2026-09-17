@@ -19,6 +19,7 @@ use futures_util::FutureExt;
 use itertools::Itertools;
 use prost::Message;
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     future,
     sync::{
@@ -1282,7 +1283,7 @@ async fn no_eager_activities_requested_when_worker_options_disable_it(
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |req| {
+        .returning(move |req, _| {
             // Store the number of eager activities requested to be checked below
             let count = req
                 .commands
@@ -1369,7 +1370,7 @@ async fn activity_tasks_from_completion_are_delivered() {
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |req| {
+        .returning(move |req, _| {
             // Store the number of eager activities requested to be checked below
             let count = req
                 .commands
@@ -1557,7 +1558,7 @@ async fn graceful_shutdown(#[values(true, false)] at_max_outstanding: bool) {
         });
     mock_client.expect_fail_activity_task().times(3).returning(
         |task_token, _, _, last_heartbeat_details| {
-            if task_token.0 == [1] {
+            if task_token.borrow() == [1] {
                 assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             } else {
                 assert!(last_heartbeat_details.is_none());
