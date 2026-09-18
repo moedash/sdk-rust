@@ -283,7 +283,7 @@ impl HistoryPaginator {
             // We only *really* have the last WFT if the events go all the way up to at least the
             // WFT started event id. Otherwise we somehow still have partial history.
             let no_more = matches!(self.next_page_token, NextPageToken::Done) && seen_enough_events;
-            let (update, extra) = HistoryUpdate::from_events(
+            let (mut update, extra) = HistoryUpdate::from_events(
                 current_events,
                 self.previous_wft_started_id,
                 self.wft_started_event_id,
@@ -310,8 +310,28 @@ impl HistoryPaginator {
                 // There was not a meaningful WFT in the whole page. We must fetch more.
                 continue;
             }
+            // The machines read the completion that closes an update's last task while that
+            // task is the one being replayed: it records the stream range the task consumed,
+            // and the workflow has to be handed that range in the same activation. A page that
+            // ends exactly on a WFT started event leaves that completion on the next page, so
+            // fetch it before handing the update over.
+            if !no_more && self.event_queue.is_empty() {
+                self.event_queue.extend(update.events);
+                continue;
+            }
             self.id_of_last_event_in_last_extracted_update =
                 update.events.last().map(|e| e.event_id);
+            // Otherwise the completion is the first retained event. Carry a copy across the
+            // split so it can be peeked at. The original stays queued and is what the next
+            // update is built from, and a lone completion yields nothing to take, so no event
+            // is applied twice.
+            if let Some(completion) = self
+                .event_queue
+                .front()
+                .filter(|e| e.event_type() == EventType::WorkflowTaskCompleted)
+            {
+                update.events.push(completion.clone());
+            }
             #[cfg(debug_assertions)]
             update.assert_contiguous();
             return Ok(update);
