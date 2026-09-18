@@ -872,3 +872,115 @@ async fn data_only_tasks_replay_one_range_per_activation() {
     );
     core.shutdown().await;
 }
+
+/// Ranges for several streams on one task arrive ordered by stream, however
+/// the server laid them out. A workflow that waits on two streams with a
+/// first-completed pattern would otherwise take whichever branch the server's
+/// iteration order happened to pick, live and again differently on replay.
+#[tokio::test]
+async fn ranges_for_several_streams_arrive_in_stream_order() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let completed = t.add_workflow_task_completed_with_stream_cursors(vec![
+        cursor("s2", 0, 1),
+        cursor("s1", 0, 1),
+    ]);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    poll_resp.add_stream_slice("s2", completed, 0, &["two"]);
+    poll_resp.add_stream_slice("s1", completed, 0, &["one"]);
+    poll_resp.add_stream_slice("s2", 0, 1, &["four"]);
+    poll_resp.add_stream_slice("s1", 0, 1, &["three"]);
+
+    let mock = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [ResponseType::Raw(poll_resp.resp)],
+        mock_worker_client(),
+    );
+    let core = mock_worker(build_mock_pollers(mock));
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        delivered_ranges(&task),
+        vec![("s1".to_string(), 0, 1), ("s2".to_string(), 0, 1)],
+        "re-supplied ranges follow stream order"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        delivered_ranges(&task),
+        vec![("s1".to_string(), 1, 2), ("s2".to_string(), 1, 2)],
+        "live ranges follow stream order"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+    core.shutdown().await;
+}
+
+/// A recorded range that observed nothing is rebuilt from the cursor alone. The
+/// event already says everything the workflow needs, so replay does not depend
+/// on the server sending an empty slice back for it.
+#[tokio::test]
+async fn an_empty_recorded_range_replays_without_a_slice_from_the_server() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 4, 4)]);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    poll_resp.add_stream_slice("s1", 0, 4, &["e"]);
+
+    let mock = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [ResponseType::Raw(poll_resp.resp)],
+        mock_worker_client(),
+    );
+    let core = mock_worker(build_mock_pollers(mock));
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![("s1".to_string(), 4, 4)]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![("s1".to_string(), 4, 5)]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+    core.shutdown().await;
+}
+
+/// A re-supplied slice is checked against the cursor it claims to satisfy. The
+/// event is the record of what the task saw, so bytes covering other offsets
+/// would replay the task on different input than it ran on.
+#[tokio::test]
+async fn a_resupplied_slice_that_disagrees_with_the_record_fails_the_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let completed = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 2)]);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    // One message where the record says two.
+    poll_resp.add_stream_slice("s1", completed, 0, &["a"]);
+
+    let (core, failures) =
+        worker_expecting_one_nondeterminism_failure(t, ResponseType::Raw(poll_resp.resp));
+
+    // The mismatch is found while the poll response is applied, so the first
+    // activation is already the eviction.
+    core.handle_eviction().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
