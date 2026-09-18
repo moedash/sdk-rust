@@ -77,7 +77,7 @@ use temporalio_common::{
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
-            stream::v1::StreamSlice,
+            stream::v1::{StreamCursor, StreamSlice},
         },
     },
     worker::WorkerDeploymentVersion,
@@ -398,6 +398,11 @@ impl WorkflowMachines {
                     .push(slice);
             }
         }
+        // The order ranges arrive in is something the workflow can branch on, and
+        // the server's order is whatever its iteration happened to produce. Fixing
+        // it here is what makes it the same live and on replay.
+        self.current_stream_slices
+            .sort_by(|a, b| stream_order(&a.stream_id, a.from_offset, &b.stream_id, b.from_offset));
         self.new_history_from_server(update)?;
         Ok(())
     }
@@ -811,12 +816,12 @@ impl WorkflowMachines {
                 }
             }};
         }
-        let mut replayed_slice_events = vec![];
+        let mut replayed_slice_events: Vec<(i64, Vec<StreamCursor>)> = vec![];
         // Kept apart from the in-batch ones. An in-batch event whose bytes are
         // missing is a real inconsistency; a looked-ahead one may simply not
         // have been sent yet, and demanding it would turn an early delivery
         // into a new way to fail.
-        let mut lookahead_slice_event: Option<i64> = None;
+        let mut lookahead_slice_event: Option<(i64, Vec<StreamCursor>)> = None;
         let mut peeked_events = events.iter().peekable();
         while let Some(event) = peeked_events.next() {
             if let Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(ref wtc)) =
@@ -826,7 +831,7 @@ impl WorkflowMachines {
                 // The event records which offsets that task consumed; the server
                 // sends the bytes back separately, keyed by this event.
                 if !wtc.stream_cursors.is_empty() {
-                    replayed_slice_events.push(event.event_id);
+                    replayed_slice_events.push((event.event_id, wtc.stream_cursors.clone()));
                 }
             }
             if peeked_events.peek().is_none()
@@ -842,7 +847,7 @@ impl WorkflowMachines {
                 // caused, so a read-then-publish task replays with nothing to
                 // decide from and reissues no command. Look ahead for it here.
                 if !wtc.stream_cursors.is_empty() {
-                    lookahead_slice_event = Some(wtc_id);
+                    lookahead_slice_event = Some((wtc_id, wtc.stream_cursors.clone()));
                 }
             }
         }
@@ -1060,8 +1065,8 @@ impl WorkflowMachines {
         // delivered live at the time. There is nothing to re-supply, the server
         // sends nothing, and re-supplying would hand the workflow the same
         // messages twice.
-        replayed_slice_events.sort_unstable();
-        for event_id in replayed_slice_events {
+        replayed_slice_events.sort_unstable_by_key(|(event_id, _)| *event_id);
+        for (event_id, cursors) in replayed_slice_events {
             // Delivered live to this instance when the task ran, so there is
             // nothing to re-supply and the server sent nothing.
             if event_id <= self.stream_slices_delivered_through + 1 {
@@ -1073,33 +1078,46 @@ impl WorkflowMachines {
                 self.stream_slices_by_event.remove(&event_id);
                 continue;
             }
-            let Some(slices) = self.stream_slices_by_event.remove(&event_id) else {
+            let slices = self.stream_slices_by_event.remove(&event_id);
+            if slices.is_none()
+                && let Some(cursor) = cursors.iter().find(|c| c.from_offset < c.to_offset)
+            {
                 // History says a task consumed a range and the server sent no
                 // bytes for it. Replaying with less data than the original run
                 // had produces different commands, and the mismatch would
-                // surface later as an unrelated nondeterminism error.
-                return Err(WFMachinesError::Nondeterminism(format!(
-                    "Event {event_id} records consumed stream offsets, \
-                     but the server sent no messages for them"
-                )));
-            };
-            for slice in slices {
-                self.drive_me.send_job(deliver_stream_messages_job(slice));
+                // surface later as an unrelated nondeterminism error. Reaching
+                // this from here also means the lookahead did not find the
+                // completion, so the range was due one activation before this.
+                return Err(nondeterminism!(
+                    "Event {event_id} records that stream {} was consumed from offset {} to {}, \
+                     but the server sent no messages for it. The workflow was owed that range \
+                     one activation earlier.",
+                    cursor.stream_id,
+                    cursor.from_offset,
+                    cursor.to_offset
+                ));
+            }
+            for job in resupplied_deliveries(event_id, cursors, slices.unwrap_or_default())? {
+                self.drive_me.send_job(job);
             }
         }
         // The task about to be replayed, whose range is only visible by looking
-        // ahead to the completion that closes it. Absent bytes mean the server
-        // has not re-supplied them on this response, which the ordinary path
-        // above will still catch when that completion arrives as an event.
-        if let Some(event_id) = lookahead_slice_event
+        // ahead to the completion that closes it. Absent bytes for a range with
+        // content mean the server has not re-supplied them on this response,
+        // which the ordinary path above will still catch when that completion
+        // arrives as an event.
+        if let Some((event_id, cursors)) = lookahead_slice_event
             && event_id > self.stream_slices_delivered_through + 1
             && event_id > self.stream_slices_lookahead_through
-            && let Some(slices) = self.stream_slices_by_event.remove(&event_id)
         {
-            for slice in slices {
-                self.drive_me.send_job(deliver_stream_messages_job(slice));
+            let slices = self.stream_slices_by_event.remove(&event_id);
+            let needs_bytes = cursors.iter().any(|c| c.from_offset < c.to_offset);
+            if slices.is_some() || !needs_bytes {
+                for job in resupplied_deliveries(event_id, cursors, slices.unwrap_or_default())? {
+                    self.drive_me.send_job(job);
+                }
+                self.stream_slices_lookahead_through = event_id;
             }
-            self.stream_slices_lookahead_through = event_id;
         }
         // Then the range for the task about to run, which is only meaningful
         // once we have caught up to it.
@@ -2222,4 +2240,82 @@ fn deliver_stream_messages_job(slice: StreamSlice) -> OutgoingJob {
         messages: slice.messages,
     }
     .into()
+}
+
+/// The one order ranges are handed to a workflow in, live and on replay.
+fn stream_order(
+    stream_a: &str,
+    from_offset_a: i64,
+    stream_b: &str,
+    from_offset_b: i64,
+) -> std::cmp::Ordering {
+    (stream_a, from_offset_a).cmp(&(stream_b, from_offset_b))
+}
+
+/// Pair the ranges a completion event recorded with the slices the server sent
+/// back for it, in the order the workflow is handed them.
+///
+/// The event is the record of what the task saw, so the slices have to match
+/// it rather than the other way round. A range that observed nothing needs no
+/// bytes and is rebuilt from the cursor alone; a range with content has to
+/// arrive, and what arrives has to cover exactly the recorded offsets. Anything
+/// else would replay the task with different input than it ran on.
+fn resupplied_deliveries(
+    event_id: i64,
+    mut cursors: Vec<StreamCursor>,
+    mut slices: Vec<StreamSlice>,
+) -> Result<Vec<OutgoingJob>> {
+    cursors.sort_by(|a, b| stream_order(&a.stream_id, a.from_offset, &b.stream_id, b.from_offset));
+    let mut jobs = Vec::with_capacity(cursors.len());
+    for cursor in cursors {
+        let slice = slices
+            .iter()
+            .position(|s| s.stream_id == cursor.stream_id)
+            .map(|ix| slices.swap_remove(ix));
+        let slice = match slice {
+            Some(slice)
+                if slice.from_offset == cursor.from_offset
+                    && slice.to_offset == cursor.to_offset =>
+            {
+                slice
+            }
+            Some(slice) => {
+                return Err(nondeterminism!(
+                    "Event {event_id} records that stream {} was consumed from offset {} to {}, \
+                     but the server sent offsets {} to {} for it",
+                    cursor.stream_id,
+                    cursor.from_offset,
+                    cursor.to_offset,
+                    slice.from_offset,
+                    slice.to_offset
+                ));
+            }
+            None if cursor.from_offset == cursor.to_offset => StreamSlice {
+                stream_id: cursor.stream_id,
+                from_offset: cursor.from_offset,
+                to_offset: cursor.to_offset,
+                ..Default::default()
+            },
+            None => {
+                return Err(nondeterminism!(
+                    "Event {event_id} records that stream {} was consumed from offset {} to {}, \
+                     but the server sent no messages for it",
+                    cursor.stream_id,
+                    cursor.from_offset,
+                    cursor.to_offset
+                ));
+            }
+        };
+        jobs.push(deliver_stream_messages_job(slice));
+    }
+    if let Some(extra) = slices.first() {
+        return Err(nondeterminism!(
+            "The server sent stream {} from offset {} to {} for event {event_id}, which records \
+             no such range",
+            extra.stream_id,
+            extra.from_offset,
+            extra.to_offset
+        ));
+    }
+    Ok(jobs)
 }
