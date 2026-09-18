@@ -16,15 +16,18 @@ use crate::{
 };
 use temporalio_common::protos::{
     coresdk::{
-        workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+        workflow_activation::{WorkflowActivation, WorkflowActivationJob, workflow_activation_job},
         workflow_commands::{AddStreamMessages, SubscribeStream},
         workflow_completion::WorkflowActivationCompletion,
     },
     temporal::api::{
         command::v1::command,
         enums::v1::{CommandType, EventType},
+        history::v1::{History, HistoryEvent},
         stream::v1::{StreamCursor, StreamMessage},
-        workflowservice::v1::RespondWorkflowTaskCompletedResponse,
+        workflowservice::v1::{
+            GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
+        },
     },
 };
 
@@ -48,6 +51,36 @@ fn delivered(job: &WorkflowActivationJob) -> (&str, i64, i64, Vec<&[u8]>) {
                 .collect(),
         ),
         other => panic!("expected a stream delivery, got {other:?}"),
+    }
+}
+
+/// The stream deliveries in an activation, as (stream, from, to).
+fn delivered_ranges(task: &WorkflowActivation) -> Vec<(String, i64, i64)> {
+    task.jobs
+        .iter()
+        .filter(|j| {
+            matches!(
+                j.variant,
+                Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+            )
+        })
+        .map(|j| {
+            let (stream, from, to, _) = delivered(j);
+            (stream.to_string(), from, to)
+        })
+        .collect()
+}
+
+fn history_page(
+    events: &[HistoryEvent],
+    next_page_token: Vec<u8>,
+) -> GetWorkflowExecutionHistoryResponse {
+    GetWorkflowExecutionHistoryResponse {
+        history: Some(History {
+            events: events.to_vec(),
+        }),
+        next_page_token,
+        ..Default::default()
     }
 }
 
@@ -547,6 +580,128 @@ async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
     ))
     .await
     .unwrap();
+
+    core.shutdown().await;
+}
+
+/// The reading task's range has to arrive in its own activation when History
+/// comes in pages and a page boundary falls at that task.
+///
+/// The range is recorded on the completion that closes the task, and the
+/// paginator hands the machines updates cut at WFT started events. Whether the
+/// boundary lands right after the reading task's started event or right after
+/// its completion, the completion is outside the update the machines are
+/// replaying from, and a lookahead reading only that update would find nothing.
+#[rstest::rstest]
+#[tokio::test]
+async fn read_then_publish_replays_across_a_page_boundary(
+    #[values(12, 13)] second_page_end: usize,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task(); // 3
+    t.add_we_signaled("go", vec![]);
+    t.add_full_wf_task(); // 7
+    // Task 2 subscribes. Its command event is what lets the paginator tell the
+    // reading task's sequence is complete once it sees the started event.
+    t.add_stream_subscribed("in", 0);
+    t.add_we_signaled("go", vec![]);
+    t.add_workflow_task_scheduled_and_started(); // 12
+    // Task 3 reads [0,1) and publishes because of it.
+    let read_completed =
+        t.add_workflow_task_completed_with_stream_cursors(vec![cursor("in", 0, 1)]);
+    t.add_stream_messages_added("out", 0, 1);
+    t.add_workflow_task_scheduled_and_started(); // 16
+
+    let events = t.get_full_history_info().unwrap().into_events();
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    poll_resp.history.as_mut().unwrap().events.truncate(3);
+    poll_resp.next_page_token = vec![1];
+    // Two complete tasks past the previous started id fit in the first two
+    // pages, so the paginator would hand them over before fetching the third.
+    poll_resp.previous_started_event_id = 3;
+    poll_resp.add_stream_slice("in", read_completed, 0, &["go"]);
+    poll_resp.add_stream_slice("in", 0, 1, &["next"]);
+
+    let second_page = history_page(&events[3..second_page_end], vec![2]);
+    let third_page = history_page(&events[second_page_end..], vec![]);
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_get_workflow_execution_history()
+        .returning(move |_, _, token| match token.as_slice() {
+            [1] => Ok(second_page.clone()),
+            [2] => Ok(third_page.clone()),
+            other => panic!("unexpected page token {other:?}"),
+        });
+    mock_client
+        .expect_fail_workflow_task()
+        .returning(|_, _, f| panic!("core rejected the replayed read-caused publish: {f:?}"));
+
+    let mock =
+        MockPollCfg::from_resp_batches("wfid", t, [ResponseType::Raw(poll_resp.resp)], mock_client);
+    let core = mock_worker(build_mock_pollers(mock));
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            SubscribeStream {
+                stream_id: "in".to_string(),
+                start_offset: 0,
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    // The reading task. Its signal and its range belong to the same activation.
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert!(task.is_replaying);
+    assert!(
+        task.jobs.iter().any(|j| matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::SignalWorkflow(_))
+        )),
+        "expected the reading task's signal; jobs were {:?}",
+        task.jobs
+    );
+    assert_eq!(
+        delivered_ranges(&task),
+        vec![("in".to_string(), 0, 1)],
+        "the replayed task must be handed the range it consumed; jobs were {:?}",
+        task.jobs
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            AddStreamMessages {
+                stream_id: "out".to_string(),
+                messages: vec![StreamMessage {
+                    body: Some(b"accept".to_vec().into()),
+                    ..Default::default()
+                }],
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    // The live task gets only its own range.
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert!(!task.is_replaying);
+    assert_eq!(delivered_ranges(&task), vec![("in".to_string(), 1, 2)]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
 
     core.shutdown().await;
 }
