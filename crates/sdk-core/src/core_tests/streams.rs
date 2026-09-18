@@ -821,3 +821,54 @@ async fn a_subscribe_reissued_to_a_different_stream_fails_the_task() {
     assert_eq!(failures.load(Ordering::Relaxed), 1);
     core.shutdown().await;
 }
+
+/// A task that consumes a range and issues no command still ran as its own
+/// activation, so replay hands each such range over in its own activation
+/// rather than collapsing the run of them into one, the way it does for
+/// heartbeats that did nothing.
+#[tokio::test]
+async fn data_only_tasks_replay_one_range_per_activation() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let first = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 1)]);
+    t.add_workflow_task_scheduled_and_started();
+    let second = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 1, 2)]);
+    t.add_workflow_task_scheduled_and_started();
+    let third = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 2, 3)]);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    poll_resp.add_stream_slice("s1", first, 0, &["a"]);
+    poll_resp.add_stream_slice("s1", second, 1, &["b"]);
+    poll_resp.add_stream_slice("s1", third, 2, &["c"]);
+    poll_resp.add_stream_slice("s1", 0, 3, &["d"]);
+
+    let mock = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [ResponseType::Raw(poll_resp.resp)],
+        mock_worker_client(),
+    );
+    let core = mock_worker(build_mock_pollers(mock));
+
+    let mut per_activation = vec![];
+    for _ in 0..4 {
+        let task = core.poll_workflow_activation().await.unwrap();
+        per_activation.push(delivered_ranges(&task));
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        per_activation,
+        vec![
+            vec![("s1".to_string(), 0, 1)],
+            vec![("s1".to_string(), 1, 2)],
+            vec![("s1".to_string(), 2, 3)],
+            vec![("s1".to_string(), 3, 4)],
+        ],
+        "each consumed range replays in the activation of the task that consumed it"
+    );
+    core.shutdown().await;
+}
