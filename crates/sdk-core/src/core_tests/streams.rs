@@ -7,12 +7,17 @@
 //! arrive, in the right order, and that an empty range is still delivered.
 
 use crate::{
+    Worker,
     replay::TestHistoryBuilder,
     test_help::{
-        MockPollCfg, PollWFTRespExt, ResponseType, build_mock_pollers, hist_to_poll_resp,
-        mock_worker,
+        MockPollCfg, PollWFTRespExt, ResponseType, WorkerTestHelpers, build_mock_pollers,
+        hist_to_poll_resp, mock_worker,
     },
     worker::client::mocks::mock_worker_client,
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use temporalio_common::protos::{
     coresdk::{
@@ -22,7 +27,7 @@ use temporalio_common::protos::{
     },
     temporal::api::{
         command::v1::command,
-        enums::v1::{CommandType, EventType},
+        enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
         history::v1::{History, HistoryEvent},
         stream::v1::{StreamCursor, StreamMessage},
         workflowservice::v1::{
@@ -69,6 +74,28 @@ fn delivered_ranges(task: &WorkflowActivation) -> Vec<(String, i64, i64)> {
             (stream.to_string(), from, to)
         })
         .collect()
+}
+
+/// A worker served one poll response, expected to fail that task as
+/// nondeterministic. Returns the worker and the count of failures it reported,
+/// which the test asserts itself: the mock only verifies call counts when it
+/// is dropped, and a missing failure would otherwise go unnoticed. The task
+/// stream is kept open so the eviction that follows the failure can be polled.
+fn worker_expecting_one_nondeterminism_failure(
+    t: TestHistoryBuilder,
+    resp: ResponseType,
+) -> (Worker, Arc<AtomicUsize>) {
+    let failures = Arc::new(AtomicUsize::new(0));
+    let counted = failures.clone();
+    let mut mock = MockPollCfg::from_resp_batches("wfid", t, [resp], mock_worker_client());
+    mock.num_expected_fails = 1;
+    mock.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
+    });
+    let mut mock = build_mock_pollers(mock);
+    mock.make_wft_stream_interminable();
+    (mock_worker(mock), failures)
 }
 
 fn history_page(
@@ -703,5 +730,94 @@ async fn read_then_publish_replays_across_a_page_boundary(
         .await
         .unwrap();
 
+    core.shutdown().await;
+}
+
+/// A publish reissued on replay is held against the recorded event, not only
+/// against its type. Core sends no commands while replaying, so this check is
+/// the only place a publish to the wrong stream can be noticed.
+#[tokio::test]
+async fn a_publish_reissued_to_a_different_stream_fails_the_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_stream_messages_added("s1", 0, 2);
+    t.add_full_wf_task();
+
+    let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![publish_two("s2").into()],
+    ))
+    .await
+    .unwrap();
+    core.handle_eviction().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// The batch size is part of the record too: the event names how many messages
+/// landed, so a replay that publishes fewer has diverged from the original run.
+#[tokio::test]
+async fn a_publish_reissued_with_a_different_batch_size_fails_the_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_stream_messages_added("s1", 0, 2);
+    t.add_full_wf_task();
+
+    let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            AddStreamMessages {
+                stream_id: "s1".to_string(),
+                messages: vec![StreamMessage {
+                    body: Some(b"one".to_vec().into()),
+                    ..Default::default()
+                }],
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    core.handle_eviction().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// A subscription is checked on the stream alone. The recorded start offset is
+/// the server's resolution of what the command asked for, so it is not the
+/// command's to reproduce.
+#[tokio::test]
+async fn a_subscribe_reissued_to_a_different_stream_fails_the_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_stream_subscribed("s1", 4);
+    t.add_full_wf_task();
+
+    let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            SubscribeStream {
+                stream_id: "s2".to_string(),
+                start_offset: -1,
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    core.handle_eviction().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
     core.shutdown().await;
 }
