@@ -1093,6 +1093,20 @@ where
                     self.apply_resolution(resolution);
                     ActivationJobResult::None
                 }
+                Some(ActivationVariant::DeliverStreamMessages(slice)) => {
+                    // The Rust workflow runtime has no stream API yet. Failing
+                    // is the only safe answer: the server has already recorded
+                    // this range as consumed, so dropping it would leave the
+                    // workflow permanently behind data it will never be sent
+                    // again.
+                    return Err(Box::new(Failure {
+                        message: format!(
+                            "received stream messages for {}, which this SDK cannot deliver",
+                            slice.stream_id
+                        ),
+                        ..Default::default()
+                    }));
+                }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
                 // External Workflow Streams are a Python-SDK feature; this runtime never asks
                 // Core to retain a Workflow Task for a stream wait, so it can only ever see one
