@@ -1452,7 +1452,7 @@ impl ManagedRun {
                 // Lang has finished this activation; only its completion bookkeeping remains.
                 // Queue now so prepare_complete_resp sees pending work rather than reporting
                 // this task before finish_activation makes the next activation deliverable.
-                self.queue_external_stream_resolve();
+                self.queue_external_stream_resolve(true);
             }
             let new_local_acts = self.wfm.drain_queued_local_activities();
             self.sink_la_requests(new_local_acts)?;
@@ -2209,10 +2209,22 @@ impl ManagedRun {
         if self.activation.is_some() {
             return;
         }
-        self.queue_external_stream_resolve();
+        self.queue_external_stream_resolve(false);
     }
 
-    fn queue_external_stream_resolve(&mut self) {
+    /// Queues the job without asking whether an activation is outstanding.
+    ///
+    /// Two callers are legal: the readiness path once no activation is outstanding, and the
+    /// completion path of the outstanding activation, after `apply_next_task_if_ready` and before
+    /// `prepare_complete_resp` picks the pending jobs up. Lang has finished that activation, so
+    /// the job lands on the next one. From anywhere else the job would ride an activation lang is
+    /// still working on, which breaks the one-outstanding-activation rule this run relies on.
+    /// `completing_outstanding_activation` is the caller saying which of the two it is.
+    fn queue_external_stream_resolve(&mut self, completing_outstanding_activation: bool) {
+        debug_assert!(
+            completing_outstanding_activation == self.activation.is_some(),
+            "external stream resolve queued outside the readiness and completion paths"
+        );
         if self.wft.is_none() || self.am_broken {
             return;
         }
