@@ -274,43 +274,46 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
     let heartbeat_time = AtomicCell::new(None);
 
     let test_fut = async {
-        // Give enough time to ensure heartbeat interval has been hit
-        tokio::time::sleep(Duration::from_millis(1500)).await;
         acts_started.notified().await;
         let client = starter.get_core_client().await;
-        let mut raw_client = client.clone();
-        let workers_list = WorkflowService::list_workers(
-            &mut raw_client,
-            ListWorkersRequest {
-                namespace: client.namespace().to_owned(),
-                page_size: 100,
-                next_page_token: Vec::new(),
-                query: String::new(),
-                include_system_workers: false,
-            }
-            .into_request(),
+        let raw_client = client.clone();
+        let heartbeat = eventually(
+            || {
+                let client = client.clone();
+                async move {
+                    let heartbeat = list_worker_heartbeats(&client, String::new())
+                        .await
+                        .into_iter()
+                        .find(|heartbeat| {
+                            heartbeat.worker_instance_key == worker_instance_key.to_string()
+                        })
+                        .ok_or_else(|| anyhow!("worker heartbeat has not been recorded"))?;
+                    let workflow_tasks = heartbeat
+                        .workflow_task_slots_info
+                        .as_ref()
+                        .map_or(0, |slots| slots.total_processed_tasks);
+                    let activities = heartbeat
+                        .activity_task_slots_info
+                        .as_ref()
+                        .map_or(0, |slots| slots.current_used_slots);
+                    if workflow_tasks == 1 && activities == 1 {
+                        Ok(heartbeat)
+                    } else {
+                        Err(anyhow!(
+                            "Heartbeat not ready: workflow tasks={workflow_tasks}, activities={activities}"
+                        ))
+                    }
+                }
+            },
+            Duration::from_secs(5),
         )
         .await
-        .unwrap()
-        .into_inner();
-        #[allow(deprecated)]
-        let worker_info = workers_list
-            .workers_info
-            .iter()
-            .find(|worker_info| {
-                if let Some(hb) = worker_info.worker_heartbeat.as_ref() {
-                    hb.worker_instance_key == worker_instance_key.to_string()
-                } else {
-                    false
-                }
-            })
-            .unwrap();
-        let heartbeat = worker_info.worker_heartbeat.as_ref().unwrap();
+        .unwrap();
         assert_eq!(
             heartbeat.worker_instance_key,
             worker_instance_key.to_string()
         );
-        in_activity_checks(heartbeat, &start_time, &heartbeat_time);
+        in_activity_checks(&heartbeat, &start_time, &heartbeat_time);
         acts_done.notify_one();
 
         // Poll until the heartbeat reflects shutdown with the second WFT processed.
@@ -764,26 +767,24 @@ async fn worker_heartbeat_sticky_cache_miss() {
         HISTORY_WF2_ACTIVITY_STARTED.notified().await;
 
         HISTORY_WF1_ACTIVITY_FINISH.notify_one();
-        let handle1 = WorkflowExecutionInfo {
-            namespace: client_for_orchestrator.namespace(),
-            workflow_id: wf1_id,
-            run_id: Some(wf1_run),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client_for_orchestrator.clone());
+        let handle1 = WorkflowExecutionInfo::builder()
+            .namespace(client_for_orchestrator.namespace())
+            .workflow_id(wf1_id)
+            .maybe_run_id(Some(wf1_run))
+            .build()
+            .bind_untyped(client_for_orchestrator.clone());
         handle1
             .get_result(Default::default())
             .await
             .expect("wf1 result");
 
         HISTORY_WF2_ACTIVITY_FINISH.notify_one();
-        let handle2 = WorkflowExecutionInfo {
-            namespace: client_for_orchestrator.namespace(),
-            workflow_id: wf2_id,
-            run_id: Some(wf2_run),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client_for_orchestrator.clone());
+        let handle2 = WorkflowExecutionInfo::builder()
+            .namespace(client_for_orchestrator.namespace())
+            .workflow_id(wf2_id)
+            .maybe_run_id(Some(wf2_run))
+            .build()
+            .bind_untyped(client_for_orchestrator.clone());
         handle2
             .get_result(Default::default())
             .await

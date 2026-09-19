@@ -301,7 +301,7 @@ impl AsyncCompleter {
             Outcome::Succeed => Ok("completed async".to_string()),
             Outcome::Cancel | Outcome::CancelAfterRecordedBeforeStarted => {
                 ctx.cancelled().await;
-                Err(WorkflowTermination::Cancelled)
+                Err(WorkflowTermination::cancelled())
             }
             _ => Err(ApplicationFailure::new("broken").into()),
         }
@@ -348,10 +348,7 @@ async fn nexus_async(
 
     let submitter = worker.get_submitter_handle();
     let converter = PayloadConverter::default();
-    let ser_ctx = SerializationContext {
-        data: &SerializationContextData::Workflow,
-        converter: &converter,
-    };
+    let ser_ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
     let wf_handle = worker
         .submit_workflow(
             NexusAsyncWf::run,
@@ -629,7 +626,7 @@ impl NexusRootCancellationWf {
             result.status,
             Some(nexus_operation_result::Status::Cancelled(_))
         );
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 }
 
@@ -936,7 +933,7 @@ impl AsyncCompleterWf {
         }
 
         ctx.state(|wf| wf.handler_exited_tx.send(true).unwrap());
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 
     #[signal(name = "proceed-to-exit")]
