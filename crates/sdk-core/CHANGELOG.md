@@ -51,6 +51,15 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Workers with caching disabled now keep an incomplete retained external stream task until its
+  normal boundary, as they do for local Activities. This prevents repeated shutdown markers and
+  replacement tasks from starving asynchronous input readiness.
+* External stream wake Signals encountered while replay advances through a History page now
+  resume reconstructed subscriptions. Workers with caching disabled no longer complete repeated
+  empty tasks while unread records remain in the external store.
+* Workflow-originated external output no longer forces an empty replacement task from an old
+  stream wait after Workflow code has resumed and is awaiting an Activity or timer. This avoids
+  delaying that result behind an unnecessary task timeout.
 * Workers now defensively buffer a replacement workflow task if it reaches a run that still owns
   one, preserving the outstanding task token in release builds.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before they
@@ -62,3 +71,8 @@ relevant information.
   preserving the resolution ordering recorded in existing histories during replay.
 * Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
   cancellation was requested.
+* Nexus tasks are now timed out locally even when the server sends a `request-timeout` header that
+  falls outside the Nexus duration grammar, such as a negative value for a task whose deadline has
+  already elapsed, a sub-millisecond unit, or a multi-unit value like `1m30s`. Previously such a
+  header was ignored entirely, so the handler was never told the task had timed out, and a task
+  left unanswered could block worker shutdown indefinitely.

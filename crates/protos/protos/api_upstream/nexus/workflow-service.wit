@@ -104,7 +104,8 @@ interface workflow-service {
     started: option<bool>,
     /// @nexus.omit
     signal-link: placeholder,
-    first-execution-run-id: string,
+    /// @nexus.omit
+    first-execution-run-id: placeholder,
   }
 
   /// @nexus.doc
