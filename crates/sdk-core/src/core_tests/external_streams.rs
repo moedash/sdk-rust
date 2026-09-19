@@ -9,7 +9,7 @@ use crate::{
     ExternalStreamReadyResult, ExternalStreamRunStatus, PollError,
     replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
-        MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt, build_fake_worker,
+        MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt, WorkerTestHelpers, build_fake_worker,
         build_mock_pollers, hist_to_poll_resp, mock_worker, query_ok, schedule_activity_cmd,
         start_timer_cmd,
     },
@@ -51,8 +51,11 @@ use temporalio_common::{
             command::v1::command,
             common::v1::Payload,
             enums::v1::{CommandType, EventType},
+            history::v1::History,
             query::v1::WorkflowQuery,
-            workflowservice::v1::RespondWorkflowTaskCompletedResponse,
+            workflowservice::v1::{
+                GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
+            },
         },
     },
     worker::WorkerTaskTypes,
@@ -423,6 +426,8 @@ async fn zero_cache_keeps_a_retained_stream_task_until_its_boundary() {
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 0;
     });
+    // Kept open so the eviction at the boundary can be polled after the mock's one task.
+    mock.make_wft_stream_interminable();
     let worker = mock_worker(mock);
     let activation = worker.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -439,6 +444,76 @@ async fn zero_cache_keeps_a_retained_stream_task_until_its_boundary() {
         "disabling cache must not evict an incomplete retained Workflow Task"
     );
     assert_eq!(consume_resolve_activation(&worker, &run_id).await, vec![1]);
+    // The resolve activation completed with a timer, which does not retain the task, so the
+    // boundary has passed and the zero-sized cache lets the run go.
+    worker.handle_eviction().await;
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::RunNotFound,
+        "a retained task must be released once its boundary is reached"
+    );
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn zero_cache_keeps_a_task_with_buffered_output_until_the_flush() {
+    // The other reason a task is retained: output lang has buffered but not yet staged. The
+    // task has to survive the zero-sized cache until the flush deadline asks lang to finalize,
+    // and go once the flush has closed it.
+    let history = canned_histories::single_timer("1");
+    let manifest = output_manifest(history.get_orig_run_id(), 1, "zero-cache-stage-token");
+    let recorded: Arc<Mutex<Vec<ExternalStreamMarkerData>>> = Default::default();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
+    let collected = recorded.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| collected.lock().extend(stream_marker_data(wft)));
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 0;
+    });
+    mock.make_wft_stream_interminable();
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id;
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            output_buffered_command(Duration::from_millis(40)),
+        ))
+        .await
+        .unwrap();
+
+    // Retained: the flush deadline reaches this run rather than an eviction.
+    let flush = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&flush),
+        vec![(0, ParkReason::OutputLatency, vec![])],
+        "disabling cache must not evict a task holding buffered output; jobs were {:?}",
+        flush.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                finalized_command(0, b""),
+                output_commit_command(manifest.clone()),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    worker.handle_eviction().await;
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::RunNotFound,
+        "the flush closed the task, so nothing retains the run any longer"
+    );
+    let written = recorded.lock();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].output.as_ref(), Some(&manifest));
     worker.drain_pollers_and_shutdown().await;
 }
 
@@ -5671,10 +5746,9 @@ async fn a_wake_reached_during_replay_resumes_the_reconstructed_waits() {
         .await
         .unwrap();
 
-    let live = tokio::time::timeout(Duration::from_secs(1), worker.poll_workflow_activation())
-        .await
-        .expect("the wake in the same History page must survive replay")
-        .unwrap();
+    // The mock either delivers the activation or hangs; the test's own timeout
+    // covers the hang.
+    let live = worker.poll_workflow_activation().await.unwrap();
     assert_eq!(resolve_hints(&live), vec![1]);
     assert!(!live.is_replaying);
     worker
@@ -6363,4 +6437,131 @@ async fn every_completion_path_writes_exactly_one_marker_ending_in_a_terminal() 
         8,
         "the table has eight paths that write a marker and two that do not"
     );
+}
+
+/// The same wake, decoded while replay is still in progress.
+///
+/// The wake sits in a task that is not the last one, so the batch that decodes it is still a
+/// replay, and History arrives in two pages with the wake on the first. The reconstructed waits
+/// receive it once, and only after replay has ended.
+#[tokio::test]
+async fn a_wake_decoded_before_replay_ends_is_applied_once_when_it_does() {
+    let mut history = TestHistoryBuilder::default();
+    let mut started = crate::replay::default_wes_attribs();
+    started.first_execution_run_id = started.original_execution_run_id.clone();
+    started.workflow_task_timeout = Some(Duration::from_secs(300).try_into().unwrap());
+    history.add(started);
+    history.add_full_wf_task();
+    history.add_external_stream_marker_covering(
+        1,
+        ParkReason::Idle,
+        b"header.segment.terminal",
+        &[(1, 0)],
+    );
+    history.add_we_signaled(
+        external_stream::WAKE_SIGNAL_NAME,
+        vec![wake_payload(wake(0, history.get_orig_run_id()))],
+    );
+    history.add_full_wf_task();
+    history.add_we_signaled("keep-the-run-going", vec![]);
+    history.add_workflow_task_scheduled_and_started();
+
+    let events = history.get_full_history_info().unwrap().into_events();
+    let mut first_page = hist_to_poll_resp(&history, "fakeid".to_owned(), ResponseType::AllHistory);
+    // The wake is the last event of the first page.
+    first_page.history.as_mut().unwrap().events.truncate(6);
+    first_page.next_page_token = vec![1];
+    let second_page = GetWorkflowExecutionHistoryResponse {
+        history: Some(History {
+            events: events[6..].to_vec(),
+        }),
+        ..Default::default()
+    };
+
+    let markers: StreamMarkers = Default::default();
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_get_workflow_execution_history()
+        .times(1)
+        .returning(move |_, _, _| Ok(second_page.clone()));
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        history,
+        [ResponseType::Raw(first_page.resp)],
+        mock_client,
+    );
+    let collected = markers.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        for _ in 0..4 {
+            let collected = collected.clone();
+            asserts.then(move |wft| collected.lock().extend(stream_markers(wft)));
+        }
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(replay_jobs(&replayed).len(), 1);
+    assert!(resolve_hints(&replayed).is_empty());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            replayed.run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+
+    // Everything after the replayed task, as (replaying, resolve hints, carried the signal).
+    let mut later = vec![];
+    loop {
+        let activation = worker.poll_workflow_activation().await.unwrap();
+        let carried_signal = activation.jobs.iter().any(|j| {
+            matches!(
+                j.variant,
+                Some(workflow_activation_job::Variant::SignalWorkflow(_))
+            )
+        });
+        later.push((
+            activation.is_replaying,
+            resolve_hints(&activation),
+            carried_signal,
+        ));
+        let done = carried_signal;
+        let completion = if done {
+            WorkflowActivationCompletion::from_cmd(
+                activation.run_id,
+                CompleteWorkflowExecution::default().into(),
+            )
+        } else {
+            WorkflowActivationCompletion::empty(activation.run_id)
+        };
+        worker
+            .complete_workflow_activation(completion)
+            .await
+            .unwrap();
+        if done || later.len() > 3 {
+            break;
+        }
+    }
+    let resolves: Vec<_> = later
+        .iter()
+        .filter(|(_, hints, _)| !hints.is_empty())
+        .collect();
+    assert_eq!(
+        resolves.len(),
+        1,
+        "the wake is applied exactly once; activations after replay were {later:?}"
+    );
+    assert_eq!(resolves[0].1, vec![1]);
+    assert!(
+        !resolves[0].0,
+        "the wake must wait for replay to end; activations were {later:?}"
+    );
+    assert_eq!(*markers.lock(), Vec::new(), "replay writes nothing");
+    worker.drain_pollers_and_shutdown().await;
 }
