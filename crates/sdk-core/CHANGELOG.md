@@ -33,17 +33,6 @@ relevant information.
 
 ## Unreleased
 
-### Fixed
-* Workers with caching disabled now keep an incomplete retained external stream task until its
-  normal boundary, as they do for local Activities. This prevents repeated shutdown markers and
-  replacement tasks from starving asynchronous input readiness.
-* External stream wake Signals encountered while replay advances through a History page now
-  resume reconstructed subscriptions. Workers with caching disabled no longer complete repeated
-  empty tasks while unread records remain in the external store.
-* Workflow-originated external output no longer forces an empty replacement task from an old
-  stream wait after Workflow code has resumed and is awaiting an Activity or timer. This avoids
-  delaying that result behind an unnecessary task timeout.
-
 ### Added
 * Added the Core protocol for replay-safe Workflow-originated external stream output, including
   exact Workflow Task History floors, compact staged-output marker proofs, and shared input/output
@@ -85,6 +74,15 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Workers with caching disabled now keep an incomplete retained external stream task until its
+  normal boundary, as they do for local Activities. This prevents repeated shutdown markers and
+  replacement tasks from starving asynchronous input readiness.
+* External stream wake Signals encountered while replay advances through a History page now
+  resume reconstructed subscriptions. Workers with caching disabled no longer complete repeated
+  empty tasks while unread records remain in the external store.
+* Workflow-originated external output no longer forces an empty replacement task from an old
+  stream wait after Workflow code has resumed and is awaiting an Activity or timer. This avoids
+  delaying that result behind an unnecessary task timeout.
 * Workers now defensively buffer a replacement workflow task if it reaches a run that still owns
   one, preserving the outstanding task token in release builds.
 * The Prometheus exporter now appends `_total` to counter metric names when an SDK enables the
