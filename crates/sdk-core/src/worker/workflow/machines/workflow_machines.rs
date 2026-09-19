@@ -1865,16 +1865,18 @@ impl WorkflowMachines {
                 // runtime-internal activations that `ManagedRun` resolves (C6, C8, C15a). None of
                 // them should reach the machines; the output commit is also intercepted there.
                 // Reaching any one silently would drop replay-visible state on the floor.
-                WFCommandVariant::ExternalStreamProgress(_)
+                leaked @ (WFCommandVariant::ExternalStreamProgress(_)
                 | WFCommandVariant::ExternalStreamQuiescent(_)
                 | WFCommandVariant::ExternalStreamParkResult(_)
                 | WFCommandVariant::ExternalStreamFinalized(_)
                 | WFCommandVariant::ExternalOutputStreamCommit(_)
                 | WFCommandVariant::ExternalOutputStreamBuffered(_)
-                | WFCommandVariant::ExternalStreamChannels(_) => {
+                | WFCommandVariant::ExternalStreamChannels(_)) => {
+                    // Named, because this is the only diagnostic for a wait-set bug and seven
+                    // commands share the branch.
                     return Err(fatal!(
-                        "An external stream command reached the state machines; it should have \
-                         been consumed by the run's external wait set"
+                        "External stream command {leaked} reached the state machines; it should \
+                         have been consumed by the run's external wait set"
                     ));
                 }
                 WFCommandVariant::NoCommandsFromLang => (),
