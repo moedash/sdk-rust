@@ -17,6 +17,7 @@ import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/update.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
@@ -379,6 +380,10 @@ message WorkflowTaskCompletedEventAttributes {
     // The Worker Deployment Version that completed this task. Must be set if `versioning_behavior`
     // is set. This value updates workflow execution's `versioning_info.deployment_version`.
     temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 11;
+
+    // The offsets this task consumed, without the payloads. Recorded so replay
+    // can reproduce what the task saw, including a range that was empty.
+    repeated temporal.api.stream.v1.StreamCursor stream_cursors = 20;
 }
 
 message WorkflowTaskTimedOutEventAttributes {
@@ -953,6 +958,28 @@ message ActivityPropertiesModifiedExternallyEventAttributes {
     temporal.api.common.v1.RetryPolicy new_retry_policy = 2;
 }
 
+message WorkflowStreamMessagesAddedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command published this
+    // batch.
+    int64 workflow_task_completed_event_id = 1;
+    // Stream the Workflow published to.
+    string stream_id = 2;
+    // Offset the first message of the batch landed at.
+    int64 first_offset = 3;
+    // How many messages the batch held. With first_offset this names the range
+    // without carrying any of it, which is what keeps this event a fixed size
+    // no matter how large the batch or its payloads are.
+    int64 message_count = 4;
+}
+
+message WorkflowStreamSubscribedEventAttributes {
+    int64 workflow_task_completed_event_id = 1;
+    string stream_id = 2;
+    // Resolved by the server when the subscription is registered, so replay
+    // reads the resolved value rather than resolving it again.
+    int64 start_offset = 3;
+}
+
 message WorkflowExecutionUpdateAcceptedEventAttributes {
     // The instance ID of the update protocol that generated this event.
     string protocol_instance_id = 1;
@@ -1276,6 +1303,8 @@ message HistoryEvent {
         WorkflowExecutionPausedEventAttributes workflow_execution_paused_event_attributes = 63;
         WorkflowExecutionUnpausedEventAttributes workflow_execution_unpaused_event_attributes = 64;
         WorkflowExecutionTimeSkippingTransitionedEventAttributes workflow_execution_time_skipping_transitioned_event_attributes = 65;
+        WorkflowStreamSubscribedEventAttributes workflow_stream_subscribed_event_attributes = 66;
+        WorkflowStreamMessagesAddedEventAttributes workflow_stream_messages_added_event_attributes = 67;
     }
 }
 

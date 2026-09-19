@@ -50,10 +50,11 @@ use temporalio_common::{
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            common::v1::WorkflowExecution,
+            common::v1::{Payload, WorkflowExecution},
             enums::v1::WorkflowTaskFailedCause,
             failure::v1::Failure,
             protocol::{self, v1::message},
+            stream::v1::{StreamMessage, StreamSlice},
             update,
             workflowservice::v1::{
                 DescribeNamespaceResponse, PollActivityTaskQueueResponse,
@@ -913,6 +914,17 @@ pub trait PollWFTRespExt {
         update_id: impl ToString,
         after_event_id: i64,
     ) -> update::v1::Request;
+
+    /// Attach a range of a stream. Passing a `completed_event_id` of zero makes
+    /// it the range for the task about to run; anything else re-supplies what
+    /// the task closed by that event consumed.
+    fn add_stream_slice(
+        &mut self,
+        stream_id: impl ToString,
+        completed_event_id: i64,
+        from_offset: i64,
+        bodies: &[&str],
+    );
 }
 
 impl PollWFTRespExt for PollWorkflowTaskQueueResponse {
@@ -946,6 +958,32 @@ impl PollWFTRespExt for PollWorkflowTaskQueueResponse {
             sequencing_id: Some(message::SequencingId::EventId(after_event_id)),
         });
         upd_req_body
+    }
+
+    fn add_stream_slice(
+        &mut self,
+        stream_id: impl ToString,
+        completed_event_id: i64,
+        from_offset: i64,
+        bodies: &[&str],
+    ) {
+        self.stream_slices.push(StreamSlice {
+            stream_id: stream_id.to_string(),
+            from_offset,
+            to_offset: from_offset + bodies.len() as i64,
+            messages: bodies
+                .iter()
+                .map(|b| StreamMessage {
+                    body: Some(Payload {
+                        data: b.as_bytes().to_vec(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            workflow_task_completed_event_id: completed_event_id,
+            ..Default::default()
+        });
     }
 }
 
