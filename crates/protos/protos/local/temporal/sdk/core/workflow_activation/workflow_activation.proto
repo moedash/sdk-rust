@@ -155,6 +155,9 @@ message WorkflowActivationJob {
         // Runtime-internal: encode the terminal boundary for a marker Core is about to write.
         // Runs no user code.
         FinalizeExternalStreams finalize_external_streams = 20;
+        // The number below is shared with the native stream tree, which leaves 17
+        // to 20 to the jobs above, and must not be reused.
+        //
         // A range of a stream the workflow subscribed to.
         DeliverStreamMessages deliver_stream_messages = 21;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the

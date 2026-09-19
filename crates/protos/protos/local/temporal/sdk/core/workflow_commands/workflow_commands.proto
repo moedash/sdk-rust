@@ -62,6 +62,8 @@ message WorkflowCommand {
         ExternalStreamFinalized external_stream_finalized = 26;
         WorkflowOutputStreamCommit workflow_output_stream_commit = 27;
         WorkflowOutputStreamBuffered workflow_output_stream_buffered = 28;
+        // The two numbers below are shared with the native stream tree, which
+        // leaves 23 to 28 to the commands above, and must not be reused.
         SubscribeStream subscribe_stream = 29;
         AddStreamMessages add_stream_messages = 30;
     }
@@ -153,13 +155,6 @@ message WorkflowOutputStreamBuffered {
     google.protobuf.Duration max_publish_latency = 1;
 }
 
-
-// Subscribe this workflow to a stream, so later Workflow Tasks carry the
-// ranges it has not consumed yet.
-//
-// The stream's addressing is resolved by the server. A workflow cannot look it
-// up without doing I/O, and a value it carried would be a reading rather than a
-// fact, so it could differ on replay.
 // Publish a batch of messages to a stream this workflow owns.
 //
 // The bodies go to the stream's own log rather than into History, which gets
@@ -171,6 +166,12 @@ message AddStreamMessages {
     repeated temporal.api.stream.v1.StreamMessage messages = 2;
 }
 
+// Subscribe this workflow to a stream, so later Workflow Tasks carry the
+// ranges it has not consumed yet.
+//
+// The stream's addressing is resolved by the server. A workflow cannot look it
+// up without doing I/O, and a value it carried would be a reading rather than a
+// fact, so it could differ on replay.
 message SubscribeStream {
     string stream_id = 1;
     // Negative means from wherever the stream is when the subscription is
