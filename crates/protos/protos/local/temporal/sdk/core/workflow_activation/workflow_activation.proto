@@ -140,8 +140,12 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // 17 to 20 are taken by the external stream jobs, which are developed
+        // alongside this one and share this message. The number below is fixed
+        // with that family and must not be reused.
+        //
         // A range of a stream the workflow subscribed to.
-        DeliverStreamMessages deliver_stream_messages = 17;
+        DeliverStreamMessages deliver_stream_messages = 21;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
