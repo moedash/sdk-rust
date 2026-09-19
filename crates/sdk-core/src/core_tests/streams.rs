@@ -219,8 +219,11 @@ async fn replays_recorded_ranges_in_order_before_the_current_one() {
     mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
     let core = mock_worker(mock);
 
+    // Each entry is (activation, from, to, bodies). The activation matters as
+    // much as the order: a range that came back one activation late would
+    // still be in order.
     let mut seen = vec![];
-    loop {
+    for activation in 1..=3 {
         let task = core.poll_workflow_activation().await.unwrap();
         for job in &task.jobs {
             if matches!(
@@ -229,29 +232,27 @@ async fn replays_recorded_ranges_in_order_before_the_current_one() {
             ) {
                 let (_, from, to, bodies) = delivered(job);
                 seen.push((
+                    activation,
                     from,
                     to,
                     bodies.iter().map(|b| b.to_vec()).collect::<Vec<_>>(),
                 ));
             }
         }
-        let done = seen.len() >= 3;
         core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
             .await
             .unwrap();
-        if done {
-            break;
-        }
     }
 
     assert_eq!(
         seen,
         vec![
-            (0, 2, vec![b"alpha".to_vec(), b"beta".to_vec()]),
-            (2, 3, vec![b"gamma".to_vec()]),
-            (3, 4, vec![b"delta".to_vec()]),
+            (1, 0, 2, vec![b"alpha".to_vec(), b"beta".to_vec()]),
+            (2, 2, 3, vec![b"gamma".to_vec()]),
+            (3, 3, 4, vec![b"delta".to_vec()]),
         ],
-        "recorded ranges come back in event order, then the live one"
+        "each recorded range comes back in the activation of the task that consumed it, \
+         then the live one"
     );
 }
 
@@ -980,6 +981,81 @@ async fn a_resupplied_slice_that_disagrees_with_the_record_fails_the_task() {
 
     // The mismatch is found while the poll response is applied, so the first
     // activation is already the eviction.
+    core.handle_eviction().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// A run that stays cached was handed its range as the task ran. When the next
+/// task arrives, the completion recording that range is in its history, and the
+/// server may re-supply the range tagged with it, as it would for a worker that
+/// lost the run. This worker did not, so it must not process the same records
+/// twice.
+#[tokio::test]
+async fn a_cached_run_is_not_handed_its_own_range_again() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let completed = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 2)]);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut first_poll = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::ToTaskNum(1));
+    first_poll.add_stream_slice("s1", 0, 0, &["a", "b"]);
+    let mut second_poll = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::OneTask(2));
+    second_poll.add_stream_slice("s1", completed, 0, &["a", "b"]);
+    second_poll.add_stream_slice("s1", 0, 2, &["c"]);
+
+    let mock = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [
+            ResponseType::Raw(first_poll.resp),
+            ResponseType::Raw(second_poll.resp),
+        ],
+        mock_worker_client(),
+    );
+    let mut mock = build_mock_pollers(mock);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![("s1".to_string(), 0, 2)]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert!(!task.is_replaying);
+    assert_eq!(
+        delivered_ranges(&task),
+        vec![("s1".to_string(), 2, 3)],
+        "only the new range; the first one was delivered live to this worker"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+    core.shutdown().await;
+}
+
+/// History says a task consumed a range with content and the server sent no
+/// bytes for it. The lookahead leaves that alone, since the completion may
+/// arrive with a later response, and the batch that carries the completion
+/// fails the task rather than replay it on less input than it ran on.
+#[tokio::test]
+async fn a_missing_resupply_for_a_consumed_range_fails_the_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 2)]);
+    t.add_workflow_task_scheduled_and_started();
+
+    let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
     core.handle_eviction().await;
     assert_eq!(failures.load(Ordering::Relaxed), 1);
     core.shutdown().await;
