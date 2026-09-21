@@ -1044,9 +1044,11 @@ async fn a_cached_run_is_not_handed_its_own_range_again() {
 }
 
 /// History says a task consumed a range with content and the server sent no
-/// bytes for it. The lookahead leaves that alone, since the completion may
-/// arrive with a later response, and the batch that carries the completion
-/// fails the task rather than replay it on less input than it ran on.
+/// bytes for it. The bytes only travel on the response that carried the task,
+/// so the lookahead fails the task as soon as it sees the range, before the
+/// workflow runs on less input than it ran on. A sticky task handed to a worker
+/// that no longer holds the run is the case that reaches this, and the server's
+/// retry on the normal queue carries the records.
 #[tokio::test]
 async fn a_missing_resupply_for_a_consumed_range_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
@@ -1057,11 +1059,8 @@ async fn a_missing_resupply_for_a_consumed_range_fails_the_task() {
 
     let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
 
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_eq!(delivered_ranges(&task), vec![]);
-    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
-        .await
-        .unwrap();
+    // Found while the poll response is applied, so the first activation is
+    // already the eviction.
     core.handle_eviction().await;
     assert_eq!(failures.load(Ordering::Relaxed), 1);
     core.shutdown().await;
@@ -1231,20 +1230,24 @@ async fn a_pushed_history_with_a_wrong_slice_fails_as_nondeterministic() {
 
 /// A recorded range with content and no slice for it is the same failure. A
 /// language replayer that has no store to fetch from cannot replay a consuming
-/// workflow, and the task says so instead of replaying on less input.
+/// workflow, and the task says so before the workflow runs on less input.
 #[tokio::test]
 async fn a_pushed_history_without_slices_for_a_consumed_range_fails_as_nondeterministic() {
     let (t, _, _) = read_then_publish_history();
     let history = HistoryForReplay::new(t.get_full_history_info().unwrap(), "wfid");
     let (core, feeder) = replay_worker(history).await;
 
+    // Found while the poll response is applied, so the first activation is
+    // already the eviction, which carries the reason in its message.
     let task = core.poll_workflow_activation().await.unwrap();
-    assert_eq!(delivered_ranges(&task), vec![]);
-    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
-        .await
-        .unwrap();
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_eq!(eviction(&task).reason(), EvictionReason::Nondeterminism);
+    let evict = eviction(&task);
+    assert!(
+        evict.message.contains(
+            "Event 4 records that stream in was consumed from offset 0 to 1, but the server \
+             sent no records for it"
+        ),
+        "eviction did not name the missing range: {evict:?}"
+    );
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
         .await
         .unwrap();
