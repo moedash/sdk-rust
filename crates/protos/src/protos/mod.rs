@@ -1374,10 +1374,10 @@ pub mod coresdk {
                                 fin.reason()
                             )
                         }
-                        workflow_activation_job::Variant::DeliverStreamMessages(d) => {
+                        workflow_activation_job::Variant::DeliverStreamRecords(d) => {
                             write!(
                                 f,
-                                "DeliverStreamMessages({}, {}..{})",
+                                "DeliverStreamRecords({}, {}..{})",
                                 d.stream_id, d.from_offset, d.to_offset
                             )
                         }
@@ -1596,13 +1596,13 @@ pub mod coresdk {
                 }
             }
 
-            impl Display for AddStreamMessages {
+            impl Display for AppendStreamRecords {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(
                         f,
-                        "AddStreamMessages({}, {} messages)",
+                        "AppendStreamRecords({}, {} records)",
                         self.stream_id,
-                        self.messages.len()
+                        self.records.len()
                     )
                 }
             }
@@ -2031,8 +2031,8 @@ pub mod temporal {
                             Attributes::SubscribeStreamCommandAttributes(_) => {
                                 CommandType::SubscribeStream
                             }
-                            Attributes::AddStreamMessagesCommandAttributes(_) => {
-                                CommandType::AddStreamMessages
+                            Attributes::AppendStreamRecordsCommandAttributes(_) => {
+                                CommandType::AppendStreamRecords
                             }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
@@ -2087,12 +2087,12 @@ pub mod temporal {
                         }
                     }
 
-                    impl From<workflow_commands::AddStreamMessages> for command::Attributes {
-                        fn from(s: workflow_commands::AddStreamMessages) -> Self {
-                            Self::AddStreamMessagesCommandAttributes(
-                                AddStreamMessagesCommandAttributes {
+                    impl From<workflow_commands::AppendStreamRecords> for command::Attributes {
+                        fn from(s: workflow_commands::AppendStreamRecords) -> Self {
+                            Self::AppendStreamRecordsCommandAttributes(
+                                AppendStreamRecordsCommandAttributes {
                                     stream_id: s.stream_id,
-                                    messages: s.messages,
+                                    records: s.records,
                                 },
                             )
                         }
@@ -2569,7 +2569,7 @@ pub mod temporal {
                                 | EventType::UpsertWorkflowSearchAttributes
                                 | EventType::WorkflowPropertiesModified
                                 | EventType::WorkflowStreamSubscribed
-                                | EventType::WorkflowStreamMessagesAdded
+                                | EventType::WorkflowStreamRecordsAppended
                                 | EventType::NexusOperationScheduled
                                 | EventType::NexusOperationCancelRequested
                                 | EventType::WorkflowExecutionCanceled
@@ -2670,7 +2670,7 @@ pub mod temporal {
                             if let Some(a) = self.attributes.as_ref() {
                                 match a {
                                     Attributes::WorkflowStreamSubscribedEventAttributes(_) => false,
-                                    Attributes::WorkflowStreamMessagesAddedEventAttributes(_) => {
+                                    Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => {
                                         false
                                     }
                                     Attributes::WorkflowExecutionStartedEventAttributes(_) => false,
@@ -2761,7 +2761,7 @@ pub mod temporal {
                             // I just absolutely _love_ this
                             match self {
                             Attributes::WorkflowStreamSubscribedEventAttributes(_) => { EventType::WorkflowStreamSubscribed }
-                            Attributes::WorkflowStreamMessagesAddedEventAttributes(_) => { EventType::WorkflowStreamMessagesAdded }
+                            Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => { EventType::WorkflowStreamRecordsAppended }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
                             Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
                             Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }

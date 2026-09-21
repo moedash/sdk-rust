@@ -159,7 +159,7 @@ message WorkflowActivationJob {
         // to 20 to the jobs above, and must not be reused.
         //
         // A range of a stream the workflow subscribed to.
-        DeliverStreamMessages deliver_stream_messages = 21;
+        DeliverStreamRecords deliver_stream_records = 21;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -233,14 +233,14 @@ message FinalizeExternalStreams {
 //
 // An empty range is still delivered: a task where the subscription saw nothing
 // is a fact replay has to reproduce, not an absence of one.
-message DeliverStreamMessages {
+message DeliverStreamRecords {
     // Id of the stream this range came from.
     string stream_id = 1;
     // Inclusive.
     int64 from_offset = 2;
     // Exclusive. Equal to from_offset when the subscription saw nothing.
     int64 to_offset = 3;
-    repeated temporal.api.stream.v1.StreamMessage messages = 4;
+    repeated temporal.api.stream.v1.StreamRecord records = 4;
 }
 
 // Initialize a new workflow

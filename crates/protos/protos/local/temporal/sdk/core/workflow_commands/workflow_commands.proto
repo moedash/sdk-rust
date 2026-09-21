@@ -65,7 +65,7 @@ message WorkflowCommand {
         // The two numbers below are shared with the native stream tree, which
         // leaves 23 to 28 to the commands above, and must not be reused.
         SubscribeStream subscribe_stream = 29;
-        AddStreamMessages add_stream_messages = 30;
+        AppendStreamRecords append_stream_records = 30;
     }
 }
 
@@ -155,15 +155,16 @@ message WorkflowOutputStreamBuffered {
     google.protobuf.Duration max_publish_latency = 1;
 }
 
-// Publish a batch of messages to a stream this workflow owns.
-//
+// Append a batch of records to a stream this workflow owns.//
 // The bodies go to the stream's own log rather than into History, which gets
 // one fixed-size event naming the offset range. That is what makes the batch
-// size free: a thousand messages cost the same in History as one.
-message AddStreamMessages {
+// size free: a thousand records cost the same in History as one. The server
+// stores each record with an empty producer id, because the workflow is the
+// producer here.
+message AppendStreamRecords {
     // Empty means the workflow's default output stream.
     string stream_id = 1;
-    repeated temporal.api.stream.v1.StreamMessage messages = 2;
+    repeated temporal.api.stream.v1.StreamRecord records = 2;
 }
 
 // Subscribe this workflow to a stream, so later Workflow Tasks carry the

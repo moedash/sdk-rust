@@ -26,7 +26,7 @@ use temporalio_common::protos::{
         enums::v1::{EventType, TaskQueueKind, WorkflowTaskFailedCause},
         failure::v1::{CanceledFailureInfo, Failure, failure},
         history::v1::{history_event::Attributes, *},
-        stream::v1::StreamCursor,
+        stream::v1::StreamRange,
         taskqueue::v1::TaskQueue,
         update,
         update::v1::outcome,
@@ -136,13 +136,13 @@ impl TestHistoryBuilder {
     /// Add a workflow task completed event recording the stream offsets that
     /// task consumed. Only the range is in History; the payloads come back from
     /// the server on the poll response.
-    pub fn add_workflow_task_completed_with_stream_cursors(
+    pub fn add_workflow_task_completed_with_consumed_stream_ranges(
         &mut self,
-        cursors: Vec<StreamCursor>,
+        cursors: Vec<StreamRange>,
     ) -> i64 {
         let id = self.add(WorkflowTaskCompletedEventAttributes {
             scheduled_event_id: self.workflow_task_scheduled_event_id,
-            stream_cursors: cursors,
+            consumed_stream_ranges: cursors,
             ..Default::default()
         });
         self.previous_task_completed_id = id;
@@ -159,18 +159,18 @@ impl TestHistoryBuilder {
         self.add(attrs)
     }
 
-    /// Add the event an add-stream-messages command produces.
-    pub fn add_stream_messages_added(
+    /// Add the event an append-stream-records command produces.
+    pub fn add_stream_records_appended(
         &mut self,
         stream_id: &str,
         first_offset: i64,
-        message_count: i64,
+        record_count: i64,
     ) -> i64 {
-        let attrs = WorkflowStreamMessagesAddedEventAttributes {
+        let attrs = WorkflowStreamRecordsAppendedEventAttributes {
             workflow_task_completed_event_id: self.previous_task_completed_id,
             stream_id: stream_id.to_string(),
             first_offset,
-            message_count,
+            record_count,
         };
         self.add(attrs)
     }

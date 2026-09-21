@@ -54,7 +54,7 @@ use temporalio_common::{
             enums::v1::WorkflowTaskFailedCause,
             failure::v1::Failure,
             protocol::{self, v1::message},
-            stream::v1::{StreamMessage, StreamSlice},
+            stream::v1::{StreamRecord, StreamSlice},
             update,
             workflowservice::v1::{
                 DescribeNamespaceResponse, PollActivityTaskQueueResponse,
@@ -971,9 +971,9 @@ impl PollWFTRespExt for PollWorkflowTaskQueueResponse {
             stream_id: stream_id.to_string(),
             from_offset,
             to_offset: from_offset + bodies.len() as i64,
-            messages: bodies
+            records: bodies
                 .iter()
-                .map(|b| StreamMessage {
+                .map(|b| StreamRecord {
                     body: Some(Payload {
                         data: b.as_bytes().to_vec(),
                         ..Default::default()

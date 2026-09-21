@@ -11,29 +11,46 @@ option csharp_namespace = "Temporalio.Api.Stream.V1";
 
 import "temporal/api/common/v1/message.proto";
 
-message StreamMessage {
+// One entry in a stream. The record is the wire format: stores keep it
+// serialized as is and readers in every language decode the same bytes.
+message StreamRecord {
+    // The value the producer published, stored as sent. A payload codec
+    // applies here as it does to any other payload.
     temporal.api.common.v1.Payload body = 1;
+    // Producer-supplied provenance, stored as sent.
     map<string, temporal.api.common.v1.Payload> metadata = 2;
+    // Producer-supplied grouping label, stored as sent.
     string topic = 3;
-    int64 topic_sequence = 4;
+    // How to read this record. Unspecified is read as DATA.
+    StreamRecordKind kind = 4;
+    // Who wrote the record. Empty when the owning Workflow did.
+    string producer_id = 5;
+    // The producer's attempt. Readers treat a later attempt by the same
+    // producer as superseding what the earlier one wrote.
+    int64 attempt = 6;
+    // The producer's position within its attempt, or -1 when unnumbered.
+    // Stored as sent; the server does not assign, validate or order by it.
+    int64 sequence = 7;
 }
 
 // A contiguous range of a stream delivered to a Workflow Task, along with the
-// offsets it covers. The offsets are what History records; the messages
+// offsets it covers. The offsets are what History records; the records
 // themselves are never written to History.
 message StreamSlice {
     string stream_id = 1;
+    // Run id of the execution that owns the stream. Set on both a slice for the
+    // task being started and a re-supplied one.
     string run_id = 2;
     // Inclusive.
     int64 from_offset = 3;
     // Exclusive. Equal to from_offset when the subscription observed nothing,
     // which is a fact replay has to reproduce rather than an absence of one.
     int64 to_offset = 4;
-    repeated StreamMessage messages = 5;
-    // The WorkflowTaskCompleted event whose stream_cursors recorded this range.
-    // Set only when the server is re-supplying a range for a task being
-    // replayed; a slice for the task now being started leaves it unset, because
-    // the event closing that task does not exist yet.
+    repeated StreamRecord records = 5;
+    // The WorkflowTaskCompleted event whose consumed_stream_ranges recorded
+    // this range. Set only when the server is re-supplying a range for a task
+    // being replayed; a slice for the task now being started leaves it unset,
+    // because the event closing that task does not exist yet.
     //
     // Replay needs this because a Workflow Task response carries one slice set
     // while a cache miss replays every prior task, so the ranges have to be
@@ -43,9 +60,23 @@ message StreamSlice {
 
 // The offsets a Workflow Task consumed, without the payloads. Recorded on
 // WorkflowTaskCompleted so History grows with Workflow Tasks rather than with
-// messages.
-message StreamCursor {
+// records.
+message StreamRange {
     string stream_id = 1;
+    // Inclusive.
     int64 from_offset = 2;
+    // Exclusive.
     int64 to_offset = 3;
+}
+
+// What a record means to a reader. Kept on the record itself so every store
+// and every language reads it the same way without a private envelope.
+enum StreamRecordKind {
+    // Read as DATA.
+    STREAM_RECORD_KIND_UNSPECIFIED = 0;
+    // A value the producer published; `body` carries it.
+    STREAM_RECORD_KIND_DATA = 1;
+    // The producer named by `producer_id` writes nothing more on `topic`.
+    // Says nothing about that producer's outcome and does not end the stream.
+    STREAM_RECORD_KIND_FINISH = 2;
 }

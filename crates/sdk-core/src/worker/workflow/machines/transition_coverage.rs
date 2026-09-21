@@ -66,7 +66,7 @@ mod machine_coverage_report {
     use super::*;
     use crate::worker::workflow::machines::{
         StateMachine, activity_state_machine::ActivityMachine,
-        add_stream_messages_state_machine::AddStreamMessagesMachine,
+        append_stream_records_state_machine::AppendStreamRecordsMachine,
         cancel_external_state_machine::CancelExternalMachine,
         cancel_workflow_state_machine::CancelWorkflowMachine,
         child_workflow_state_machine::ChildWorkflowMachine,
@@ -122,7 +122,7 @@ mod machine_coverage_report {
         let mut nexus = NexusOperationMachine::visualizer().to_owned();
         let mut external_stream = ExternalStreamMachine::visualizer().to_owned();
         let mut subscribe_stream = SubscribeStreamMachine::visualizer().to_owned();
-        let mut add_stream_messages = AddStreamMessagesMachine::visualizer().to_owned();
+        let mut append_stream_records = AppendStreamRecordsMachine::visualizer().to_owned();
 
         // This isn't at all efficient but doesn't need to be.
         // Replace transitions in the vizzes with green color if they are covered.
@@ -154,8 +154,8 @@ mod machine_coverage_report {
                 m @ "SubscribeStreamMachine" => {
                     cover_transitions(m, &mut subscribe_stream, coverage)
                 }
-                m @ "AddStreamMessagesMachine" => {
-                    cover_transitions(m, &mut add_stream_messages, coverage)
+                m @ "AppendStreamRecordsMachine" => {
+                    cover_transitions(m, &mut append_stream_records, coverage)
                 }
                 m => panic!("Unknown machine {m}"),
             }

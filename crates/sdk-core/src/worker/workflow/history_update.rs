@@ -769,7 +769,7 @@ fn find_end_index_of_next_wft_seq(
                     // fold it into a heartbeat chain and hand several ranges over at once.
                     if let Some(Attributes::WorkflowTaskCompletedEventAttributes(ref attrs)) =
                         next_event.attributes
-                        && !attrs.stream_cursors.is_empty()
+                        && !attrs.consumed_stream_ranges.is_empty()
                     {
                         saw_command = true;
                         saw_command_or_started = true;

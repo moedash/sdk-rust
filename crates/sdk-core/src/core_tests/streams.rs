@@ -22,22 +22,22 @@ use std::sync::{
 use temporalio_common::protos::{
     coresdk::{
         workflow_activation::{WorkflowActivation, WorkflowActivationJob, workflow_activation_job},
-        workflow_commands::{AddStreamMessages, SubscribeStream},
+        workflow_commands::{AppendStreamRecords, SubscribeStream},
         workflow_completion::WorkflowActivationCompletion,
     },
     temporal::api::{
         command::v1::command,
         enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
         history::v1::{History, HistoryEvent},
-        stream::v1::{StreamCursor, StreamMessage},
+        stream::v1::{StreamRange, StreamRecord},
         workflowservice::v1::{
             GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
         },
     },
 };
 
-fn cursor(stream_id: &str, from: i64, to: i64) -> StreamCursor {
-    StreamCursor {
+fn cursor(stream_id: &str, from: i64, to: i64) -> StreamRange {
+    StreamRange {
         stream_id: stream_id.to_string(),
         from_offset: from,
         to_offset: to,
@@ -46,11 +46,11 @@ fn cursor(stream_id: &str, from: i64, to: i64) -> StreamCursor {
 
 fn delivered(job: &WorkflowActivationJob) -> (&str, i64, i64, Vec<&[u8]>) {
     match job.variant.as_ref().unwrap() {
-        workflow_activation_job::Variant::DeliverStreamMessages(d) => (
+        workflow_activation_job::Variant::DeliverStreamRecords(d) => (
             d.stream_id.as_str(),
             d.from_offset,
             d.to_offset,
-            d.messages
+            d.records
                 .iter()
                 .map(|m| m.body.as_ref().unwrap().data.as_slice())
                 .collect(),
@@ -66,7 +66,7 @@ fn delivered_ranges(task: &WorkflowActivation) -> Vec<(String, i64, i64)> {
         .filter(|j| {
             matches!(
                 j.variant,
-                Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+                Some(workflow_activation_job::Variant::DeliverStreamRecords(_))
             )
         })
         .map(|j| {
@@ -135,7 +135,7 @@ async fn delivers_the_range_for_the_current_task() {
         .filter(|j| {
             matches!(
                 j.variant,
-                Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+                Some(workflow_activation_job::Variant::DeliverStreamRecords(_))
             )
         })
         .collect();
@@ -176,7 +176,7 @@ async fn delivers_an_empty_range() {
         .find(|j| {
             matches!(
                 j.variant,
-                Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+                Some(workflow_activation_job::Variant::DeliverStreamRecords(_))
             )
         })
         .expect("an empty range is still delivered");
@@ -196,10 +196,10 @@ async fn replays_recorded_ranges_in_order_before_the_current_one() {
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
     let first_completed =
-        t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 2)]);
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 0, 2)]);
     t.add_workflow_task_scheduled_and_started();
     let second_completed =
-        t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 2, 3)]);
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 2, 3)]);
     t.add_workflow_task_scheduled_and_started();
 
     let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
@@ -228,7 +228,7 @@ async fn replays_recorded_ranges_in_order_before_the_current_one() {
         for job in &task.jobs {
             if matches!(
                 job.variant,
-                Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+                Some(workflow_activation_job::Variant::DeliverStreamRecords(_))
             ) {
                 let (_, from, to, bodies) = delivered(job);
                 seen.push((
@@ -316,14 +316,14 @@ async fn publish_command_reaches_the_server_with_its_payloads() {
         .times(1)
         .returning(|resp, _| {
             let cmd = resp.commands.first().expect("a command was sent");
-            assert_eq!(cmd.command_type(), CommandType::AddStreamMessages);
+            assert_eq!(cmd.command_type(), CommandType::AppendStreamRecords);
             match cmd.attributes.as_ref().unwrap() {
-                command::Attributes::AddStreamMessagesCommandAttributes(a) => {
+                command::Attributes::AppendStreamRecordsCommandAttributes(a) => {
                     assert_eq!(a.stream_id, "s1");
                     // The bodies are the half of the batch History never sees,
                     // so the command is the only thing that can carry them.
                     let bodies: Vec<_> = a
-                        .messages
+                        .records
                         .iter()
                         .map(|m| m.body.as_ref().unwrap().data.clone())
                         .collect();
@@ -358,7 +358,7 @@ async fn publish_command_round_trips_through_replay() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
-    t.add_stream_messages_added("s1", 0, 2);
+    t.add_stream_records_appended("s1", 0, 2);
     t.add_full_wf_task();
 
     let mut mock_client = mock_worker_client();
@@ -431,15 +431,15 @@ async fn subscribe_command_reaches_the_server() {
     core.shutdown().await;
 }
 
-fn publish_two(stream_id: &str) -> AddStreamMessages {
-    AddStreamMessages {
+fn publish_two(stream_id: &str) -> AppendStreamRecords {
+    AppendStreamRecords {
         stream_id: stream_id.to_string(),
-        messages: vec![
-            StreamMessage {
+        records: vec![
+            StreamRecord {
                 body: Some(b"one".to_vec().into()),
                 ..Default::default()
             },
-            StreamMessage {
+            StreamRecord {
                 body: Some(b"two".to_vec().into()),
                 ..Default::default()
             },
@@ -466,8 +466,8 @@ async fn read_then_publish_replays_when_the_range_is_only_visible_by_lookahead()
     t.add_workflow_task_scheduled_and_started();
     // The task that reads [0,1) and publishes because of it.
     let read_completed =
-        t.add_workflow_task_completed_with_stream_cursors(vec![cursor("in", 0, 1)]);
-    t.add_stream_messages_added("out", 0, 1);
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("in", 0, 1)]);
+    t.add_stream_records_appended("out", 0, 1);
     t.add_workflow_task_scheduled_and_started();
 
     let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
@@ -492,7 +492,7 @@ async fn read_then_publish_replays_when_the_range_is_only_visible_by_lookahead()
     let got_input = task.jobs.iter().any(|j| {
         matches!(
             j.variant,
-            Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+            Some(workflow_activation_job::Variant::DeliverStreamRecords(_))
         )
     });
     assert!(
@@ -505,9 +505,9 @@ async fn read_then_publish_replays_when_the_range_is_only_visible_by_lookahead()
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
         task.run_id,
         vec![
-            AddStreamMessages {
+            AppendStreamRecords {
                 stream_id: "out".to_string(),
-                messages: vec![StreamMessage {
+                records: vec![StreamRecord {
                     body: Some(b"accept".to_vec().into()),
                     ..Default::default()
                 }],
@@ -538,8 +538,8 @@ async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
     t.add_workflow_task_scheduled_and_started();
     // Task 2 reads [0,3) and publishes because of it.
     let read_completed =
-        t.add_workflow_task_completed_with_stream_cursors(vec![cursor("in", 0, 3)]);
-    t.add_stream_messages_added("out", 0, 1);
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("in", 0, 3)]);
+    t.add_stream_records_appended("out", 0, 1);
     t.add_workflow_task_scheduled_and_started();
 
     let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
@@ -582,7 +582,7 @@ async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
         .filter(|j| {
             matches!(
                 j.variant,
-                Some(workflow_activation_job::Variant::DeliverStreamMessages(_))
+                Some(workflow_activation_job::Variant::DeliverStreamRecords(_))
             )
         })
         .flat_map(|j| delivered(j).3.into_iter().map(|b| b.to_vec()))
@@ -596,9 +596,9 @@ async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
         task.run_id,
         vec![
-            AddStreamMessages {
+            AppendStreamRecords {
                 stream_id: "out".to_string(),
-                messages: vec![StreamMessage {
+                records: vec![StreamRecord {
                     body: Some(b"accept".to_vec().into()),
                     ..Default::default()
                 }],
@@ -637,8 +637,8 @@ async fn read_then_publish_replays_across_a_page_boundary(
     t.add_workflow_task_scheduled_and_started(); // 12
     // Task 3 reads [0,1) and publishes because of it.
     let read_completed =
-        t.add_workflow_task_completed_with_stream_cursors(vec![cursor("in", 0, 1)]);
-    t.add_stream_messages_added("out", 0, 1);
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("in", 0, 1)]);
+    t.add_stream_records_appended("out", 0, 1);
     t.add_workflow_task_scheduled_and_started(); // 16
 
     let events = t.get_full_history_info().unwrap().into_events();
@@ -710,9 +710,9 @@ async fn read_then_publish_replays_across_a_page_boundary(
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
         task.run_id,
         vec![
-            AddStreamMessages {
+            AppendStreamRecords {
                 stream_id: "out".to_string(),
-                messages: vec![StreamMessage {
+                records: vec![StreamRecord {
                     body: Some(b"accept".to_vec().into()),
                     ..Default::default()
                 }],
@@ -742,7 +742,7 @@ async fn a_publish_reissued_to_a_different_stream_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
-    t.add_stream_messages_added("s1", 0, 2);
+    t.add_stream_records_appended("s1", 0, 2);
     t.add_full_wf_task();
 
     let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
@@ -759,14 +759,14 @@ async fn a_publish_reissued_to_a_different_stream_fails_the_task() {
     core.shutdown().await;
 }
 
-/// The batch size is part of the record too: the event names how many messages
+/// The batch size is part of the record too: the event names how many records
 /// landed, so a replay that publishes fewer has diverged from the original run.
 #[tokio::test]
 async fn a_publish_reissued_with_a_different_batch_size_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
-    t.add_stream_messages_added("s1", 0, 2);
+    t.add_stream_records_appended("s1", 0, 2);
     t.add_full_wf_task();
 
     let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
@@ -775,9 +775,9 @@ async fn a_publish_reissued_with_a_different_batch_size_fails_the_task() {
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
         task.run_id,
         vec![
-            AddStreamMessages {
+            AppendStreamRecords {
                 stream_id: "s1".to_string(),
-                messages: vec![StreamMessage {
+                records: vec![StreamRecord {
                     body: Some(b"one".to_vec().into()),
                     ..Default::default()
                 }],
@@ -832,11 +832,12 @@ async fn data_only_tasks_replay_one_range_per_activation() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
-    let first = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 1)]);
+    let first = t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 0, 1)]);
     t.add_workflow_task_scheduled_and_started();
-    let second = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 1, 2)]);
+    let second =
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 1, 2)]);
     t.add_workflow_task_scheduled_and_started();
-    let third = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 2, 3)]);
+    let third = t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 2, 3)]);
     t.add_workflow_task_scheduled_and_started();
 
     let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
@@ -883,7 +884,7 @@ async fn ranges_for_several_streams_arrive_in_stream_order() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
-    let completed = t.add_workflow_task_completed_with_stream_cursors(vec![
+    let completed = t.add_workflow_task_completed_with_consumed_stream_ranges(vec![
         cursor("s2", 0, 1),
         cursor("s1", 0, 1),
     ]);
@@ -933,7 +934,7 @@ async fn an_empty_recorded_range_replays_without_a_slice_from_the_server() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
-    t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 4, 4)]);
+    t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 4, 4)]);
     t.add_workflow_task_scheduled_and_started();
 
     let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
@@ -969,11 +970,12 @@ async fn a_resupplied_slice_that_disagrees_with_the_record_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
-    let completed = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 2)]);
+    let completed =
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 0, 2)]);
     t.add_workflow_task_scheduled_and_started();
 
     let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
-    // One message where the record says two.
+    // One record where the event says two.
     poll_resp.add_stream_slice("s1", completed, 0, &["a"]);
 
     let (core, failures) =
@@ -996,7 +998,8 @@ async fn a_cached_run_is_not_handed_its_own_range_again() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
-    let completed = t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 2)]);
+    let completed =
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 0, 2)]);
     t.add_workflow_task_scheduled_and_started();
 
     let mut first_poll = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::ToTaskNum(1));
@@ -1046,7 +1049,7 @@ async fn a_missing_resupply_for_a_consumed_range_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
-    t.add_workflow_task_completed_with_stream_cursors(vec![cursor("s1", 0, 2)]);
+    t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 0, 2)]);
     t.add_workflow_task_scheduled_and_started();
 
     let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);

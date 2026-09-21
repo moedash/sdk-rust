@@ -7,21 +7,21 @@ use crate::worker::workflow::{
     nondeterminism,
 };
 use temporalio_common::protos::{
-    coresdk::workflow_commands::AddStreamMessages,
+    coresdk::workflow_commands::AppendStreamRecords,
     temporal::api::{
         enums::v1::{CommandType, EventType},
-        history::v1::{WorkflowStreamMessagesAddedEventAttributes, history_event},
+        history::v1::{WorkflowStreamRecordsAppendedEventAttributes, history_event},
     },
 };
 
 fsm! {
-    pub(super) name AddStreamMessagesMachine;
-    command AddStreamMessagesMachineCommand;
+    pub(super) name AppendStreamRecordsMachine;
+    command AppendStreamRecordsMachineCommand;
     error WFMachinesError;
     shared_state SharedState;
 
     Created --(CommandScheduled) --> CommandIssued;
-    CommandIssued --(CommandRecorded(WorkflowStreamMessagesAddedEventAttributes),
+    CommandIssued --(CommandRecorded(WorkflowStreamRecordsAppendedEventAttributes),
         shared on_command_recorded) --> Done;
 }
 
@@ -29,20 +29,20 @@ fsm! {
 #[derive(Default, Clone)]
 pub(super) struct SharedState {
     stream_id: String,
-    message_count: i64,
+    record_count: i64,
 }
 
-/// Publish a batch of messages to a stream this workflow owns.
+/// Append a batch of records to a stream this workflow owns.
 ///
 /// The bodies go to the stream's own log, and History gets one event naming the
 /// offset range the batch landed at. The offsets are assigned by the server, so
 /// nothing here predicts them.
-pub(super) fn add_stream_messages(lang_cmd: AddStreamMessages) -> NewMachineWithCommand {
-    let sm = AddStreamMessagesMachine::from_parts(
+pub(super) fn append_stream_records(lang_cmd: AppendStreamRecords) -> NewMachineWithCommand {
+    let sm = AppendStreamRecordsMachine::from_parts(
         Created {}.into(),
         SharedState {
             stream_id: lang_cmd.stream_id.clone(),
-            message_count: lang_cmd.messages.len() as i64,
+            record_count: lang_cmd.records.len() as i64,
         },
     );
     NewMachineWithCommand {
@@ -52,7 +52,7 @@ pub(super) fn add_stream_messages(lang_cmd: AddStreamMessages) -> NewMachineWith
 }
 
 #[derive(Debug, derive_more::Display)]
-pub(super) enum AddStreamMessagesMachineCommand {}
+pub(super) enum AppendStreamRecordsMachineCommand {}
 
 #[derive(Debug, Default, Clone, derive_more::Display)]
 pub(super) struct Created {}
@@ -64,20 +64,20 @@ impl CommandIssued {
     pub(super) fn on_command_recorded(
         self,
         dat: &mut SharedState,
-        attrs: WorkflowStreamMessagesAddedEventAttributes,
-    ) -> AddStreamMessagesMachineTransition<Done> {
+        attrs: WorkflowStreamRecordsAppendedEventAttributes,
+    ) -> AppendStreamRecordsMachineTransition<Done> {
         // An empty id names the workflow's default stream, and the server is the
         // one that resolves that name, so only a named stream can be compared.
         let same_stream = dat.stream_id.is_empty() || dat.stream_id == attrs.stream_id;
-        if same_stream && dat.message_count == attrs.message_count {
+        if same_stream && dat.record_count == attrs.record_count {
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
-                "Recorded publish of {} messages to stream {:?} does not match the reissued \
-                 publish of {} messages to stream {:?}",
-                attrs.message_count,
+                "Recorded append of {} records to stream {:?} does not match the reissued \
+                 append of {} records to stream {:?}",
+                attrs.record_count,
                 attrs.stream_id,
-                dat.message_count,
+                dat.record_count,
                 dat.stream_id
             ))
         }
@@ -87,49 +87,51 @@ impl CommandIssued {
 #[derive(Debug, Default, Clone, derive_more::Display)]
 pub(super) struct Done {}
 
-impl WFMachinesAdapter for AddStreamMessagesMachine {
+impl WFMachinesAdapter for AppendStreamRecordsMachine {
     fn adapt_response(
         &self,
         _my_command: Self::Command,
         _event_info: Option<EventInfo>,
     ) -> Result<Vec<MachineResponse>, Self::Error> {
         Err(Self::Error::Nondeterminism(
-            "AddStreamMessages does not use state machine commands".to_string(),
+            "AppendStreamRecords does not use state machine commands".to_string(),
         ))
     }
 }
 
-impl TryFrom<HistEventData> for AddStreamMessagesMachineEvents {
+impl TryFrom<HistEventData> for AppendStreamRecordsMachineEvents {
     type Error = WFMachinesError;
 
     fn try_from(e: HistEventData) -> Result<Self, Self::Error> {
         let e = e.event;
         match e.event_type() {
-            EventType::WorkflowStreamMessagesAdded => {
+            EventType::WorkflowStreamRecordsAppended => {
                 if let Some(
-                    history_event::Attributes::WorkflowStreamMessagesAddedEventAttributes(attrs),
+                    history_event::Attributes::WorkflowStreamRecordsAppendedEventAttributes(attrs),
                 ) = e.attributes
                 {
-                    Ok(AddStreamMessagesMachineEvents::CommandRecorded(attrs))
+                    Ok(AppendStreamRecordsMachineEvents::CommandRecorded(attrs))
                 } else {
-                    Err(fatal!("Stream messages added attributes were unset: {e}"))
+                    Err(fatal!("Stream records appended attributes were unset: {e}"))
                 }
             }
             _ => Err(Self::Error::Nondeterminism(format!(
-                "AddStreamMessagesMachine does not handle {e}"
+                "AppendStreamRecordsMachine does not handle {e}"
             ))),
         }
     }
 }
 
-impl TryFrom<CommandType> for AddStreamMessagesMachineEvents {
+impl TryFrom<CommandType> for AppendStreamRecordsMachineEvents {
     type Error = WFMachinesError;
 
     fn try_from(c: CommandType) -> Result<Self, Self::Error> {
         match c {
-            CommandType::AddStreamMessages => Ok(AddStreamMessagesMachineEvents::CommandScheduled),
+            CommandType::AppendStreamRecords => {
+                Ok(AppendStreamRecordsMachineEvents::CommandScheduled)
+            }
             _ => Err(Self::Error::Nondeterminism(format!(
-                "AddStreamMessagesMachine does not handle command type {c:?}"
+                "AppendStreamRecordsMachine does not handle command type {c:?}"
             ))),
         }
     }
