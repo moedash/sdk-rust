@@ -50,9 +50,9 @@ relevant information.
   metrics now carry a `failure_reason` attribute. Each is now split into one time series per
   reason, which may affect existing dashboards.
 * Workflow task completions larger than the gRPC request size limit are now paginated automatically when the namespace supports it. Paginated workflow task completions require Temporal Server 1.32.0 or later.
-* Workflows can subscribe to server-side streams and publish batches of messages to them with the
-  `SubscribeStream` and `AddStreamMessages` commands. Consumed ranges reach the workflow as
-  `DeliverStreamMessages` activation jobs, and replay hands each recorded range back in the
+* Workflows can subscribe to server-side streams and append batches of records to them with the
+  `SubscribeStream` and `AppendStreamRecords` commands. Consumed ranges reach the workflow as
+  `DeliverStreamRecords` activation jobs, and replay hands each recorded range back in the
   activation of the task that consumed it.
 
 ### Breaking Changes :boom:

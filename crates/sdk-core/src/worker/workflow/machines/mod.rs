@@ -1,4 +1,4 @@
-mod add_stream_messages_state_machine;
+mod append_stream_records_state_machine;
 mod workflow_machines;
 
 mod activity_state_machine;
@@ -33,7 +33,7 @@ use crate::{
     worker::workflow::{WFMachinesError, fatal, nondeterminism},
 };
 use activity_state_machine::ActivityMachine;
-use add_stream_messages_state_machine::AddStreamMessagesMachine;
+use append_stream_records_state_machine::AppendStreamRecordsMachine;
 use cancel_external_state_machine::CancelExternalMachine;
 use cancel_workflow_state_machine::CancelWorkflowMachine;
 use child_workflow_state_machine::ChildWorkflowMachine;
@@ -85,7 +85,7 @@ enum Machines {
     UpsertSearchAttributesMachine,
     ModifyWorkflowPropertiesMachine,
     SubscribeStreamMachine,
-    AddStreamMessagesMachine,
+    AppendStreamRecordsMachine,
     UpdateMachine,
     NexusOperationMachine,
 }

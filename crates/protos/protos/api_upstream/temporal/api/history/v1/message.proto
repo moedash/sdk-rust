@@ -381,9 +381,12 @@ message WorkflowTaskCompletedEventAttributes {
     // is set. This value updates workflow execution's `versioning_info.deployment_version`.
     temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 11;
 
-    // The offsets this task consumed, without the payloads. Recorded so replay
-    // can reproduce what the task saw, including a range that was empty.
-    repeated temporal.api.stream.v1.StreamCursor stream_cursors = 20;
+    // Offset ranges this Workflow Task consumed from streams it subscribes to.
+    // Recorded on every task where a subscription is active, including when it
+    // observed nothing: an empty range is a fact replay must reproduce, and
+    // omitting it would let replay deliver records the Workflow did not have.
+    // Numbered 20 to leave 14 through 19 free for fields added on the main line.
+    repeated temporal.api.stream.v1.StreamRange consumed_stream_ranges = 20;
 }
 
 message WorkflowTaskTimedOutEventAttributes {
@@ -958,18 +961,18 @@ message ActivityPropertiesModifiedExternallyEventAttributes {
     temporal.api.common.v1.RetryPolicy new_retry_policy = 2;
 }
 
-message WorkflowStreamMessagesAddedEventAttributes {
-    // The WorkflowTaskCompleted event of the task whose command published this
+message WorkflowStreamRecordsAppendedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command appended this
     // batch.
     int64 workflow_task_completed_event_id = 1;
-    // Stream the Workflow published to.
+    // Stream the Workflow appended to.
     string stream_id = 2;
-    // Offset the first message of the batch landed at.
+    // Offset the first record of the batch landed at.
     int64 first_offset = 3;
-    // How many messages the batch held. With first_offset this names the range
+    // How many records the batch held. With first_offset this names the range
     // without carrying any of it, which is what keeps this event a fixed size
     // no matter how large the batch or its payloads are.
-    int64 message_count = 4;
+    int64 record_count = 4;
 }
 
 message WorkflowStreamSubscribedEventAttributes {
@@ -1304,7 +1307,7 @@ message HistoryEvent {
         WorkflowExecutionUnpausedEventAttributes workflow_execution_unpaused_event_attributes = 64;
         WorkflowExecutionTimeSkippingTransitionedEventAttributes workflow_execution_time_skipping_transitioned_event_attributes = 65;
         WorkflowStreamSubscribedEventAttributes workflow_stream_subscribed_event_attributes = 66;
-        WorkflowStreamMessagesAddedEventAttributes workflow_stream_messages_added_event_attributes = 67;
+        WorkflowStreamRecordsAppendedEventAttributes workflow_stream_records_appended_event_attributes = 67;
     }
 }
 

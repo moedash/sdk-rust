@@ -1093,7 +1093,7 @@ where
                     self.apply_resolution(resolution);
                     ActivationJobResult::None
                 }
-                Some(ActivationVariant::DeliverStreamMessages(slice)) => {
+                Some(ActivationVariant::DeliverStreamRecords(slice)) => {
                     // The Rust workflow runtime has no stream API yet. Failing
                     // is the only safe answer: the server has already recorded
                     // this range as consumed, so dropping it would leave the
@@ -1101,7 +1101,7 @@ where
                     // again.
                     return Err(Box::new(Failure {
                         message: format!(
-                            "received stream messages for {}, which this SDK cannot deliver",
+                            "received stream records for {}, which this SDK cannot deliver",
                             slice.stream_id
                         ),
                         ..Default::default()

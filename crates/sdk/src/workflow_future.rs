@@ -340,12 +340,12 @@ impl WorkflowFuture {
                         .context("Nexus operation must have result")?;
                     push_polled_context!(ActivationJobContext::Passive);
                 }
-                Variant::DeliverStreamMessages(slice) => {
+                Variant::DeliverStreamRecords(slice) => {
                     // No stream API in this SDK. Bailing rather than ignoring:
                     // the server has recorded this range as consumed and will
                     // not send it again, so dropping it loses data silently.
                     bail!(
-                        "received stream messages for {}, which this SDK cannot deliver",
+                        "received stream records for {}, which this SDK cannot deliver",
                         slice.stream_id
                     );
                 }
