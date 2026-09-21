@@ -33,6 +33,7 @@ use temporalio_common::{
         temporal::api::{
             common::v1::WorkflowExecution,
             history::v1::History,
+            stream::v1::StreamSlice,
             workflowservice::v1::{
                 DescribeNamespaceResponse, RespondWorkflowTaskCompletedResponse,
                 RespondWorkflowTaskFailedResponse,
@@ -118,6 +119,7 @@ where
                         workflow_id: history.workflow_id,
                         run_id: hist_info.orig_run_id().to_string(),
                     });
+                    resp.stream_slices = history.stream_slices;
                     Ok(resp)
                 } else {
                     if let Some(wc) = hlock.worker_closer.get() {
@@ -174,6 +176,7 @@ mod tests {
 pub struct HistoryForReplay {
     hist: History,
     workflow_id: String,
+    stream_slices: Vec<StreamSlice>,
 }
 impl HistoryForReplay {
     /// Create a new history from replay from something that looks like a history and a workflow id.
@@ -181,7 +184,22 @@ impl HistoryForReplay {
         Self {
             hist: history.into(),
             workflow_id: workflow_id.into(),
+            stream_slices: Vec::new(),
         }
+    }
+
+    /// Attach the stream records the history's completed tasks consumed.
+    ///
+    /// History records the offsets a task consumed and never the payloads, so a workflow that
+    /// read a stream cannot be replayed from its history alone. Each slice carries the records
+    /// for one recorded range, tagged with the `WorkflowTaskCompleted` event that recorded it,
+    /// the same shape the server puts on a poll response when it re-supplies them. Replay hands
+    /// each range to the activation of the task that consumed it and fails the task as
+    /// nondeterministic when a slice disagrees with the recorded range or a recorded range with
+    /// content has no slice.
+    pub fn with_stream_slices(mut self, slices: impl IntoIterator<Item = StreamSlice>) -> Self {
+        self.stream_slices = slices.into_iter().collect();
+        self
     }
 }
 #[cfg(any(feature = "test-utilities", test))]

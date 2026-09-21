@@ -57,6 +57,9 @@ relevant information.
   `SubscribeStream` and `AppendStreamRecords` commands. Consumed ranges reach the workflow as
   `DeliverStreamRecords` activation jobs, and replay hands each recorded range back in the
   activation of the task that consumed it.
+* A history fed to a replay worker can carry the stream records its tasks consumed
+  (`HistoryForReplay::with_stream_slices`), so a language replayer that fetched them from the
+  stream service can replay a consuming workflow. History alone holds only the offsets.
 
 ### Breaking Changes :boom:
 * The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,

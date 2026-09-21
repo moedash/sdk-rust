@@ -7,11 +7,11 @@
 //! arrive, in the right order, and that an empty range is still delivered.
 
 use crate::{
-    Worker,
-    replay::TestHistoryBuilder,
+    Worker, init_replay_worker,
+    replay::{HistoryFeeder, HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
         MockPollCfg, PollWFTRespExt, ResponseType, WorkerTestHelpers, build_mock_pollers,
-        hist_to_poll_resp, mock_worker,
+        hist_to_poll_resp, mock_worker, test_worker_cfg,
     },
     worker::client::mocks::mock_worker_client,
 };
@@ -21,15 +21,18 @@ use std::sync::{
 };
 use temporalio_common::protos::{
     coresdk::{
-        workflow_activation::{WorkflowActivation, WorkflowActivationJob, workflow_activation_job},
-        workflow_commands::{AppendStreamRecords, SubscribeStream},
+        workflow_activation::{
+            RemoveFromCache, WorkflowActivation, WorkflowActivationJob,
+            remove_from_cache::EvictionReason, workflow_activation_job,
+        },
+        workflow_commands::{AppendStreamRecords, CompleteWorkflowExecution, SubscribeStream},
         workflow_completion::WorkflowActivationCompletion,
     },
     temporal::api::{
         command::v1::command,
         enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
         history::v1::{History, HistoryEvent},
-        stream::v1::{StreamRange, StreamRecord},
+        stream::v1::{StreamRange, StreamRecord, StreamSlice},
         workflowservice::v1::{
             GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
         },
@@ -1061,5 +1064,190 @@ async fn a_missing_resupply_for_a_consumed_range_fails_the_task() {
         .unwrap();
     core.handle_eviction().await;
     assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// A slice as the server re-supplies it: the records of one recorded range,
+/// tagged with the completion that recorded it.
+fn replay_slice(
+    stream_id: &str,
+    completed_event_id: i64,
+    from: i64,
+    bodies: &[&str],
+) -> StreamSlice {
+    StreamSlice {
+        stream_id: stream_id.to_string(),
+        from_offset: from,
+        to_offset: from + bodies.len() as i64,
+        records: bodies
+            .iter()
+            .map(|b| StreamRecord {
+                body: Some(b.as_bytes().to_vec().into()),
+                ..Default::default()
+            })
+            .collect(),
+        workflow_task_completed_event_id: completed_event_id,
+        ..Default::default()
+    }
+}
+
+/// A publish of one record per body.
+fn publish(stream_id: &str, bodies: &[&str]) -> AppendStreamRecords {
+    AppendStreamRecords {
+        stream_id: stream_id.to_string(),
+        records: bodies
+            .iter()
+            .map(|b| StreamRecord {
+                body: Some(b.as_bytes().to_vec().into()),
+                ..Default::default()
+            })
+            .collect(),
+    }
+}
+
+fn eviction(task: &WorkflowActivation) -> &RemoveFromCache {
+    match task.jobs.as_slice() {
+        [
+            WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::RemoveFromCache(evict)),
+            },
+        ] => evict,
+        other => panic!("expected an eviction, got {other:?}"),
+    }
+}
+
+/// A recorded read-then-publish workflow: each task consumes one record and
+/// publishes because of it, the second one also completes the run.
+fn read_then_publish_history() -> (TestHistoryBuilder, i64, i64) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let first = t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("in", 0, 1)]);
+    t.add_stream_records_appended("out", 0, 1);
+    t.add_workflow_task_scheduled_and_started();
+    let second =
+        t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("in", 1, 2)]);
+    t.add_stream_records_appended("out", 1, 1);
+    t.add_workflow_execution_completed();
+    (t, first, second)
+}
+
+/// A replay worker fed one history. The feeder is handed back so the history
+/// stream stays open until the test drops it, as a language replayer keeps it
+/// open: once the stream ends the worker closes, and an eviction still owed
+/// for the last history would be lost to the shutdown.
+async fn replay_worker(history: HistoryForReplay) -> (Worker, HistoryFeeder) {
+    let (feeder, stream) = HistoryFeeder::new(1);
+    feeder.feed(history).await.unwrap();
+    let core = init_replay_worker(ReplayWorkerInput::new(
+        test_worker_cfg().build().unwrap(),
+        stream,
+    ))
+    .unwrap();
+    (core, feeder)
+}
+
+/// A history pushed for replay can carry the ranges its tasks consumed, in the
+/// shape the server re-supplies them. The replay worker puts them on its
+/// synthetic poll response, so the ordinary delivery path runs: each range
+/// reaches the activation of the task that consumed it, and the publish that
+/// task reissues is matched against its event.
+#[tokio::test]
+async fn a_pushed_history_replays_with_the_slices_it_carries() {
+    let (t, first, second) = read_then_publish_history();
+    let history = HistoryForReplay::new(t.get_full_history_info().unwrap(), "wfid")
+        .with_stream_slices([
+            replay_slice("in", first, 0, &["go"]),
+            replay_slice("in", second, 1, &["stop"]),
+        ]);
+    let (core, feeder) = replay_worker(history).await;
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![("in".to_string(), 0, 1)]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![publish("out", &["accept"]).into()],
+    ))
+    .await
+    .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![("in".to_string(), 1, 2)]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            publish("out", &["done"]).into(),
+            CompleteWorkflowExecution { result: None }.into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    // Replay is over and the worker lets the run go; a nondeterminism eviction
+    // would say the reissued publishes did not match their events.
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(eviction(&task).reason(), EvictionReason::LangRequested);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+    drop(feeder);
+    core.shutdown().await;
+}
+
+/// A slice attached to a pushed history is held to the same check as one the
+/// server sends: offsets other than the recorded range fail the task as
+/// nondeterministic rather than replay it on different input.
+#[tokio::test]
+async fn a_pushed_history_with_a_wrong_slice_fails_as_nondeterministic() {
+    let (t, first, second) = read_then_publish_history();
+    let history = HistoryForReplay::new(t.get_full_history_info().unwrap(), "wfid")
+        .with_stream_slices([
+            // Two records where the event says one.
+            replay_slice("in", first, 0, &["go", "extra"]),
+            replay_slice("in", second, 1, &["stop"]),
+        ]);
+    let (core, feeder) = replay_worker(history).await;
+
+    // The mismatch is found while the poll response is applied, so the first
+    // activation is already the eviction. The task is failed as
+    // nondeterministic (the mock-client test above checks the cause); the
+    // eviction carries the reason in its message, since an eviction for a
+    // failure found before any activation ran reports no reason of its own.
+    let task = core.poll_workflow_activation().await.unwrap();
+    let evict = eviction(&task);
+    assert!(
+        evict.message.contains(
+            "Event 4 records that stream in was consumed from offset 0 to 1, but the server \
+             sent offsets 0 to 2 for it"
+        ),
+        "eviction did not name the mismatch: {evict:?}"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+    drop(feeder);
+    core.shutdown().await;
+}
+
+/// A recorded range with content and no slice for it is the same failure. A
+/// language replayer that has no store to fetch from cannot replay a consuming
+/// workflow, and the task says so instead of replaying on less input.
+#[tokio::test]
+async fn a_pushed_history_without_slices_for_a_consumed_range_fails_as_nondeterministic() {
+    let (t, _, _) = read_then_publish_history();
+    let history = HistoryForReplay::new(t.get_full_history_info().unwrap(), "wfid");
+    let (core, feeder) = replay_worker(history).await;
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(eviction(&task).reason(), EvictionReason::Nondeterminism);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+    drop(feeder);
     core.shutdown().await;
 }
