@@ -787,7 +787,10 @@ impl ManagedRun {
                 EvictionReason::Unspecified | EvictionReason::PaginationOrHistoryFetch
             );
 
-        let (should_report, rur) = if is_no_report_query_fail {
+        // An unreported query failure leaves an intact run in the cache for the retry to use. A
+        // run whose machines broke while it was being brought up to the query is given up
+        // instead, since it can produce nothing more, so the retry starts from history.
+        let (should_report, rur) = if is_no_report_query_fail && !self.am_broken {
             (false, None)
         } else {
             // Blow up any cached data associated with the workflow
@@ -797,11 +800,14 @@ impl ManagedRun {
                 reason,
                 auto_reply_fail_tt: None,
             });
-            let should_report = match &evict_req_outcome {
-                EvictionRequestResult::EvictionRequested(Some(attempt), _)
-                | EvictionRequestResult::EvictionAlreadyRequested(Some(attempt)) => *attempt <= 1,
-                _ => false,
-            };
+            let should_report = !is_no_report_query_fail
+                && match &evict_req_outcome {
+                    EvictionRequestResult::EvictionRequested(Some(attempt), _)
+                    | EvictionRequestResult::EvictionAlreadyRequested(Some(attempt)) => {
+                        *attempt <= 1
+                    }
+                    _ => false,
+                };
             let rur = evict_req_outcome.into_run_update_resp();
             (should_report, rur)
         };

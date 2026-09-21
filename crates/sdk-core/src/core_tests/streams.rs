@@ -32,6 +32,7 @@ use temporalio_common::protos::{
         command::v1::command,
         enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
         history::v1::{History, HistoryEvent},
+        query::v1::WorkflowQuery,
         stream::v1::{StreamRange, StreamRecord, StreamSlice},
         workflowservice::v1::{
             GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
@@ -88,13 +89,21 @@ fn worker_expecting_one_nondeterminism_failure(
     t: TestHistoryBuilder,
     resp: ResponseType,
 ) -> (Worker, Arc<AtomicUsize>) {
+    worker_expecting_one_failure(t, resp, WorkflowTaskFailedCause::NonDeterministicError)
+}
+
+fn worker_expecting_one_failure(
+    t: TestHistoryBuilder,
+    resp: ResponseType,
+    expected: WorkflowTaskFailedCause,
+) -> (Worker, Arc<AtomicUsize>) {
     let failures = Arc::new(AtomicUsize::new(0));
     let counted = failures.clone();
     let mut mock = MockPollCfg::from_resp_batches("wfid", t, [resp], mock_worker_client());
     mock.num_expected_fails = 1;
     mock.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
         counted.fetch_add(1, Ordering::Relaxed);
-        matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
+        *cause == expected
     });
     let mut mock = build_mock_pollers(mock);
     mock.make_wft_stream_interminable();
@@ -1048,7 +1057,8 @@ async fn a_cached_run_is_not_handed_its_own_range_again() {
 /// so the lookahead fails the task as soon as it sees the range, before the
 /// workflow runs on less input than it ran on. A sticky task handed to a worker
 /// that no longer holds the run is the case that reaches this, and the server's
-/// retry on the normal queue carries the records.
+/// retry on the normal queue carries the records. The task is failed as the
+/// worker's failure, not the workflow's: nothing the workflow did was wrong.
 #[tokio::test]
 async fn a_missing_resupply_for_a_consumed_range_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
@@ -1057,12 +1067,89 @@ async fn a_missing_resupply_for_a_consumed_range_fails_the_task() {
     t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("s1", 0, 2)]);
     t.add_workflow_task_scheduled_and_started();
 
-    let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
+    let (core, failures) = worker_expecting_one_failure(
+        t,
+        ResponseType::AllHistory,
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+    );
 
     // Found while the poll response is applied, so the first activation is
     // already the eviction.
     core.handle_eviction().await;
     assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// A legacy query for a run this worker no longer holds arrives on the sticky
+/// queue with partial history and no records, and the history the worker
+/// fetches itself carries none either. Answering it from a replay on less
+/// input would be wrong, and failing it would end the query: the server
+/// retries a query it hears nothing about on the normal queue, where the
+/// records travel with it. So the query goes unanswered, no task is failed,
+/// and the run is given up so the retry starts from history.
+#[tokio::test]
+async fn a_legacy_query_owed_records_it_was_not_sent_goes_unanswered() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    // Task 1 subscribes and consumes nothing, so the missing range is only
+    // reached once the workflow has run its first activation.
+    t.add_workflow_task_completed();
+    t.add_stream_subscribed("in", 0);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("in", 0, 2)]);
+    t.add_stream_records_appended("out", 0, 2);
+
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    poll_resp.resp.query = Some(WorkflowQuery {
+        query_type: "trace".to_string(),
+        query_args: None,
+        header: None,
+    });
+    // No slices: the mock plays the sticky queue, and the defaults of zero
+    // expected task failures and zero legacy query responses are the assertion.
+    let mock = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [ResponseType::Raw(poll_resp.resp)],
+        mock_worker_client(),
+    );
+    let mut mock = build_mock_pollers(mock);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 10;
+        wc.ignore_evicts_on_shutdown = false;
+    });
+    let core = mock_worker(mock);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(delivered_ranges(&task), vec![]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            SubscribeStream {
+                stream_id: "in".to_string(),
+                start_offset: 0,
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    // The missing range is found while the next task is applied. The run is
+    // evicted as a fetch failure would evict it, and nothing is reported.
+    let task = core.poll_workflow_activation().await.unwrap();
+    let evict = eviction(&task);
+    assert_eq!(evict.reason(), EvictionReason::PaginationOrHistoryFetch);
+    assert!(
+        evict
+            .message
+            .contains("but the server sent no records for it"),
+        "eviction did not name the missing range: {evict:?}"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
     core.shutdown().await;
 }
 
