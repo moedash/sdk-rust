@@ -927,14 +927,12 @@ impl WorkflowMachines {
                 // surface later as an unrelated nondeterminism error. Reaching
                 // this from here also means the lookahead did not find the
                 // completion, so the range was due one activation before this.
-                return Err(nondeterminism!(
+                return Err(WFMachinesError::MissingRecords(format!(
                     "Event {event_id} records that stream {} was consumed from offset {} to {}, \
                      but the server sent no records for it. The workflow was owed that range \
                      one activation earlier.",
-                    cursor.stream_id,
-                    cursor.from_offset,
-                    cursor.to_offset
-                ));
+                    cursor.stream_id, cursor.from_offset, cursor.to_offset
+                )));
             }
             for job in resupplied_deliveries(event_id, cursors, slices.unwrap_or_default())? {
                 self.drive_me.send_job(job);
@@ -958,15 +956,13 @@ impl WorkflowMachines {
                 // had, keeps a legacy query from being answered from the wrong
                 // state, and the server's retry on the normal task queue
                 // carries the records for both task kinds.
-                return Err(nondeterminism!(
+                return Err(WFMachinesError::MissingRecords(format!(
                     "Event {event_id} records that stream {} was consumed from offset {} to {}, \
                      but the server sent no records for it. A task dispatched with a partial \
                      history to a worker that no longer holds the run cannot replay it; the \
                      retry on the normal task queue carries the records.",
-                    cursor.stream_id,
-                    cursor.from_offset,
-                    cursor.to_offset
-                ));
+                    cursor.stream_id, cursor.from_offset, cursor.to_offset
+                )));
             }
             for job in resupplied_deliveries(event_id, cursors, slices.unwrap_or_default())? {
                 self.drive_me.send_job(job);
