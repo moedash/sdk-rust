@@ -57,6 +57,10 @@ relevant information.
 * A history fed to a replay worker can carry the stream records its tasks consumed
   (`HistoryForReplay::with_stream_slices`), so a language replayer that fetched them from the
   stream service can replay a consuming workflow. History alone holds only the offsets.
+* A task whose history records a consumed range with content that the response carried no
+  records for fails before the workflow runs, rather than after it ran on less input. A legacy
+  query dispatched that way to a worker that no longer holds the run goes unanswered, so the
+  server retries it on the normal task queue, where the records travel with it.
 
 ### Breaking Changes :boom:
 * The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,
