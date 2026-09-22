@@ -24,6 +24,7 @@ import "temporal/api/enums/v1/activity.proto";
 import "temporal/api/enums/v1/nexus.proto";
 import "temporal/api/activity/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/history/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/api/command/v1/message.proto";
@@ -38,7 +39,6 @@ import "temporal/api/replication/v1/message.proto";
 import "temporal/api/rules/v1/message.proto";
 import "temporal/api/sdk/v1/worker_config.proto";
 import "temporal/api/schedule/v1/message.proto";
-import "temporal/api/stream/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/version/v1/message.proto";
@@ -367,12 +367,6 @@ message PollWorkflowTaskQueueResponse {
     // This poller group ID identifies the owner of the workflow task awaiting for query response.
     // Corresponding RespondQueryTaskCompleted should pass this value for proper routing.
     string poller_group_id = 17;
-
-    // Slices of the streams this Workflow consumes. A slice with no
-    // workflow_task_completed_event_id is for the task about to run; one with
-    // it set is re-supplying a range an earlier task consumed, so a worker
-    // replaying from History gets the same bytes that task was given.
-    repeated temporal.api.stream.v1.StreamSlice stream_slices = 20;
     // Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
     // ignore stale updates.
     // The weighted list of poller groups IDs that client should use for future polls to this task
@@ -390,6 +384,10 @@ message PollWorkflowTaskQueueResponse {
     //   3. If every group has some pending polls, assign the next poll to a group randomly
     //     according to the weights.
     temporal.api.taskqueue.v1.PollerGroupsInfo poller_groups_info = 19;
+
+    // Stream data attached to this task. Delivered out of band so the payloads
+    // never enter History; only the offset ranges are recorded there.
+    repeated temporal.api.stream.v1.StreamSlice stream_slices = 20;
 }
 
 message RespondWorkflowTaskCompletedRequest {

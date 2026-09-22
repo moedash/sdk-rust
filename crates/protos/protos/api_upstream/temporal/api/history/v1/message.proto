@@ -961,6 +961,19 @@ message ActivityPropertiesModifiedExternallyEventAttributes {
     temporal.api.common.v1.RetryPolicy new_retry_policy = 2;
 }
 
+message WorkflowStreamSubscribedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command created this
+    // subscription.
+    int64 workflow_task_completed_event_id = 1;
+    // Stream the Workflow subscribed to.
+    string stream_id = 2;
+    // The offset the subscription actually starts from. Resolved by the server
+    // when the subscription is registered and recorded here, so replay reads
+    // the resolved value rather than resolving it again against a stream that
+    // has since moved.
+    int64 start_offset = 3;
+}
+
 message WorkflowStreamRecordsAppendedEventAttributes {
     // The WorkflowTaskCompleted event of the task whose command appended this
     // batch.
@@ -973,14 +986,6 @@ message WorkflowStreamRecordsAppendedEventAttributes {
     // without carrying any of it, which is what keeps this event a fixed size
     // no matter how large the batch or its payloads are.
     int64 record_count = 4;
-}
-
-message WorkflowStreamSubscribedEventAttributes {
-    int64 workflow_task_completed_event_id = 1;
-    string stream_id = 2;
-    // Resolved by the server when the subscription is registered, so replay
-    // reads the resolved value rather than resolving it again.
-    int64 start_offset = 3;
 }
 
 message WorkflowExecutionUpdateAcceptedEventAttributes {
