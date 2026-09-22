@@ -511,9 +511,11 @@ async fn zero_cache_keeps_a_task_with_buffered_output_until_the_flush() {
         ExternalStreamReadyResult::RunNotFound,
         "the flush closed the task, so nothing retains the run any longer"
     );
-    let written = recorded.lock();
-    assert_eq!(written.len(), 1);
-    assert_eq!(written[0].output.as_ref(), Some(&manifest));
+    {
+        let written = recorded.lock();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].output.as_ref(), Some(&manifest));
+    }
     worker.drain_pollers_and_shutdown().await;
 }
 
