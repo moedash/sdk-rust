@@ -14,6 +14,7 @@ import "google/protobuf/duration.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/enums/v1/command_type.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
@@ -324,5 +325,38 @@ message Command {
 
         ScheduleNexusOperationCommandAttributes schedule_nexus_operation_command_attributes = 18;
         RequestCancelNexusOperationCommandAttributes request_cancel_nexus_operation_command_attributes = 19;
+        AppendStreamRecordsCommandAttributes append_stream_records_command_attributes = 20;
+        SubscribeStreamCommandAttributes subscribe_stream_command_attributes = 21;
     }
+}
+
+// Appends records to a stream the Workflow owns. Applied inside the Workflow
+// Task's own commit. Produces one `WorkflowStreamRecordsAppended` event
+// carrying the offset range and none of the payload; it schedules no further
+// work.
+message AppendStreamRecordsCommandAttributes {
+    // Empty means the Workflow's default output stream.
+    string stream_id = 1;
+    // Stored in order. The server sets `producer_id` to empty on each record,
+    // because the owning Workflow is the producer here.
+    repeated temporal.api.stream.v1.StreamRecord records = 2;
+}
+
+// Subscribe this Workflow to a stream, so later Workflow Tasks carry the ranges
+// it has not consumed yet.
+//
+// The stream's addressing is resolved by the server rather than supplied here.
+// A Workflow cannot look it up without doing I/O, and a value it carried would
+// be a reading rather than a fact, so it could differ on replay.
+message SubscribeStreamCommandAttributes {
+    // Stream to consume. A stream in another execution is addressed by its id;
+    // one this Workflow owns is addressed by the name it was published under.
+    // The server resolves an owned name first and falls back to a standalone
+    // id, so a Workflow that owns a stream under this name cannot reach a
+    // standalone stream with the same id.
+    string stream_id = 1;
+    // Where to start. Negative means from wherever the stream is when the
+    // subscription is registered, which the server resolves and records so
+    // replay does not resolve it again.
+    int64 start_offset = 2;
 }
