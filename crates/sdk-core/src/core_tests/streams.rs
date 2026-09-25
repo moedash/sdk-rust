@@ -110,6 +110,21 @@ fn worker_expecting_one_failure(
     (mock_worker(mock), failures)
 }
 
+/// A worker whose only assertion is that nothing is rejected. Core signals a
+/// reissued command it will not accept by failing the workflow task, so turning
+/// that into a panic is how a test says the command was accepted.
+fn worker_rejecting_any_failure(t: TestHistoryBuilder) -> Worker {
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_complete_workflow_task()
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
+    mock_client
+        .expect_fail_workflow_task()
+        .returning(|_, _, f| panic!("core rejected a reissued command: {f:?}"));
+    let mock = MockPollCfg::from_resp_batches("wfid", t, [ResponseType::AllHistory], mock_client);
+    mock_worker(build_mock_pollers(mock))
+}
+
 fn history_page(
     events: &[HistoryEvent],
     next_page_token: Vec<u8>,
@@ -804,9 +819,35 @@ async fn a_publish_reissued_with_a_different_batch_size_fails_the_task() {
     core.shutdown().await;
 }
 
-/// A subscription is checked on the stream alone. The recorded start offset is
-/// the server's resolution of what the command asked for, so it is not the
-/// command's to reproduce.
+/// A reissued append that names no stream is held to the name the run's earlier
+/// unnamed appends resolved to. Without that, an empty id would match any
+/// recorded stream and a workflow that moved its output would go unnoticed.
+#[tokio::test]
+async fn a_default_publish_reissued_against_another_stream_fails_the_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    // The server resolved the run's unnamed appends to this name.
+    t.add_stream_records_appended("output", 0, 2);
+    t.add_stream_records_appended("elsewhere", 0, 2);
+    t.add_full_wf_task();
+
+    let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![publish_two("").into(), publish_two("").into()],
+    ))
+    .await
+    .unwrap();
+    core.handle_eviction().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// The stream a subscription names is part of what the recorded event holds it
+/// to.
 #[tokio::test]
 async fn a_subscribe_reissued_to_a_different_stream_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
@@ -832,6 +873,96 @@ async fn a_subscribe_reissued_to_a_different_stream_fails_the_task() {
     .unwrap();
     core.handle_eviction().await;
     assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// An explicit start offset is a value the workflow chose, so the recorded
+/// event holds the reissued command to it. Without the check a replay that
+/// asked to read from the top would be served from wherever the original run
+/// began, and nothing would say so.
+#[tokio::test]
+async fn a_subscribe_reissued_with_a_different_offset_fails_the_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_stream_subscribed("s1", 100);
+    t.add_full_wf_task();
+
+    let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            SubscribeStream {
+                stream_id: "s1".to_string(),
+                start_offset: 0,
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    core.handle_eviction().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// A negative offset asks the server where the stream stands, so the recorded
+/// answer is its own and the reissued command is not held to it.
+#[tokio::test]
+async fn a_subscribe_from_the_tail_is_not_held_to_the_recorded_offset() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_stream_subscribed("s1", 100);
+    t.add_full_wf_task();
+
+    let core = worker_rejecting_any_failure(t);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![
+            SubscribeStream {
+                stream_id: "s1".to_string(),
+                start_offset: -1,
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    core.shutdown().await;
+}
+
+/// A second subscribe to the same stream registers nothing: the server records
+/// where the cursor has already reached, which is not what the command asked
+/// for. Holding the repeat to its offset would fail a run that did nothing
+/// wrong.
+#[tokio::test]
+async fn a_repeat_subscribe_is_not_held_to_the_offset_it_asked_for() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_stream_subscribed("s1", 100);
+    // The cursor had moved on by the time the second command was handled.
+    t.add_stream_subscribed("s1", 140);
+    t.add_full_wf_task();
+
+    let core = worker_rejecting_any_failure(t);
+
+    let subscribe = SubscribeStream {
+        stream_id: "s1".to_string(),
+        start_offset: 100,
+    };
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![subscribe.clone().into(), subscribe.into()],
+    ))
+    .await
+    .unwrap();
     core.shutdown().await;
 }
 
