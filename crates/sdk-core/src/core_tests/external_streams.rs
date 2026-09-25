@@ -3749,6 +3749,35 @@ async fn output_commit_does_not_force_a_task_for_a_stale_wait_snapshot() {
     worker.drain_pollers_and_shutdown().await;
 }
 
+/// A completion that stages a commit and says more output is still buffered has to be reported
+/// with a replacement. The flush deadline only does anything while a task is held, so reporting
+/// without one drops the publish latency lang asked for and leaves those records waiting on
+/// whatever task happens to come next.
+#[tokio::test]
+async fn output_commit_forces_a_task_for_output_still_buffered() {
+    let (history, manifest) = output_only_marker_history();
+    let markers: StreamMarkers = Default::default();
+    let forced: Arc<Mutex<Vec<bool>>> = Default::default();
+    let worker = worker_recording_rollovers(markers, forced.clone(), history, vec![1]);
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id,
+            vec![
+                output_commit_command(manifest),
+                output_buffered_command(Duration::from_secs(5)),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        *forced.lock(),
+        vec![true],
+        "output buffered behind the staged commit needs a task to flush on"
+    );
+    worker.drain_pollers_and_shutdown().await;
+}
+
 #[tokio::test]
 async fn output_capacity_replacement_enters_lang_instead_of_autocompleting() {
     // Capacity backpressure blocks the publishing Workflow in lang. Its staged commit has no
