@@ -317,7 +317,7 @@ async fn subscribe_command_round_trips_through_replay() {
         task.run_id,
         vec![
             SubscribeStream {
-                stream_id: "s1".to_string(),
+                stream_name_or_id: "s1".to_string(),
                 start_offset: -1,
             }
             .into(),
@@ -346,7 +346,7 @@ async fn publish_command_reaches_the_server_with_its_payloads() {
             assert_eq!(cmd.command_type(), CommandType::AppendStreamRecords);
             match cmd.attributes.as_ref().unwrap() {
                 command::Attributes::AppendStreamRecordsCommandAttributes(a) => {
-                    assert_eq!(a.stream_id, "s1");
+                    assert_eq!(a.stream_name, "s1");
                     // The bodies are the half of the batch History never sees,
                     // so the command is the only thing that can carry them.
                     let bodies: Vec<_> = a
@@ -429,7 +429,7 @@ async fn subscribe_command_reaches_the_server() {
             assert_eq!(cmd.command_type(), CommandType::SubscribeStream);
             match cmd.attributes.as_ref().unwrap() {
                 command::Attributes::SubscribeStreamCommandAttributes(a) => {
-                    assert_eq!(a.stream_id, "s1");
+                    assert_eq!(a.stream_name_or_id, "s1");
                     // Passed through unresolved: the server turns it into a
                     // real offset and records that.
                     assert_eq!(a.start_offset, -1);
@@ -447,7 +447,7 @@ async fn subscribe_command_reaches_the_server() {
         task.run_id,
         vec![
             SubscribeStream {
-                stream_id: "s1".to_string(),
+                stream_name_or_id: "s1".to_string(),
                 start_offset: -1,
             }
             .into(),
@@ -458,9 +458,9 @@ async fn subscribe_command_reaches_the_server() {
     core.shutdown().await;
 }
 
-fn publish_two(stream_id: &str) -> AppendStreamRecords {
+fn publish_two(stream_name: &str) -> AppendStreamRecords {
     AppendStreamRecords {
-        stream_id: stream_id.to_string(),
+        stream_name: stream_name.to_string(),
         records: vec![
             StreamRecord {
                 body: Some(b"one".to_vec().into()),
@@ -786,8 +786,9 @@ async fn a_publish_reissued_to_a_different_stream_fails_the_task() {
     core.shutdown().await;
 }
 
-/// The batch size is part of the record too: the event names how many records
-/// landed, so a replay that publishes fewer has diverged from the original run.
+/// The batch size is part of the record too: the event names the offset range
+/// the batch landed at, so a replay that publishes fewer has diverged from the
+/// original run.
 #[tokio::test]
 async fn a_publish_reissued_with_a_different_batch_size_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
@@ -803,7 +804,7 @@ async fn a_publish_reissued_with_a_different_batch_size_fails_the_task() {
         task.run_id,
         vec![
             AppendStreamRecords {
-                stream_id: "s1".to_string(),
+                stream_name: "s1".to_string(),
                 records: vec![StreamRecord {
                     body: Some(b"one".to_vec().into()),
                     ..Default::default()
@@ -863,7 +864,7 @@ async fn a_subscribe_reissued_to_a_different_stream_fails_the_task() {
         task.run_id,
         vec![
             SubscribeStream {
-                stream_id: "s2".to_string(),
+                stream_name_or_id: "s2".to_string(),
                 start_offset: -1,
             }
             .into(),
@@ -896,7 +897,7 @@ async fn a_subscribe_reissued_with_a_different_offset_is_accepted() {
         task.run_id,
         vec![
             SubscribeStream {
-                stream_id: "s1".to_string(),
+                stream_name_or_id: "s1".to_string(),
                 start_offset: 0,
             }
             .into(),
@@ -923,7 +924,7 @@ async fn a_repeat_subscribe_is_accepted() {
     let core = worker_rejecting_any_failure(t);
 
     let subscribe = SubscribeStream {
-        stream_id: "s1".to_string(),
+        stream_name_or_id: "s1".to_string(),
         start_offset: 100,
     };
     let task = core.poll_workflow_activation().await.unwrap();
