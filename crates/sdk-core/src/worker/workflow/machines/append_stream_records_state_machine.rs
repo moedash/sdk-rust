@@ -6,6 +6,7 @@ use crate::worker::workflow::{
     machines::{EventInfo, HistEventData, WFMachinesAdapter},
     nondeterminism,
 };
+use std::{cell::RefCell, rc::Rc};
 use temporalio_common::protos::{
     coresdk::workflow_commands::AppendStreamRecords,
     temporal::api::{
@@ -26,23 +27,36 @@ fsm! {
 }
 
 /// What the command claimed, kept so the recorded event can be held against it.
+///
+/// The default stream's resolved name is shared with the run's other appends,
+/// because only a recorded event carries it and one append's event is what tells
+/// the next what the name is.
 #[derive(Default, Clone)]
 pub(super) struct SharedState {
     stream_id: String,
     record_count: i64,
+    default_stream_id: DefaultStreamIdRef,
 }
+
+/// The name the server resolved this run's unnamed appends to, once one of them
+/// has been recorded.
+pub(super) type DefaultStreamIdRef = Rc<RefCell<Option<String>>>;
 
 /// Append a batch of records to a stream this workflow owns.
 ///
 /// The bodies go to the stream's own log, and History gets one event naming the
 /// offset range the batch landed at. The offsets are assigned by the server, so
 /// nothing here predicts them.
-pub(super) fn append_stream_records(lang_cmd: AppendStreamRecords) -> NewMachineWithCommand {
+pub(super) fn append_stream_records(
+    lang_cmd: AppendStreamRecords,
+    default_stream_id: DefaultStreamIdRef,
+) -> NewMachineWithCommand {
     let sm = AppendStreamRecordsMachine::from_parts(
         Created {}.into(),
         SharedState {
             stream_id: lang_cmd.stream_id.clone(),
             record_count: lang_cmd.records.len() as i64,
+            default_stream_id,
         },
     );
     NewMachineWithCommand {
@@ -67,9 +81,18 @@ impl CommandIssued {
         attrs: WorkflowStreamRecordsAppendedEventAttributes,
     ) -> AppendStreamRecordsMachineTransition<Done> {
         // An empty id names the workflow's default stream, and the server is the
-        // one that resolves that name, so only a named stream can be compared.
-        let same_stream = dat.stream_id.is_empty() || dat.stream_id == attrs.stream_id;
-        if same_stream && dat.record_count == attrs.record_count {
+        // one that resolves that name. The resolved name is on the event, so the
+        // run's first unnamed append is what teaches it and every later one is
+        // held to it.
+        let expected = if dat.stream_id.is_empty() {
+            dat.default_stream_id
+                .borrow_mut()
+                .get_or_insert_with(|| attrs.stream_id.clone())
+                .clone()
+        } else {
+            dat.stream_id.clone()
+        };
+        if expected == attrs.stream_id && dat.record_count == attrs.record_count {
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
@@ -78,7 +101,7 @@ impl CommandIssued {
                 attrs.record_count,
                 attrs.stream_id,
                 dat.record_count,
-                dat.stream_id
+                expected
             ))
         }
     }
