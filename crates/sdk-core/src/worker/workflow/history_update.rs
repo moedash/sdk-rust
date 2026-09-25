@@ -315,6 +315,11 @@ impl HistoryPaginator {
             // and the workflow has to be handed that range in the same activation. A page that
             // ends exactly on a WFT started event leaves that completion on the next page, so
             // fetch it before handing the update over.
+            //
+            // The fetch costs a page for any run whose page boundary lands here, stream or not.
+            // There is no telling the two apart from here: a subscription made through the
+            // stream service records no event, so a run can consume ranges with nothing earlier
+            // in its history to say it would.
             if !no_more && self.event_queue.is_empty() {
                 self.event_queue.extend(update.events);
                 continue;
