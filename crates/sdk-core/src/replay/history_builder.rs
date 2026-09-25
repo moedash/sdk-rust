@@ -129,6 +129,32 @@ impl TestHistoryBuilder {
         self.previous_task_completed_id = id;
     }
 
+    /// Add the event a subscribe-stream command produces.
+    pub fn add_stream_subscribed(&mut self, stream_id: &str, start_offset: i64) -> i64 {
+        let attrs = WorkflowStreamSubscribedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            stream_id: stream_id.to_string(),
+            start_offset,
+        };
+        self.add(attrs)
+    }
+
+    /// Add the event an append-stream-records command produces.
+    pub fn add_stream_records_appended(
+        &mut self,
+        stream_id: &str,
+        first_offset: i64,
+        record_count: i64,
+    ) -> i64 {
+        let attrs = WorkflowStreamRecordsAppendedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            stream_id: stream_id.to_string(),
+            first_offset,
+            record_count,
+        };
+        self.add(attrs)
+    }
+
     /// Add a workflow task timed out event.
     pub fn add_workflow_task_timed_out(&mut self) {
         let attrs = WorkflowTaskTimedOutEventAttributes {
