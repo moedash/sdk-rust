@@ -2,14 +2,17 @@ mod local_acts;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
-    append_stream_records_state_machine::append_stream_records,
+    append_stream_records_state_machine::{DefaultStreamIdRef, append_stream_records},
     cancel_external_state_machine::new_external_cancel,
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
     continue_as_new_workflow_state_machine::continue_as_new,
-    fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
-    patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
-    subscribe_stream_state_machine::subscribe_stream, timer_state_machine::new_timer,
+    fail_workflow_state_machine::fail_workflow,
+    local_activity_state_machine::new_local_activity,
+    patch_state_machine::has_change,
+    signal_external_state_machine::new_external_signal,
+    subscribe_stream_state_machine::subscribe_stream,
+    timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
@@ -47,7 +50,7 @@ use siphasher::sip::SipHasher13;
 use slotmap::{SlotMap, SparseSecondaryMap};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::TryInto,
     hash::{Hash, Hasher},
     iter::Peekable,
@@ -164,6 +167,16 @@ pub(crate) struct WorkflowMachines {
 
     /// Contains extra local-activity related data
     local_activity_data: LocalActivityData,
+
+    /// Streams this run has already issued a subscribe command for. A repeat
+    /// subscription registers nothing and is recorded at wherever the cursor has
+    /// reached, so only the first one can be held to the offset it asked for. A
+    /// cursor put on this run out of band through the stream service leaves no
+    /// event, so there is no seeing that one from here.
+    subscribed_stream_ids: HashSet<String>,
+    /// What the server resolved this run's unnamed appends to, learned from the
+    /// first one it recorded and shared with the machines that follow.
+    default_stream_id: DefaultStreamIdRef,
 
     /// The workflow that is being driven by this instance of the machines
     drive_me: DrivenWorkflow,
@@ -304,6 +317,8 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
+            subscribed_stream_ids: Default::default(),
+            default_stream_id: Default::default(),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
@@ -1533,7 +1548,7 @@ impl WorkflowMachines {
                     // server assigned and hands nothing back. A workflow that
                     // wants to know where its batch landed reads the stream.
                     self.add_cmd_to_wf_task(
-                        append_stream_records(attrs),
+                        append_stream_records(attrs, self.default_stream_id.clone()),
                         annotations,
                         CommandIdKind::NeverResolves,
                     );
@@ -1542,8 +1557,10 @@ impl WorkflowMachines {
                     // Never resolves: the event it produces records the
                     // subscription and hands nothing back to the workflow. The
                     // ranges arrive later as their own activation jobs.
+                    let first_for_stream =
+                        self.subscribed_stream_ids.insert(attrs.stream_id.clone());
                     self.add_cmd_to_wf_task(
-                        subscribe_stream(attrs),
+                        subscribe_stream(attrs, first_for_stream),
                         annotations,
                         CommandIdKind::NeverResolves,
                     );
