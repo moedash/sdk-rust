@@ -2,13 +2,15 @@ mod local_acts;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
+    append_stream_records_state_machine::append_stream_records,
     cancel_external_state_machine::new_external_cancel,
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
     continue_as_new_workflow_state_machine::continue_as_new,
     fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
-    timer_state_machine::new_timer, upsert_search_attributes_state_machine::upsert_search_attrs,
+    subscribe_stream_state_machine::subscribe_stream, timer_state_machine::new_timer,
+    upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
 };
@@ -1522,6 +1524,26 @@ impl WorkflowMachines {
                 WFCommandVariant::ModifyWorkflowProperties(attrs) => {
                     self.add_cmd_to_wf_task(
                         modify_workflow_properties(attrs),
+                        annotations,
+                        CommandIdKind::NeverResolves,
+                    );
+                }
+                WFCommandVariant::AppendStreamRecords(attrs) => {
+                    // Never resolves: the event names the offset range the
+                    // server assigned and hands nothing back. A workflow that
+                    // wants to know where its batch landed reads the stream.
+                    self.add_cmd_to_wf_task(
+                        append_stream_records(attrs),
+                        annotations,
+                        CommandIdKind::NeverResolves,
+                    );
+                }
+                WFCommandVariant::SubscribeStream(attrs) => {
+                    // Never resolves: the event it produces records the
+                    // subscription and hands nothing back to the workflow. The
+                    // ranges arrive later as their own activation jobs.
+                    self.add_cmd_to_wf_task(
+                        subscribe_stream(attrs),
                         annotations,
                         CommandIdKind::NeverResolves,
                     );
