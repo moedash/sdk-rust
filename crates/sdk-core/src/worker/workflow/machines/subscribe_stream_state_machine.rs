@@ -107,8 +107,8 @@ impl WFMachinesAdapter for SubscribeStreamMachine {
         _my_command: Self::Command,
         _event_info: Option<EventInfo>,
     ) -> Result<Vec<MachineResponse>, Self::Error> {
-        Err(Self::Error::Nondeterminism(
-            "SubscribeStream does not use state machine commands".to_string(),
+        Err(fatal!(
+            "SubscribeStream does not use state machine commands"
         ))
     }
 }
