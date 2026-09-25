@@ -35,10 +35,10 @@ fsm! {
 /// it would catch.
 #[derive(Default, Clone)]
 pub(super) struct SharedState {
-    stream_id: String,
+    stream_name_or_id: String,
 }
 
-/// Subscribe this workflow to a stream. The command carries only the stream id
+/// Subscribe this workflow to a stream. The command carries only the name or id
 /// and a start offset; the server resolves the addressing, because a workflow
 /// cannot look it up without doing I/O and a value it carried would be a
 /// reading rather than a fact.
@@ -46,7 +46,7 @@ pub(super) fn subscribe_stream(lang_cmd: SubscribeStream) -> NewMachineWithComma
     let sm = SubscribeStreamMachine::from_parts(
         Created {}.into(),
         SharedState {
-            stream_id: lang_cmd.stream_id.clone(),
+            stream_name_or_id: lang_cmd.stream_name_or_id.clone(),
         },
     );
     NewMachineWithCommand {
@@ -70,14 +70,14 @@ impl CommandIssued {
         dat: &mut SharedState,
         attrs: WorkflowStreamSubscribedEventAttributes,
     ) -> SubscribeStreamMachineTransition<Done> {
-        if dat.stream_id == attrs.stream_id {
+        if dat.stream_name_or_id == attrs.stream_id {
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
                 "Recorded subscription to stream {:?} does not match the reissued subscription \
                  to stream {:?}",
                 attrs.stream_id,
-                dat.stream_id
+                dat.stream_name_or_id
             ))
         }
     }

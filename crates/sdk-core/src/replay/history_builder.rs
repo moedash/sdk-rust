@@ -156,18 +156,19 @@ impl TestHistoryBuilder {
         self.add(attrs)
     }
 
-    /// Add the event an append-stream-records command produces.
+    /// Add the event an append-stream-records command produces. The range is
+    /// half-open, as it is on the event.
     pub fn add_stream_records_appended(
         &mut self,
         stream_id: &str,
-        first_offset: i64,
-        record_count: i64,
+        from_offset: i64,
+        to_offset: i64,
     ) -> i64 {
         let attrs = WorkflowStreamRecordsAppendedEventAttributes {
             workflow_task_completed_event_id: self.previous_task_completed_id,
             stream_id: stream_id.to_string(),
-            first_offset,
-            record_count,
+            from_offset,
+            to_offset,
         };
         self.add(attrs)
     }
