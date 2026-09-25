@@ -1322,8 +1322,13 @@ impl ManagedRun {
         // Only a current wait (or a query-only activation preserving that wait) justifies an
         // output replacement. Otherwise an empty forced task can buffer the Activity or timer
         // result that lang is actually waiting for until the task times out.
+        //
+        // Buffered output is not one of those stale waits. Staging the commit clears the flag, so
+        // it can only be set here by a `WorkflowOutputStreamBuffered` on this same completion, and
+        // the flush deadline it asks for fires into nothing once the task is gone.
         let output_waits_need_replacement = stream_commands.quiescence.is_some()
             || park_retains
+            || self.waiting_on_local_work.output_buffered
             || (answering_a_query && self.waiting_on_local_work.external_wait_set.retains_wft());
         let query_refused_retention = stream_waits_still_pending
             && !boundary_closes_the_run
@@ -2220,10 +2225,11 @@ impl ManagedRun {
     /// still working on, which breaks the one-outstanding-activation rule this run relies on.
     /// `completing_outstanding_activation` is the caller saying which of the two it is.
     fn queue_external_stream_resolve(&mut self, completing_outstanding_activation: bool) {
-        debug_assert!(
-            completing_outstanding_activation == self.activation.is_some(),
-            "external stream resolve queued outside the readiness and completion paths"
-        );
+        // Violating this reorders activations rather than crashing, so a release build has to say
+        // so as well; `debug_assert!` alone would leave it silent everywhere it matters.
+        if completing_outstanding_activation != self.activation.is_some() {
+            dbg_panic!("external stream resolve queued outside the readiness and completion paths");
+        }
         if self.wft.is_none() || self.am_broken {
             return;
         }
