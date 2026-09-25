@@ -1107,7 +1107,8 @@ async fn an_empty_recorded_range_replays_without_a_slice_from_the_server() {
 
 /// A re-supplied slice is checked against the cursor it claims to satisfy. The
 /// event is the record of what the task saw, so bytes covering other offsets
-/// would replay the task on different input than it ran on.
+/// would replay the task on different input than it ran on. Both sides of that
+/// comparison come from the server, so the task fails as the worker's failure.
 #[tokio::test]
 async fn a_resupplied_slice_that_disagrees_with_the_record_fails_the_task() {
     let mut t = TestHistoryBuilder::default();
@@ -1121,8 +1122,11 @@ async fn a_resupplied_slice_that_disagrees_with_the_record_fails_the_task() {
     // One record where the event says two.
     poll_resp.add_stream_slice("s1", completed, 0, &["a"]);
 
-    let (core, failures) =
-        worker_expecting_one_nondeterminism_failure(t, ResponseType::Raw(poll_resp.resp));
+    let (core, failures) = worker_expecting_one_failure(
+        t,
+        ResponseType::Raw(poll_resp.resp),
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+    );
 
     // The mismatch is found while the poll response is applied, so the first
     // activation is already the eviction.
@@ -1207,6 +1211,52 @@ async fn a_missing_resupply_for_a_consumed_range_fails_the_task() {
     // Found while the poll response is applied, so the first activation is
     // already the eviction.
     core.handle_eviction().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
+    core.shutdown().await;
+}
+
+/// A task that read two streams and a response that re-supplies only one of
+/// them. The recorded range is the whole of what the task ran on, so a partial
+/// re-supply leaves the workflow as short of input as none at all, and it is
+/// the same worker failure: the history and the response both come from the
+/// server, and the retry on the normal task queue carries every stream.
+#[tokio::test]
+async fn a_partial_resupply_for_a_consumed_task_fails_the_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let completed = t.add_workflow_task_completed_with_consumed_stream_ranges(vec![
+        cursor("s1", 0, 1),
+        cursor("s2", 0, 1),
+    ]);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    // Only one of the two subscribed streams came back.
+    poll_resp.add_stream_slice("s1", completed, 0, &["one"]);
+
+    let (core, failures) = worker_expecting_one_failure(
+        t,
+        ResponseType::Raw(poll_resp.resp),
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+    );
+
+    // Found while the poll response is applied, so the first activation is
+    // already the eviction.
+    // The reason travels in the message, since an eviction for a failure found
+    // before any activation ran reports none of its own.
+    let task = core.poll_workflow_activation().await.unwrap();
+    let evict = eviction(&task);
+    assert!(
+        evict.message.contains(
+            "stream s2 was consumed from offset 0 to 1, but the server sent no \
+                       messages for it"
+        ),
+        "eviction did not name the stream that went missing: {evict:?}"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
     assert_eq!(failures.load(Ordering::Relaxed), 1);
     core.shutdown().await;
 }
@@ -1412,10 +1462,10 @@ async fn a_pushed_history_replays_with_the_slices_it_carries() {
 }
 
 /// A slice attached to a pushed history is held to the same check as one the
-/// server sends: offsets other than the recorded range fail the task as
-/// nondeterministic rather than replay it on different input.
+/// server sends: offsets other than the recorded range fail the task rather
+/// than replay it on different input.
 #[tokio::test]
-async fn a_pushed_history_with_a_wrong_slice_fails_as_nondeterministic() {
+async fn a_pushed_history_with_a_wrong_slice_fails_as_a_worker_failure() {
     let (t, first, second) = read_then_publish_history();
     let history = HistoryForReplay::new(t.get_full_history_info().unwrap(), "wfid")
         .with_stream_slices([
@@ -1426,10 +1476,10 @@ async fn a_pushed_history_with_a_wrong_slice_fails_as_nondeterministic() {
     let (core, feeder) = replay_worker(history).await;
 
     // The mismatch is found while the poll response is applied, so the first
-    // activation is already the eviction. The task is failed as
-    // nondeterministic (the mock-client test above checks the cause); the
-    // eviction carries the reason in its message, since an eviction for a
-    // failure found before any activation ran reports no reason of its own.
+    // activation is already the eviction. The task is failed as the worker's
+    // failure (the mock-client test above checks the cause); the eviction
+    // carries the reason in its message, since an eviction for a failure found
+    // before any activation ran reports no reason of its own.
     let task = core.poll_workflow_activation().await.unwrap();
     let evict = eviction(&task);
     assert!(
@@ -1450,7 +1500,7 @@ async fn a_pushed_history_with_a_wrong_slice_fails_as_nondeterministic() {
 /// language replayer that has no store to fetch from cannot replay a consuming
 /// workflow, and the task says so before the workflow runs on less input.
 #[tokio::test]
-async fn a_pushed_history_without_slices_for_a_consumed_range_fails_as_nondeterministic() {
+async fn a_pushed_history_without_slices_for_a_consumed_range_fails_as_a_worker_failure() {
     let (t, _, _) = read_then_publish_history();
     let history = HistoryForReplay::new(t.get_full_history_info().unwrap(), "wfid");
     let (core, feeder) = replay_worker(history).await;
