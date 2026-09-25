@@ -15,6 +15,7 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/sdk/v1/event_group_marker.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
@@ -54,7 +55,38 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        // 23 to 28 are taken by the external stream commands, which are developed
+        // alongside these and share this message. The two numbers below are fixed
+        // with that family and must not be reused.
+        SubscribeStream subscribe_stream = 29;
+        AppendStreamRecords append_stream_records = 30;
     }
+}
+
+// Append a batch of records to a stream this workflow owns.
+//
+// The bodies go to the stream's own log rather than into History, which gets
+// one fixed-size event naming the offset range. That is what makes the batch
+// size free: a thousand records cost the same in History as one. The server
+// stores each record with an empty producer id, because the workflow is the
+// producer here.
+message AppendStreamRecords {
+    // Empty means the workflow's default output stream.
+    string stream_id = 1;
+    repeated temporal.api.stream.v1.StreamRecord records = 2;
+}
+
+// Subscribe this workflow to a stream, so later Workflow Tasks carry the
+// ranges it has not consumed yet.
+//
+// The stream's addressing is resolved by the server. A workflow cannot look it
+// up without doing I/O, and a value it carried would be a reading rather than a
+// fact, so it could differ on replay.
+message SubscribeStream {
+    string stream_id = 1;
+    // Negative means from wherever the stream is when the subscription is
+    // registered. The server resolves that once and records it.
+    int64 start_offset = 2;
 }
 
 message StartTimer {
