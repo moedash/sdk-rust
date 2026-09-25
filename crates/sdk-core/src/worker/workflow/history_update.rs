@@ -763,6 +763,17 @@ fn find_end_index_of_next_wft_seq(
                     wft_started_event_id_to_index.pop();
                     continue;
                 } else if next_event_type == EventType::WorkflowTaskCompleted {
+                    // A task that consumed a stream range issued nothing the machines match,
+                    // but it was an activation of its own: the workflow was handed that range
+                    // and ran on it. Replay has to give it its own activation too, rather than
+                    // fold it into a heartbeat chain and hand several ranges over at once.
+                    if let Some(Attributes::WorkflowTaskCompletedEventAttributes(ref attrs)) =
+                        next_event.attributes
+                        && !attrs.consumed_stream_ranges.is_empty()
+                    {
+                        saw_command = true;
+                        saw_command_or_started = true;
+                    }
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
