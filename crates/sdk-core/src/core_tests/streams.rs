@@ -533,7 +533,7 @@ async fn read_then_publish_replays_when_the_range_is_only_visible_by_lookahead()
         task.run_id,
         vec![
             AppendStreamRecords {
-                stream_id: "out".to_string(),
+                stream_name: "out".to_string(),
                 records: vec![StreamRecord {
                     body: Some(b"accept".to_vec().into()),
                     ..Default::default()
@@ -592,7 +592,7 @@ async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
         task.run_id,
         vec![
             SubscribeStream {
-                stream_id: "in".to_string(),
+                stream_name_or_id: "in".to_string(),
                 start_offset: 0,
             }
             .into(),
@@ -624,7 +624,7 @@ async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
         task.run_id,
         vec![
             AppendStreamRecords {
-                stream_id: "out".to_string(),
+                stream_name: "out".to_string(),
                 records: vec![StreamRecord {
                     body: Some(b"accept".to_vec().into()),
                     ..Default::default()
@@ -708,7 +708,7 @@ async fn read_then_publish_replays_across_a_page_boundary(
         task.run_id,
         vec![
             SubscribeStream {
-                stream_id: "in".to_string(),
+                stream_name_or_id: "in".to_string(),
                 start_offset: 0,
             }
             .into(),
@@ -738,7 +738,7 @@ async fn read_then_publish_replays_across_a_page_boundary(
         task.run_id,
         vec![
             AppendStreamRecords {
-                stream_id: "out".to_string(),
+                stream_name: "out".to_string(),
                 records: vec![StreamRecord {
                     body: Some(b"accept".to_vec().into()),
                     ..Default::default()
@@ -1279,7 +1279,7 @@ async fn a_legacy_query_owed_records_it_was_not_sent_goes_unanswered() {
         task.run_id,
         vec![
             SubscribeStream {
-                stream_id: "in".to_string(),
+                stream_name_or_id: "in".to_string(),
                 start_offset: 0,
             }
             .into(),
@@ -1330,9 +1330,9 @@ fn replay_slice(
 }
 
 /// A publish of one record per body.
-fn publish(stream_id: &str, bodies: &[&str]) -> AppendStreamRecords {
+fn publish(stream_name: &str, bodies: &[&str]) -> AppendStreamRecords {
     AppendStreamRecords {
-        stream_id: stream_id.to_string(),
+        stream_name: stream_name.to_string(),
         records: bodies
             .iter()
             .map(|b| StreamRecord {
@@ -1365,7 +1365,7 @@ fn read_then_publish_history() -> (TestHistoryBuilder, i64, i64) {
     t.add_workflow_task_scheduled_and_started();
     let second =
         t.add_workflow_task_completed_with_consumed_stream_ranges(vec![cursor("in", 1, 2)]);
-    t.add_stream_records_appended("out", 1, 1);
+    t.add_stream_records_appended("out", 1, 2);
     t.add_workflow_execution_completed();
     (t, first, second)
 }
