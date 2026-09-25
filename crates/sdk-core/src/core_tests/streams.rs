@@ -876,42 +876,13 @@ async fn a_subscribe_reissued_to_a_different_stream_fails_the_task() {
     core.shutdown().await;
 }
 
-/// An explicit start offset is a value the workflow chose, so the recorded
-/// event holds the reissued command to it. Without the check a replay that
-/// asked to read from the top would be served from wherever the original run
-/// began, and nothing would say so.
+/// The start offset is deliberately not compared, even when the command names
+/// one itself. The comparison would only be sound for the run's first subscribe
+/// to a stream, and a subscription made through the stream service leaves no
+/// event, so which one is first cannot be told from history. Failing a run that
+/// did nothing wrong costs more than the drift the check would catch.
 #[tokio::test]
-async fn a_subscribe_reissued_with_a_different_offset_fails_the_task() {
-    let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
-    t.add_stream_subscribed("s1", 100);
-    t.add_full_wf_task();
-
-    let (core, failures) = worker_expecting_one_nondeterminism_failure(t, ResponseType::AllHistory);
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-        task.run_id,
-        vec![
-            SubscribeStream {
-                stream_id: "s1".to_string(),
-                start_offset: 0,
-            }
-            .into(),
-        ],
-    ))
-    .await
-    .unwrap();
-    core.handle_eviction().await;
-    assert_eq!(failures.load(Ordering::Relaxed), 1);
-    core.shutdown().await;
-}
-
-/// A negative offset asks the server where the stream stands, so the recorded
-/// answer is its own and the reissued command is not held to it.
-#[tokio::test]
-async fn a_subscribe_from_the_tail_is_not_held_to_the_recorded_offset() {
+async fn a_subscribe_reissued_with_a_different_offset_is_accepted() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
@@ -926,7 +897,7 @@ async fn a_subscribe_from_the_tail_is_not_held_to_the_recorded_offset() {
         vec![
             SubscribeStream {
                 stream_id: "s1".to_string(),
-                start_offset: -1,
+                start_offset: 0,
             }
             .into(),
         ],
@@ -936,12 +907,11 @@ async fn a_subscribe_from_the_tail_is_not_held_to_the_recorded_offset() {
     core.shutdown().await;
 }
 
-/// A second subscribe to the same stream registers nothing: the server records
-/// where the cursor has already reached, which is not what the command asked
-/// for. Holding the repeat to its offset would fail a run that did nothing
-/// wrong.
+/// A second subscribe to the same stream registers nothing on the server, which
+/// records the event at wherever the cursor has already reached. The reissued
+/// command still has to be accepted against it.
 #[tokio::test]
-async fn a_repeat_subscribe_is_not_held_to_the_offset_it_asked_for() {
+async fn a_repeat_subscribe_is_accepted() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
