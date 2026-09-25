@@ -1825,6 +1825,12 @@ pub mod temporal {
                                 CommandType::ScheduleActivityTask
                             }
                             Attributes::StartTimerCommandAttributes(_) => CommandType::StartTimer,
+                            Attributes::SubscribeStreamCommandAttributes(_) => {
+                                CommandType::SubscribeStream
+                            }
+                            Attributes::AppendStreamRecordsCommandAttributes(_) => {
+                                CommandType::AppendStreamRecords
+                            }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
                             }
@@ -2337,6 +2343,8 @@ pub mod temporal {
                                 | EventType::TimerStarted
                                 | EventType::UpsertWorkflowSearchAttributes
                                 | EventType::WorkflowPropertiesModified
+                                | EventType::WorkflowStreamSubscribed
+                                | EventType::WorkflowStreamRecordsAppended
                                 | EventType::NexusOperationScheduled
                                 | EventType::NexusOperationCancelRequested
                                 | EventType::WorkflowExecutionCanceled
@@ -2436,6 +2444,10 @@ pub mod temporal {
                             // mark any new event types as ignorable or not.
                             if let Some(a) = self.attributes.as_ref() {
                                 match a {
+                                    Attributes::WorkflowStreamSubscribedEventAttributes(_) => false,
+                                    Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => {
+                                        false
+                                    }
                                     Attributes::WorkflowExecutionStartedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionCompletedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionFailedEventAttributes(_) => false,
@@ -2523,6 +2535,8 @@ pub mod temporal {
                         pub fn event_type(&self) -> EventType {
                             // I just absolutely _love_ this
                             match self {
+                            Attributes::WorkflowStreamSubscribedEventAttributes(_) => { EventType::WorkflowStreamSubscribed }
+                            Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => { EventType::WorkflowStreamRecordsAppended }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
                             Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
                             Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }
@@ -2638,6 +2652,11 @@ pub mod temporal {
         pub mod sdk {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.sdk.v1");
+            }
+        }
+        pub mod stream {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.stream.v1");
             }
         }
         pub mod taskqueue {
