@@ -1495,7 +1495,7 @@ pub mod coresdk {
 
             impl Display for SubscribeStream {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-                    write!(f, "SubscribeStream({})", self.stream_id)
+                    write!(f, "SubscribeStream({})", self.stream_name_or_id)
                 }
             }
 
@@ -1504,7 +1504,7 @@ pub mod coresdk {
                     write!(
                         f,
                         "AppendStreamRecords({}, {} records)",
-                        self.stream_id,
+                        self.stream_name,
                         self.records.len()
                     )
                 }
@@ -1912,7 +1912,7 @@ pub mod temporal {
                         fn from(s: workflow_commands::AppendStreamRecords) -> Self {
                             Self::AppendStreamRecordsCommandAttributes(
                                 AppendStreamRecordsCommandAttributes {
-                                    stream_id: s.stream_id,
+                                    stream_name: s.stream_name,
                                     records: s.records,
                                 },
                             )
@@ -1923,7 +1923,7 @@ pub mod temporal {
                         fn from(s: workflow_commands::SubscribeStream) -> Self {
                             Self::SubscribeStreamCommandAttributes(
                                 SubscribeStreamCommandAttributes {
-                                    stream_id: s.stream_id,
+                                    stream_name_or_id: s.stream_name_or_id,
                                     start_offset: s.start_offset,
                                 },
                             )

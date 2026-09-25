@@ -2,7 +2,7 @@ mod local_acts;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
-    append_stream_records_state_machine::{DefaultStreamIdRef, append_stream_records},
+    append_stream_records_state_machine::{DefaultStreamNameRef, append_stream_records},
     cancel_external_state_machine::new_external_cancel,
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
@@ -170,7 +170,7 @@ pub(crate) struct WorkflowMachines {
 
     /// What the server resolved this run's unnamed appends to, learned from the
     /// first one it recorded and shared with the machines that follow.
-    default_stream_id: DefaultStreamIdRef,
+    default_stream_name: DefaultStreamNameRef,
 
     /// The workflow that is being driven by this instance of the machines
     drive_me: DrivenWorkflow,
@@ -311,7 +311,7 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
-            default_stream_id: Default::default(),
+            default_stream_name: Default::default(),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
@@ -1541,7 +1541,7 @@ impl WorkflowMachines {
                     // server assigned and hands nothing back. A workflow that
                     // wants to know where its batch landed reads the stream.
                     self.add_cmd_to_wf_task(
-                        append_stream_records(attrs, self.default_stream_id.clone()),
+                        append_stream_records(attrs, self.default_stream_name.clone()),
                         annotations,
                         CommandIdKind::NeverResolves,
                     );

@@ -33,14 +33,14 @@ fsm! {
 /// the next what the name is.
 #[derive(Default, Clone)]
 pub(super) struct SharedState {
-    stream_id: String,
+    stream_name: String,
     record_count: i64,
-    default_stream_id: DefaultStreamIdRef,
+    default_stream_name: DefaultStreamNameRef,
 }
 
 /// The name the server resolved this run's unnamed appends to, once one of them
 /// has been recorded.
-pub(super) type DefaultStreamIdRef = Rc<RefCell<Option<String>>>;
+pub(super) type DefaultStreamNameRef = Rc<RefCell<Option<String>>>;
 
 /// Append a batch of records to a stream this workflow owns.
 ///
@@ -49,14 +49,14 @@ pub(super) type DefaultStreamIdRef = Rc<RefCell<Option<String>>>;
 /// nothing here predicts them.
 pub(super) fn append_stream_records(
     lang_cmd: AppendStreamRecords,
-    default_stream_id: DefaultStreamIdRef,
+    default_stream_name: DefaultStreamNameRef,
 ) -> NewMachineWithCommand {
     let sm = AppendStreamRecordsMachine::from_parts(
         Created {}.into(),
         SharedState {
-            stream_id: lang_cmd.stream_id.clone(),
+            stream_name: lang_cmd.stream_name.clone(),
             record_count: lang_cmd.records.len() as i64,
-            default_stream_id,
+            default_stream_name,
         },
     );
     NewMachineWithCommand {
@@ -80,25 +80,28 @@ impl CommandIssued {
         dat: &mut SharedState,
         attrs: WorkflowStreamRecordsAppendedEventAttributes,
     ) -> AppendStreamRecordsMachineTransition<Done> {
-        // An empty id names the workflow's default stream, and the server is the
-        // one that resolves that name. The resolved name is on the event, so the
-        // run's first unnamed append is what teaches it and every later one is
-        // held to it.
-        let expected = if dat.stream_id.is_empty() {
-            dat.default_stream_id
+        // An empty name means the workflow's default stream, and the server is
+        // the one that resolves that name. The resolved name is on the event, so
+        // the run's first unnamed append is what teaches it and every later one
+        // is held to it.
+        let expected = if dat.stream_name.is_empty() {
+            dat.default_stream_name
                 .borrow_mut()
                 .get_or_insert_with(|| attrs.stream_id.clone())
                 .clone()
         } else {
-            dat.stream_id.clone()
+            dat.stream_name.clone()
         };
-        if expected == attrs.stream_id && dat.record_count == attrs.record_count {
+        // The event names a half-open offset range rather than a count, and the
+        // batch size is what this machine can hold a reissued command to.
+        let recorded_count = attrs.to_offset - attrs.from_offset;
+        if expected == attrs.stream_id && dat.record_count == recorded_count {
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
                 "Recorded append of {} records to stream {:?} does not match the reissued \
                  append of {} records to stream {:?}",
-                attrs.record_count,
+                recorded_count,
                 attrs.stream_id,
                 dat.record_count,
                 expected

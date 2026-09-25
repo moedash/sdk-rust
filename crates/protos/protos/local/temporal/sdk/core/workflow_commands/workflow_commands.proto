@@ -71,8 +71,11 @@ message WorkflowCommand {
 // stores each record with an empty producer id, because the workflow is the
 // producer here.
 message AppendStreamRecords {
-    // Empty means the workflow's default output stream.
-    string stream_id = 1;
+    // Name of a stream this workflow owns, scoped to the workflow. Created on
+    // first use. Empty means the workflow's default output stream. A workflow
+    // cannot append to a stream in another execution, so this is never the id
+    // of a standalone stream.
+    string stream_name = 1;
     repeated temporal.api.stream.v1.StreamRecord records = 2;
 }
 
@@ -83,9 +86,17 @@ message AppendStreamRecords {
 // up without doing I/O, and a value it carried would be a reading rather than a
 // fact, so it could differ on replay.
 message SubscribeStream {
-    string stream_id = 1;
-    // Negative means from wherever the stream is when the subscription is
-    // registered. The server resolves that once and records it.
+    // Stream to consume, named either way round: a stream this workflow owns
+    // by the name it appends under, a stream in another execution by its id.
+    // The server tries them in that order, so a workflow that owns a stream
+    // under this name cannot reach a standalone stream with the same id. When
+    // neither exists the workflow gets a stream of its own by that name, which
+    // is how a reader subscribes before the first record is written.
+    string stream_name_or_id = 1;
+    // Where to start, as an absolute offset. Any negative value means the head
+    // of the stream as of registration, and they all mean the same thing. The
+    // server resolves it and records the result, so replay does not resolve it
+    // again.
     int64 start_offset = 2;
 }
 
