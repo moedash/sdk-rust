@@ -14,8 +14,13 @@ import "temporal/api/common/v1/message.proto";
 // One entry in a stream. The record is the wire format: stores keep it
 // serialized as is and readers in every language decode the same bytes.
 message StreamRecord {
-    // The value the producer published, stored as sent. A payload codec
-    // applies here as it does to any other payload.
+    // The value the producer published, stored as sent.
+    //
+    // A payload codec applies on the paths this API owns: the append command on
+    // RespondWorkflowTaskCompleted, and the slices on PollWorkflowTaskQueue.
+    // Records a producer writes or reads through the stream service take a
+    // different path, whose messages are not part of this API yet and so are
+    // outside what a codec-applying proxy walks.
     temporal.api.common.v1.Payload body = 1;
     // Producer-supplied provenance, stored as sent.
     map<string, temporal.api.common.v1.Payload> metadata = 2;
@@ -28,8 +33,9 @@ message StreamRecord {
     // The producer's attempt. Readers treat a later attempt by the same
     // producer as superseding what the earlier one wrote.
     int64 attempt = 6;
-    // The producer's position within its attempt, or -1 when unnumbered.
-    // Stored as sent; the server does not assign, validate or order by it.
+    // The producer's position within its attempt, zero when it does not number
+    // its records. Stored as sent; the server does not assign, validate or
+    // order by it, and the stream's own offsets are what order a read.
     int64 sequence = 7;
 }
 
@@ -37,14 +43,21 @@ message StreamRecord {
 // offsets it covers. The offsets are what History records; the records
 // themselves are never written to History.
 message StreamSlice {
+    // The stream, as the subscribing command addressed it: either the name of
+    // a stream the consuming Workflow owns or the id of one in another
+    // execution.
     string stream_id = 1;
     // Run id of the execution that owns the stream. Set on both a slice for the
     // task being started and a re-supplied one.
     string run_id = 2;
     // Inclusive.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" and "to" name a half-open offset range. --)
     int64 from_offset = 3;
     // Exclusive. Equal to from_offset when the subscription observed nothing,
     // which is a fact replay has to reproduce rather than an absence of one.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" and "to" name a half-open offset range. --)
     int64 to_offset = 4;
     repeated StreamRecord records = 5;
     // The WorkflowTaskCompleted event whose consumed_stream_ranges recorded
@@ -62,10 +75,17 @@ message StreamSlice {
 // WorkflowTaskCompleted so History grows with Workflow Tasks rather than with
 // records.
 message StreamRange {
+    // The stream, as the subscribing command addressed it: either the name of
+    // a stream the consuming Workflow owns or the id of one in another
+    // execution.
     string stream_id = 1;
     // Inclusive.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" and "to" name a half-open offset range. --)
     int64 from_offset = 2;
     // Exclusive.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" and "to" name a half-open offset range. --)
     int64 to_offset = 3;
 }
 
