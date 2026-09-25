@@ -3,7 +3,6 @@
 
 pub(crate) mod activity_functions;
 pub(crate) mod fake_grpc_server;
-pub(crate) mod http_proxy;
 pub(crate) mod workflows;
 
 use anyhow::bail;
@@ -61,8 +60,8 @@ use temporalio_sdk::{
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use temporalio_sdk_core::test_help::NAMESPACE;
 use temporalio_sdk_core::{
-    CoreRuntime, RuntimeOptions, Worker as CoreWorker, WorkerConfig, WorkerVersioningStrategy,
-    init_replay_worker, init_worker,
+    CoreRuntime, RuntimeOptions, Worker as CoreWorker, WorkerConfig,
+    WorkerTuner as CoreWorkerTuner, WorkerVersioningStrategy, init_replay_worker, init_worker,
     replay::{HistoryForReplay, ReplayWorkerInput},
     test_help::{MockPollCfg, build_mock_pollers, mock_worker},
 };
@@ -356,6 +355,7 @@ pub(crate) struct CoreWfStarter {
     /// Run when initializing, allows for altering the config used to init the core worker
     #[allow(clippy::type_complexity)] // It's not tho
     core_config_mutator: Option<Arc<dyn Fn(&mut WorkerConfig)>>,
+    core_tuner_override: Option<Arc<dyn CoreWorkerTuner + Send + Sync>>,
     core_task_types: Option<WorkerTaskTypes>,
 }
 struct InitializedWorker {
@@ -481,6 +481,7 @@ impl CoreWfStarter {
             client_override,
             min_local_server_version: None,
             core_config_mutator: None,
+            core_tuner_override: None,
             core_task_types: None,
         }
     }
@@ -497,6 +498,7 @@ impl CoreWfStarter {
             min_local_server_version: self.min_local_server_version.clone(),
             initted_worker: Default::default(),
             core_config_mutator: self.core_config_mutator.clone(),
+            core_tuner_override: self.core_tuner_override.clone(),
             core_task_types: self.core_task_types,
         }
     }
@@ -512,9 +514,10 @@ impl CoreWfStarter {
         let interceptor_router = TestWorkerInterceptorRouter::default();
         let mut sdk_config = self.sdk_config.clone();
         sdk_config.worker_interceptor(interceptor_router.clone());
-        let sdk = Worker::new_from_core_options(worker, client.options().clone(), sdk_config)
-            .expect("SDK worker should initialize from core worker and options");
-        let mut w = TestWorker::new_with_interceptor_router(sdk, interceptor_router);
+        let sdk =
+            Worker::new_from_core_options(worker.clone(), client.options().clone(), sdk_config)
+                .expect("SDK worker should initialize from core worker and options");
+        let mut w = TestWorker::new_with_interceptor_router(sdk, worker, interceptor_router);
         w.client = Some(client);
 
         w
@@ -522,6 +525,10 @@ impl CoreWfStarter {
 
     pub(crate) fn set_core_cfg_mutator(&mut self, mutator: impl Fn(&mut WorkerConfig) + 'static) {
         self.core_config_mutator = Some(Arc::new(mutator))
+    }
+
+    pub(crate) fn set_core_tuner(&mut self, tuner: Arc<dyn CoreWorkerTuner + Send + Sync>) {
+        self.core_tuner_override = Some(tuner);
     }
 
     pub(crate) fn set_core_task_types(&mut self, task_types: WorkerTaskTypes) {
@@ -614,9 +621,9 @@ impl CoreWfStarter {
         let events = client
             .get_workflow_handle::<UntypedWorkflow>(self.get_wf_id())
             .fetch_history(Default::default())
+            .into_events()
             .await
-            .unwrap()
-            .into_events();
+            .unwrap();
         History { events }
     }
 
@@ -677,6 +684,9 @@ impl CoreWfStarter {
                 if let Some(ref ccm) = self.core_config_mutator {
                     ccm(&mut core_config);
                 }
+                if let Some(tuner) = &self.core_tuner_override {
+                    core_config.tuner = Some(tuner.clone());
+                }
                 let worker =
                     init_worker(rt, core_config, connection).expect("Worker inits cleanly");
                 InitializedWorker {
@@ -691,6 +701,7 @@ impl CoreWfStarter {
 /// Provides conveniences for running integ tests with the SDK (against real server or mocks)
 pub(crate) struct TestWorker {
     inner: Worker,
+    core_worker: Arc<CoreWorker>,
     interceptor_router: Option<TestWorkerInterceptorRouter>,
     client: Option<Client>,
     pub started_workflows: Arc<Mutex<Vec<WorkflowExecutionInfo>>>,
@@ -700,9 +711,10 @@ pub(crate) struct TestWorker {
 }
 impl TestWorker {
     /// Create a new test worker
-    pub(crate) fn new(sdk: Worker) -> Self {
+    pub(crate) fn new(sdk: Worker, core_worker: Arc<CoreWorker>) -> Self {
         Self {
             inner: sdk,
+            core_worker,
             interceptor_router: None,
             client: None,
             started_workflows: Arc::new(Mutex::new(vec![])),
@@ -712,11 +724,12 @@ impl TestWorker {
 
     fn new_with_interceptor_router(
         sdk: Worker,
+        core_worker: Arc<CoreWorker>,
         interceptor_router: TestWorkerInterceptorRouter,
     ) -> Self {
         Self {
             interceptor_router: Some(interceptor_router),
-            ..Self::new(sdk)
+            ..Self::new(sdk, core_worker)
         }
     }
 
@@ -856,7 +869,7 @@ impl TestWorker {
     }
 
     pub(crate) fn core_worker(&self) -> Arc<temporalio_sdk_core::Worker> {
-        self.inner.core_worker()
+        self.core_worker.clone()
     }
 }
 
@@ -1079,7 +1092,7 @@ where
         worker: &mut TestWorker,
     ) -> Result<Option<Payload>, anyhow::Error> {
         let wf_id = self.info().workflow_id.clone();
-        let events = self.fetch_history(Default::default()).await?.into_events();
+        let events = self.fetch_history(Default::default()).into_events().await?;
         let with_id = HistoryForReplay::new(events, wf_id);
         let replay_worker = init_core_replay_preloaded(worker.inner.task_queue(), [with_id]);
         worker.inner.with_new_core_worker(Arc::new(replay_worker));
@@ -1212,7 +1225,7 @@ pub(crate) fn mock_sdk_cfg_with_options(
     poll_cfg.using_rust_sdk = true;
     let mut mock = build_mock_pollers(poll_cfg);
     mock.worker_cfg(mutator);
-    let core = mock_worker(mock);
+    let core = Arc::new(mock_worker(mock));
     let interceptor_router = TestWorkerInterceptorRouter::default();
     let client_options = ClientOptions::new(core.get_config().namespace.clone())
         .data_converter(DataConverter::default())
@@ -1221,9 +1234,9 @@ pub(crate) fn mock_sdk_cfg_with_options(
         .worker_interceptor(interceptor_router.clone())
         .build();
     options_mutator(&mut worker_options);
-    let sdk = Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+    let sdk = Worker::new_from_core_options(core.clone(), client_options, worker_options)
         .expect("mock worker options are valid");
-    TestWorker::new_with_interceptor_router(sdk, interceptor_router)
+    TestWorker::new_with_interceptor_router(sdk, core, interceptor_router)
 }
 
 #[derive(Default)]

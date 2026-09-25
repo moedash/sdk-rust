@@ -1,14 +1,15 @@
 use crate::{
-    ClientInterceptor, ClientPlugin, ErasedClientPlugin, HttpConnectProxyOptions, RetryOptions,
-    RpcOptions, VERSION, callback_based,
+    ClientInterceptor, HttpConnectProxyOptions, RetryOptions, RpcOptions, VERSION, callback_based,
 };
+#[cfg(feature = "experimental")]
+use crate::{ClientPlugin, ErasedClientPlugin};
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
     ActivityCloseTimeouts, MemoValues, RetryPolicy,
     data_converters::{
         DataConverter, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
-        SerializationContext, SerializationContextData,
+        SerializationContext, SerializationContextData, WorkflowSerializationContext,
     },
     payload_visitor::encode_payloads,
     protos::temporal::api::{
@@ -18,9 +19,12 @@ use temporalio_common::{
         },
         enums::v1::{
             ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
-            ActivityIdReusePolicy as ProtoActivityIdReusePolicy, ArchivalState,
-            HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
-            WorkflowIdReusePolicy,
+            ActivityIdReusePolicy as ProtoActivityIdReusePolicy,
+            ArchivalState as ProtoArchivalState,
+            HistoryEventFilterType as ProtoHistoryEventFilterType,
+            QueryRejectCondition as ProtoQueryRejectCondition,
+            WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+            WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
         },
         replication::v1::ClusterReplicationConfig,
         sdk::v1::UserMetadata,
@@ -33,6 +37,9 @@ use temporalio_common::{
 use tokio_rustls::rustls::client::ResolvesClientCert;
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use url::Url;
+
+pub(crate) const DEFAULT_PAYLOADS_WARN_SIZE: u64 = 512 * 1024;
+pub(crate) const DEFAULT_MEMO_WARN_SIZE: u64 = 2 * 1024;
 
 /// Options for [crate::Connection::connect].
 #[derive(bon::Builder, Clone, Debug)]
@@ -106,6 +113,14 @@ pub struct ConnectionOptions {
     /// Payload size limit options for this connection. Defaults to the standard warning thresholds;
     /// disable an individual warning by setting its threshold to `0`.
     /// NOTE: Experimental
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(
+        docsrs,
+        builder(setters(
+            some_fn(name = payload_limits_impl, vis = "pub(crate)"),
+            option_fn(name = maybe_payload_limits_impl, vis = "pub(crate)")
+        ))
+    )]
     #[builder(default)]
     pub payload_limits: PayloadLimitsOptions,
 
@@ -126,6 +141,35 @@ pub struct ConnectionOptions {
     #[builder(default = VERSION.to_owned())]
     #[cfg_attr(feature = "core-based-sdk", builder(setters(vis = "pub")))]
     pub(crate) client_version: String,
+}
+
+// Bon does not propagate `doc(cfg)` to generated setters, so these docs-only methods forward to
+// renamed generated implementations.
+#[cfg(all(feature = "experimental", docsrs))]
+impl<S: connection_options_builder::State> ConnectionOptionsBuilder<S> {
+    /// Set the payload size limit options for this connection.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn payload_limits(
+        self,
+        value: PayloadLimitsOptions,
+    ) -> ConnectionOptionsBuilder<connection_options_builder::SetPayloadLimits<S>>
+    where
+        S::PayloadLimits: connection_options_builder::IsUnset,
+    {
+        self.payload_limits_impl(value)
+    }
+
+    /// Set the payload size limit options for this connection from an optional value.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn maybe_payload_limits(
+        self,
+        value: Option<PayloadLimitsOptions>,
+    ) -> ConnectionOptionsBuilder<connection_options_builder::SetPayloadLimits<S>>
+    where
+        S::PayloadLimits: connection_options_builder::IsUnset,
+    {
+        self.maybe_payload_limits_impl(value)
+    }
 }
 
 // Setters/getters for fields that should only be touched by SDK implementers.
@@ -160,10 +204,12 @@ pub struct ClientOptions {
 
     #[builder(field)]
     #[debug(skip)]
+    #[cfg(feature = "experimental")]
     plugins: Vec<ErasedClientPlugin>,
 
     #[builder(field)]
     #[debug(skip)]
+    #[cfg(feature = "experimental")]
     client_plugins_applied: bool,
 
     /// The data converter used for serializing/deserializing payloads.
@@ -175,6 +221,7 @@ pub struct ClientOptions {
     pub client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
 }
 
+#[cfg(feature = "experimental")]
 impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register a type-erased client plugin.
     ///
@@ -211,14 +258,17 @@ impl ClientOptions {
     /// This is intended for SDK integrations that propagate worker plugin registrations.
     ///
     /// **Experimental:** This API may change or be removed.
+    #[cfg(feature = "experimental")]
     pub fn plugins(&self) -> &[ErasedClientPlugin] {
         &self.plugins
     }
 
+    #[cfg(feature = "experimental")]
     pub(crate) fn client_plugins_applied(&self) -> bool {
         self.client_plugins_applied
     }
 
+    #[cfg(feature = "experimental")]
     pub(crate) fn mark_client_plugins_applied(&mut self) {
         self.client_plugins_applied = true;
     }
@@ -353,19 +403,21 @@ impl Default for DnsLoadBalancingOptions {
 
 /// Payload size limit options for a connection.
 /// NOTE: Experimental
+#[cfg(feature = "experimental")]
 #[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
     /// fields are logged but still sent to server. Defaults to 512 KiB. Set to `0` to disable.
-    #[builder(default = 512 * 1024)]
+    #[builder(default = DEFAULT_PAYLOADS_WARN_SIZE)]
     pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are logged but still
     /// sent to server. Defaults to 2 KiB. Set to `0` to disable.
-    #[builder(default = 2 * 1024)]
+    #[builder(default = DEFAULT_MEMO_WARN_SIZE)]
     pub memo_warn_size: u64,
 }
 
+#[cfg(feature = "experimental")]
 impl Default for PayloadLimitsOptions {
     fn default() -> Self {
         Self::builder().build()
@@ -376,6 +428,59 @@ impl std::fmt::Debug for ClientTlsOptions {
     // Intentionally omit details here since they could leak a key if ever printed
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ClientTlsOptions(..)")
+    }
+}
+
+/// Controls whether a closed workflow ID may be reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum WorkflowIdReusePolicy {
+    /// Use the server's default policy.
+    #[default]
+    Unspecified,
+    /// Allow starting a workflow using the same workflow ID.
+    AllowDuplicate,
+    /// Allow reuse only when the previous execution did not complete successfully.
+    AllowDuplicateFailedOnly,
+    /// Reject reuse of the workflow ID.
+    RejectDuplicate,
+}
+
+impl From<WorkflowIdReusePolicy> for ProtoWorkflowIdReusePolicy {
+    fn from(value: WorkflowIdReusePolicy) -> Self {
+        match value {
+            WorkflowIdReusePolicy::Unspecified => Self::Unspecified,
+            WorkflowIdReusePolicy::AllowDuplicate => Self::AllowDuplicate,
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly => Self::AllowDuplicateFailedOnly,
+            WorkflowIdReusePolicy::RejectDuplicate => Self::RejectDuplicate,
+        }
+    }
+}
+
+/// Controls how starting a workflow resolves a conflict with a running workflow using the same
+/// workflow ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum WorkflowIdConflictPolicy {
+    /// Use the server's default policy.
+    #[default]
+    Unspecified,
+    /// Do not start a new workflow and return an already-started error.
+    Fail,
+    /// Do not start a new workflow and return a handle for the running workflow.
+    UseExisting,
+    /// Terminate the running workflow before starting a new one.
+    TerminateExisting,
+}
+
+impl From<WorkflowIdConflictPolicy> for ProtoWorkflowIdConflictPolicy {
+    fn from(value: WorkflowIdConflictPolicy) -> Self {
+        match value {
+            WorkflowIdConflictPolicy::Unspecified => Self::Unspecified,
+            WorkflowIdConflictPolicy::Fail => Self::Fail,
+            WorkflowIdConflictPolicy::UseExisting => Self::UseExisting,
+            WorkflowIdConflictPolicy::TerminateExisting => Self::TerminateExisting,
+        }
     }
 }
 
@@ -417,8 +522,7 @@ pub struct WorkflowStartOptions {
     /// Additional search attributes for the workflow.
     pub search_attributes: Option<SearchAttributes>,
 
-    /// Optionally enable Eager Workflow Start, a latency optimization using local workers
-    /// NOTE: Experimental
+    /// Optionally enable Eager Workflow Start, a latency optimization using local workers.
     #[builder(default)]
     pub enable_eager_workflow_start: bool,
 
@@ -466,8 +570,8 @@ impl WorkflowStartOptions {
         };
 
         let payload_converter = data_converter.payload_converter();
-        let context =
-            SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let context = SerializationContext::new(&context_data, payload_converter);
         let mut memo = ProtoMemo {
             fields: memo
                 .iter()
@@ -481,7 +585,7 @@ impl WorkflowStartOptions {
         encode_payloads(
             &mut memo,
             data_converter.codec(),
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
         .await?;
         Ok(Some(memo))
@@ -490,8 +594,9 @@ impl WorkflowStartOptions {
     pub(crate) fn user_metadata(&self) -> Option<UserMetadata> {
         (self.static_summary.is_some() || self.static_details.is_some()).then(|| {
             let payload_converter = PayloadConverter::default();
-            let context =
-                SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let context = SerializationContext::new(&context_data, &payload_converter);
             UserMetadata {
                 summary: self.static_summary.as_ref().map(|summary| {
                     payload_converter
@@ -684,6 +789,32 @@ pub struct WorkflowSignalOptions {
     pub rpc_options: RpcOptions,
 }
 
+/// Controls when a workflow query should be rejected based on workflow state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum QueryRejectCondition {
+    /// Use the server's default condition.
+    #[default]
+    Unspecified,
+    /// Do not reject the query based on workflow state.
+    None,
+    /// Reject the query if the workflow is not open.
+    NotOpen,
+    /// Reject the query if the workflow did not complete successfully.
+    NotCompletedCleanly,
+}
+
+impl From<QueryRejectCondition> for ProtoQueryRejectCondition {
+    fn from(value: QueryRejectCondition) -> Self {
+        match value {
+            QueryRejectCondition::Unspecified => Self::Unspecified,
+            QueryRejectCondition::None => Self::None,
+            QueryRejectCondition::NotOpen => Self::NotOpen,
+            QueryRejectCondition::NotCompletedCleanly => Self::NotCompletedCleanly,
+        }
+    }
+}
+
 /// Options for querying a workflow.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
@@ -739,6 +870,29 @@ pub struct WorkflowDescribeOptions {
 
 /// Default workflow execution retention for a Namespace is 3 days
 const DEFAULT_WORKFLOW_EXECUTION_RETENTION_PERIOD: Duration = Duration::from_secs(60 * 60 * 24 * 3);
+
+/// Controls whether archival is enabled for a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum ArchivalState {
+    /// Use the server's default archival state.
+    #[default]
+    Unspecified,
+    /// Disable archival.
+    Disabled,
+    /// Enable archival.
+    Enabled,
+}
+
+impl From<ArchivalState> for ProtoArchivalState {
+    fn from(value: ArchivalState) -> Self {
+        match value {
+            ArchivalState::Unspecified => Self::Unspecified,
+            ArchivalState::Disabled => Self::Disabled,
+            ArchivalState::Enabled => Self::Enabled,
+        }
+    }
+}
 
 /// Helper struct for `register_namespace`.
 #[derive(Clone, Debug, bon::Builder)]
@@ -799,10 +953,34 @@ impl From<RegisterNamespaceOptions> for RegisterNamespaceRequest {
             data: val.data,
             security_token: val.security_token,
             is_global_namespace: val.is_global_namespace,
-            history_archival_state: val.history_archival_state as i32,
+            history_archival_state: ProtoArchivalState::from(val.history_archival_state) as i32,
             history_archival_uri: val.history_archival_uri,
-            visibility_archival_state: val.visibility_archival_state as i32,
+            visibility_archival_state: ProtoArchivalState::from(val.visibility_archival_state)
+                as i32,
             visibility_archival_uri: val.visibility_archival_uri,
+        }
+    }
+}
+
+/// Selects which workflow history events are returned when fetching history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum HistoryEventFilterType {
+    /// Use the server's default filter.
+    #[default]
+    Unspecified,
+    /// Return all history events.
+    AllEvent,
+    /// Return only the workflow's close event.
+    CloseEvent,
+}
+
+impl From<HistoryEventFilterType> for ProtoHistoryEventFilterType {
+    fn from(value: HistoryEventFilterType) -> Self {
+        match value {
+            HistoryEventFilterType::Unspecified => Self::Unspecified,
+            HistoryEventFilterType::AllEvent => Self::AllEvent,
+            HistoryEventFilterType::CloseEvent => Self::CloseEvent,
         }
     }
 }
