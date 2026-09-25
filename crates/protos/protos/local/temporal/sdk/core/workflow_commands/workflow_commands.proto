@@ -155,7 +155,8 @@ message WorkflowOutputStreamBuffered {
     google.protobuf.Duration max_publish_latency = 1;
 }
 
-// Append a batch of records to a stream this workflow owns.//
+// Append a batch of records to a stream this workflow owns.
+//
 // The bodies go to the stream's own log rather than into History, which gets
 // one fixed-size event naming the offset range. That is what makes the batch
 // size free: a thousand records cost the same in History as one. The server
