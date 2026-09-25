@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)] // error if there are missing docs
 
 //! This crate contains client implementations that can be used to contact the Temporal service.
@@ -20,11 +21,10 @@ pub mod grpc;
 pub mod interceptors;
 mod metrics;
 mod options_structs;
+#[cfg(feature = "experimental")]
 /// Experimental APIs for configuring clients with reusable plugins.
 pub mod plugins;
-/// Visible only for tests
-#[doc(hidden)]
-pub mod proxy;
+mod proxy;
 mod replaceable;
 pub mod request_extensions;
 mod retry;
@@ -37,15 +37,12 @@ pub mod worker;
 mod workflow_handle;
 mod workflow_status;
 
-pub use crate::{
-    proxy::HttpConnectProxyOptions,
-    request_extensions::PayloadErrorLimits,
-    retry::{CallType, RETRYABLE_ERROR_CODES},
-};
+pub use crate::{proxy::HttpConnectProxyOptions, request_extensions::PayloadErrorLimits};
 pub use activity::*;
 pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
+pub(crate) use retry::CallType;
 #[doc(hidden)]
 pub use retry::jittered;
 
@@ -65,6 +62,7 @@ pub use interceptors::{
 };
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
+#[cfg(feature = "experimental")]
 pub use plugins::{
     ClientPlugin, ErasedClientPlugin, PluginApplyError, PluginError, PluginTarget, WorkerPluginData,
 };
@@ -102,7 +100,7 @@ pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
     WorkflowExecutionDescription, WorkflowExecutionInfo, WorkflowExecutionResult, WorkflowHandle,
-    WorkflowHistory, WorkflowHistoryJsonError, WorkflowResultDetails, WorkflowUpdateHandle,
+    WorkflowHistory, WorkflowHistoryError, WorkflowResultDetails, WorkflowUpdateHandle,
 };
 pub use workflow_status::WorkflowExecutionStatus;
 
@@ -135,7 +133,10 @@ use std::{
 };
 use temporalio_common::{
     ActivityDefinition, HasWorkflowDefinition, SignalDefinition, UntypedActivity, UpdateDefinition,
-    data_converters::{DataConverter, SerializationContext, SerializationContextData},
+    data_converters::{
+        ActivitySerializationContext, DataConverter, SerializationContext,
+        SerializationContextData, WorkflowSerializationContext,
+    },
     payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
@@ -148,6 +149,8 @@ use temporalio_common::{
                 ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
                 ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
                 UpdateWorkflowExecutionLifecycleStage,
+                WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+                WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
             },
             operatorservice::v1::operator_service_client::OperatorServiceClient,
             sdk::v1::UserMetadata,
@@ -187,14 +190,6 @@ static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 #[doc(hidden)]
 /// Key used to communicate when a GRPC message is too large
 pub static MESSAGE_TOO_LARGE_KEY: &str = "message-too-large";
-#[doc(hidden)]
-/// Returns the violation, if `status` is the client proactively rejecting an outbound request for exceeding a
-/// payload/memo error size limit.
-pub fn payload_limit_violation_from(
-    status: &tonic::Status,
-) -> Option<&temporalio_common::payload_limits::PayloadLimitViolation> {
-    std::error::Error::source(status).and_then(|src| src.downcast_ref())
-}
 #[doc(hidden)]
 /// Key used to indicate a error was returned by the retryer because of the short-circuit predicate
 pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT: &str = "short-circuit";
@@ -429,6 +424,14 @@ impl Connection {
         } else {
             None
         };
+        #[cfg(feature = "experimental")]
+        let payloads_warn_size = options.payload_limits.payloads_warn_size;
+        #[cfg(not(feature = "experimental"))]
+        let payloads_warn_size = options_structs::DEFAULT_PAYLOADS_WARN_SIZE;
+        #[cfg(feature = "experimental")]
+        let memo_warn_size = options.payload_limits.memo_warn_size;
+        #[cfg(not(feature = "experimental"))]
+        let memo_warn_size = options_structs::DEFAULT_MEMO_WARN_SIZE;
         Ok(Self {
             inner: Arc::new(ConnectionInner {
                 service: svc_client,
@@ -442,12 +445,9 @@ impl Connection {
                 _dns_task: dns_task,
                 payloads_warn_size: resolve_warn_threshold(
                     "payloads_warn_size",
-                    options.payload_limits.payloads_warn_size,
+                    payloads_warn_size,
                 ),
-                memo_warn_size: resolve_warn_threshold(
-                    "memo_warn_size",
-                    options.payload_limits.memo_warn_size,
-                ),
+                memo_warn_size: resolve_warn_threshold("memo_warn_size", memo_warn_size),
             }),
         })
     }
@@ -1094,9 +1094,12 @@ impl Client {
     /// Connect to a Temporal service and create a namespace-bound client, applying registered
     /// plugins to connection and client options in registration order.
     pub async fn connect(
-        mut connection_options: ConnectionOptions,
+        connection_options: ConnectionOptions,
         client_options: ClientOptions,
     ) -> Result<Self, ClientConnectError> {
+        #[cfg(feature = "experimental")]
+        let mut connection_options = connection_options;
+        #[cfg(feature = "experimental")]
         plugins::apply_connection_plugins(&client_options, &mut connection_options)?;
         let connection = Connection::connect(connection_options).await?;
         Ok(Self::new(connection, client_options)?)
@@ -1106,7 +1109,10 @@ impl Client {
     ///
     /// Registered client plugins are applied here. Connection plugin hooks only run when using
     /// [`Client::connect`].
-    pub fn new(connection: Connection, mut options: ClientOptions) -> Result<Self, ClientNewError> {
+    pub fn new(connection: Connection, options: ClientOptions) -> Result<Self, ClientNewError> {
+        #[cfg(feature = "experimental")]
+        let mut options = options;
+        #[cfg(feature = "experimental")]
         plugins::apply_client_plugins(&mut options)?;
         Ok(Client {
             connection,
@@ -1659,7 +1665,7 @@ impl WorkflowExecution {
         Memo::from_raw(
             self.raw.memo.clone(),
             self.data_converter.payload_converter().clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -1805,6 +1811,7 @@ fn build_start_workflow_request(
     options: WorkflowStartOptions,
 ) -> StartWorkflowExecutionRequest {
     let user_metadata = options.user_metadata();
+    let request_eager_execution = options.enable_eager_workflow_start;
     StartWorkflowExecutionRequest {
         namespace: client.namespace(),
         input,
@@ -1819,8 +1826,9 @@ fn build_start_workflow_request(
         }),
         identity: client.identity(),
         request_id: Uuid::new_v4().to_string(),
-        workflow_id_reuse_policy: options.id_reuse_policy as i32,
-        workflow_id_conflict_policy: options.id_conflict_policy as i32,
+        workflow_id_reuse_policy: ProtoWorkflowIdReusePolicy::from(options.id_reuse_policy) as i32,
+        workflow_id_conflict_policy: ProtoWorkflowIdConflictPolicy::from(options.id_conflict_policy)
+            as i32,
         workflow_execution_timeout: options
             .execution_timeout
             .and_then(|duration| duration.try_into().ok()),
@@ -1834,7 +1842,7 @@ fn build_start_workflow_request(
             .search_attributes
             .map(|attributes| attributes.into_proto()),
         cron_schedule: options.cron_schedule.unwrap_or_default(),
-        request_eager_execution: options.enable_eager_workflow_start,
+        request_eager_execution,
         retry_policy: options.retry_policy.map(Into::into),
         links: options.links,
         completion_callbacks: options.completion_callbacks,
@@ -1876,14 +1884,18 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
 
                         let payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), unencoded_payloads?)
                             .await?;
                         let workflow_id = options.workflow_id.clone();
                         let memo = options.encoded_memo(&data_converter).await?;
@@ -1967,18 +1979,21 @@ where
                         ) = input.into_parts();
                         let data_converter = client.data_converter().clone();
                         let payload_converter = data_converter.payload_converter();
-                        let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+                        let context_data = SerializationContextData::Workflow(
+                            WorkflowSerializationContext::new(),
+                        );
+                        let context = SerializationContext::new(&context_data, payload_converter);
                         let workflow_payloads = workflow_args.serialize_payloads(&context);
                         let signal_payloads = signal_args.serialize_payloads(&context);
                         drop(workflow_args);
                         drop(signal_args);
                         let workflow_payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, workflow_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), workflow_payloads?)
                             .await?;
                         let signal_payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, signal_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), signal_payloads?)
                             .await?;
                         let workflow_id = options.workflow_id.clone();
                         let memo = options.encoded_memo(&data_converter).await?;
@@ -2097,10 +2112,11 @@ where
                         let data_converter = client.data_converter().clone();
                         let (unencoded_workflow_payloads, unencoded_update_payloads) = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext::new(
-                                &SerializationContextData::Workflow,
-                                payload_converter,
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
                             );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
                             (
                                 workflow_args.serialize_payloads(&context),
                                 update_args.serialize_payloads(&context),
@@ -2112,11 +2128,15 @@ where
                         // encode both payload sets concurrently.
                         let (workflow_payloads, update_payloads) = try_join(
                             data_converter.codec().encode(
-                                &SerializationContextData::Workflow,
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
                                 unencoded_workflow_payloads?,
                             ),
                             data_converter.codec().encode(
-                                &SerializationContextData::Workflow,
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
                                 unencoded_update_payloads?,
                             ),
                         )
@@ -2364,7 +2384,9 @@ where
                                     && let Err(err) = decode_payloads(
                                         memo,
                                         data_converter.codec(),
-                                        &SerializationContextData::Workflow,
+                                        &SerializationContextData::Workflow(
+                                            WorkflowSerializationContext::new(),
+                                        ),
                                     )
                                     .await
                                 {
@@ -2460,7 +2482,7 @@ where
     {
         let mut client = self.clone();
         let dc = client.data_converter();
-        let sc = &SerializationContextData::Activity;
+        let sc = &SerializationContextData::Activity(ActivitySerializationContext::new());
 
         let user_metadata = {
             let summary = match &options.summary {
@@ -3655,7 +3677,7 @@ mod tests {
             let recorded = Arc::new(Mutex::new(RecordedStart::default()));
             let data_converter = DataConverter::new(
                 PayloadConverter::default(),
-                DefaultFailureConverter,
+                DefaultFailureConverter::default(),
                 CountingCodec {
                     encode_calls: encode_calls.clone(),
                 },
@@ -3678,8 +3700,11 @@ mod tests {
             codec: impl PayloadCodec + Send + Sync + 'static,
         ) -> (MockStartWorkflowClient, Arc<Mutex<RecordedStart>>) {
             let recorded = Arc::new(Mutex::new(RecordedStart::default()));
-            let data_converter =
-                DataConverter::new(PayloadConverter::default(), DefaultFailureConverter, codec);
+            let data_converter = DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter::default(),
+                codec,
+            );
             (
                 MockStartWorkflowClient {
                     recorded: recorded.clone(),
@@ -3692,13 +3717,17 @@ mod tests {
         /// Decode a sent memo the same way `describe`/`list` do, and read it back.
         async fn read_back(sent: ProtoMemo) -> Memo {
             let mut sent = sent;
-            decode_payloads(&mut sent, &XorCodec, &SerializationContextData::Workflow)
-                .await
-                .unwrap();
+            decode_payloads(
+                &mut sent,
+                &XorCodec,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            )
+            .await
+            .unwrap();
             Memo::from_raw(
                 Some(sent),
                 PayloadConverter::default(),
-                SerializationContextData::Workflow,
+                SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
         }
 
@@ -3853,7 +3882,10 @@ mod tests {
             };
             let replacement: String = client
                 .data_converter()
-                .from_payloads(&SerializationContextData::Workflow, payloads)
+                .from_payloads(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    payloads,
+                )
                 .await
                 .unwrap();
             assert_eq!(replacement, "replacement");
@@ -3888,7 +3920,7 @@ mod tests {
             let recorded = Arc::new(Mutex::new(RecordedStart::default()));
             let data_converter = DataConverter::new(
                 PayloadConverter::UseWrappers,
-                DefaultFailureConverter,
+                DefaultFailureConverter::default(),
                 CountingCodec {
                     encode_calls: encode_calls.clone(),
                 },
@@ -4016,7 +4048,7 @@ mod tests {
             assert_eq!(
                 data_converter
                     .from_payloads::<Vec<String>>(
-                        &SerializationContextData::Workflow,
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                         workflow_payloads,
                     )
                     .await
@@ -4026,7 +4058,7 @@ mod tests {
             assert_eq!(
                 data_converter
                     .from_payloads::<Vec<String>>(
-                        &SerializationContextData::Workflow,
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                         signal_payloads,
                     )
                     .await
@@ -4140,7 +4172,10 @@ mod tests {
                 common::v1::{
                     Header, Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution,
                 },
-                enums::v1::{UpdateWorkflowExecutionLifecycleStage, WorkflowIdConflictPolicy},
+                enums::v1::{
+                    UpdateWorkflowExecutionLifecycleStage,
+                    WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+                },
                 update::v1::{
                     Input as UpdateInput, Meta as UpdateMeta, Outcome, Request as UpdateRequest,
                     UpdateRef, WaitPolicy, outcome,
@@ -4181,15 +4216,18 @@ mod tests {
         ) -> ExecuteMultiOperationResponse {
             let outcome = (stage == UpdateWorkflowExecutionLifecycleStage::Completed).then(|| {
                 let payload_converter = PayloadConverter::default();
-                let result_payloads = payload_converter
-                    .to_payloads(
-                        &SerializationContext::new(
-                            &SerializationContextData::Workflow,
-                            &payload_converter,
-                        ),
-                        &"update-result".to_owned(),
-                    )
-                    .unwrap();
+                let result_payloads =
+                    payload_converter
+                        .to_payloads(
+                            &SerializationContext::new(
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                                &payload_converter,
+                            ),
+                            &"update-result".to_owned(),
+                        )
+                        .unwrap();
                 Outcome {
                     value: Some(outcome::Value::Success(Payloads {
                         payloads: result_payloads,
@@ -4321,8 +4359,9 @@ mod tests {
                 .unwrap();
 
             let payload_converter = PayloadConverter::default();
-            let context =
-                SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let context = SerializationContext::new(&context_data, &payload_converter);
             let workflow_payloads = payload_converter
                 .to_payloads(&context, &"workflow-input".to_owned())
                 .unwrap();
@@ -4360,7 +4399,7 @@ mod tests {
                                     request_id,
                                     identity: "test-identity".to_owned(),
                                     workflow_id_conflict_policy:
-                                        WorkflowIdConflictPolicy::UseExisting as i32,
+                                        ProtoWorkflowIdConflictPolicy::UseExisting as i32,
                                     header: Some(start_header),
                                     priority: Some(Default::default()),
                                     ..Default::default()
@@ -4531,7 +4570,7 @@ mod tests {
             let workflow_input: String = client
                 .data_converter()
                 .from_payloads(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     start_request.input.clone().unwrap().payloads,
                 )
                 .await
@@ -4544,7 +4583,7 @@ mod tests {
             let update_input: String = client
                 .data_converter()
                 .from_payloads(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     update_request
                         .request
                         .clone()
@@ -4776,12 +4815,12 @@ mod tests {
         async fn list_workflows_exposes_typed_memo() {
             let data_converter = DataConverter::new(
                 PayloadConverter::default(),
-                DefaultFailureConverter,
+                DefaultFailureConverter::default(),
                 XorCodec,
             );
             let memo_payload = data_converter
                 .to_payload(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     &"memo-value".to_owned(),
                 )
                 .await
@@ -4816,7 +4855,7 @@ mod tests {
                 total_workflows: 1,
                 data_converter: DataConverter::new(
                     PayloadConverter::default(),
-                    DefaultFailureConverter,
+                    DefaultFailureConverter::default(),
                     FailingCodec,
                 ),
                 memo_payload: Some(Payload::default()),
