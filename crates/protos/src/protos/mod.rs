@@ -2028,11 +2028,11 @@ pub mod temporal {
                                 CommandType::ScheduleActivityTask
                             }
                             Attributes::StartTimerCommandAttributes(_) => CommandType::StartTimer,
-                            Attributes::SubscribeStreamCommandAttributes(_) => {
-                                CommandType::SubscribeStream
-                            }
                             Attributes::AppendStreamRecordsCommandAttributes(_) => {
                                 CommandType::AppendStreamRecords
+                            }
+                            Attributes::SubscribeStreamCommandAttributes(_) => {
+                                CommandType::SubscribeStream
                             }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
