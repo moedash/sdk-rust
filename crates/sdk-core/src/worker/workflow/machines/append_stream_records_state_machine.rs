@@ -116,8 +116,8 @@ impl WFMachinesAdapter for AppendStreamRecordsMachine {
         _my_command: Self::Command,
         _event_info: Option<EventInfo>,
     ) -> Result<Vec<MachineResponse>, Self::Error> {
-        Err(Self::Error::Nondeterminism(
-            "AppendStreamRecords does not use state machine commands".to_string(),
+        Err(fatal!(
+            "AppendStreamRecords does not use state machine commands"
         ))
     }
 }
