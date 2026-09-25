@@ -160,6 +160,15 @@ impl ManagedRun {
         self.waiting_on_local_work.local_activities.is_some()
     }
 
+    pub(super) fn retains_task_for_external_streams(&self) -> bool {
+        self.wft.is_some()
+            && (self.waiting_on_local_work.output_buffered
+                || matches!(
+                    self.external_stream_run_status(),
+                    ExternalStreamRunStatus::WftOpen
+                ))
+    }
+
     pub(super) fn have_seen_terminal_event(&self) -> bool {
         self.wfm.machines.have_seen_terminal_event
     }
@@ -1310,6 +1319,18 @@ impl ManagedRun {
             || park_retains
             || self.waiting_on_local_work.external_wait_set.retains_wft()
             || self.waiting_on_local_work.output_buffered;
+        // A registered wait can belong to a previous task whose input has since resumed lang.
+        // Only a current wait (or a query-only activation preserving that wait) justifies an
+        // output replacement. Otherwise an empty forced task can buffer the Activity or timer
+        // result that lang is actually waiting for until the task times out.
+        //
+        // Buffered output is not one of those stale waits. Staging the commit clears the flag, so
+        // it can only be set here by a `WorkflowOutputStreamBuffered` on this same completion, and
+        // the flush deadline it asks for fires into nothing once the task is gone.
+        let output_waits_need_replacement = stream_commands.quiescence.is_some()
+            || park_retains
+            || self.waiting_on_local_work.output_buffered
+            || (answering_a_query && self.waiting_on_local_work.external_wait_set.retains_wft());
         let query_refused_retention = stream_waits_still_pending
             && !boundary_closes_the_run
             && !has_server_bound_commands
@@ -1426,6 +1447,18 @@ impl ManagedRun {
             if !completion.activation_was_eviction && !self.am_broken {
                 self.wfm.apply_next_task_if_ready()?;
             }
+            // A cold replay can reach a wake already contained in this History page, without
+            // admitting another server task. Its reconstructed waits must receive that wake
+            // before this task is reported empty and the zero-sized cache evicts them again.
+            if !self.wfm.machines.replaying && self.apply_external_stream_wakes() {
+                self.waiting_on_local_work
+                    .external_wait_set
+                    .set_wft_open(true);
+                // Lang has finished this activation; only its completion bookkeeping remains.
+                // Queue now so prepare_complete_resp sees pending work rather than reporting
+                // this task before finish_activation makes the next activation deliverable.
+                self.queue_external_stream_resolve(true);
+            }
             let new_local_acts = self.wfm.drain_queued_local_activities();
             self.sink_la_requests(new_local_acts)?;
 
@@ -1506,7 +1539,7 @@ impl ManagedRun {
                         || completing_shutdown
                         || completing_output_capacity
                         || completing_output_latency
-                        || (output_commit_pending && stream_waits_still_pending),
+                        || (output_commit_pending && output_waits_need_replacement),
                 )))
             }
             Ok(Some((start_t, wft_timeout))) => {
@@ -2178,7 +2211,27 @@ impl ManagedRun {
     /// activation, and notifications arriving while an activation is outstanding accumulate for
     /// the next one. There is never more than one outstanding activation per run.
     fn maybe_issue_external_stream_resolve(&mut self) {
-        if self.activation.is_some() || self.wft.is_none() || self.am_broken {
+        if self.activation.is_some() {
+            return;
+        }
+        self.queue_external_stream_resolve(false);
+    }
+
+    /// Queues the job without asking whether an activation is outstanding.
+    ///
+    /// Two callers are legal: the readiness path once no activation is outstanding, and the
+    /// completion path of the outstanding activation, after `apply_next_task_if_ready` and before
+    /// `prepare_complete_resp` picks the pending jobs up. Lang has finished that activation, so
+    /// the job lands on the next one. From anywhere else the job would ride an activation lang is
+    /// still working on, which breaks the one-outstanding-activation rule this run relies on.
+    /// `completing_outstanding_activation` is the caller saying which of the two it is.
+    fn queue_external_stream_resolve(&mut self, completing_outstanding_activation: bool) {
+        // Violating this reorders activations rather than crashing, so a release build has to say
+        // so as well; `debug_assert!` alone would leave it silent everywhere it matters.
+        if completing_outstanding_activation != self.activation.is_some() {
+            dbg_panic!("external stream resolve queued outside the readiness and completion paths");
+        }
+        if self.wft.is_none() || self.am_broken {
             return;
         }
         let set = &mut self.waiting_on_local_work.external_wait_set;

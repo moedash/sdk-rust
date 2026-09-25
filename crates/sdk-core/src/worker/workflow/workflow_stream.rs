@@ -428,7 +428,14 @@ impl WFStream {
         // one was being delivered) count as not-yet-resolved too: they can schedule further LAs,
         // and the commands they produce are only flushed by the completion that finally answers
         // the WFT. Evicting first would strand those commands in the discarded machines.
-        if has_zero_sized_cache && !rh.waiting_on_local_activities() && !rh.more_pending_work() {
+        // A retained stream task is incomplete too. Evicting its quiescent activation would
+        // force a Shutdown boundary before asynchronous input prefetch can deliver readiness,
+        // then repeat on every cold replacement task. Evict after its normal durable boundary.
+        if has_zero_sized_cache
+            && !rh.waiting_on_local_activities()
+            && !rh.retains_task_for_external_streams()
+            && !rh.more_pending_work()
+        {
             acts.extend(self.request_eviction_of_lru_run().into_run_update_resp())
         }
         acts

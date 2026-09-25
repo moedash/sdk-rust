@@ -136,12 +136,7 @@ interface model {
   ///   typescript="common.WorkflowIdReusePolicy"
   ///   dotnet="Temporalio.Api.Enums.V1.WorkflowIdReusePolicy"
   ///   typescript-import="@temporalio/common"
-  enum workflow-id-reuse-policy {
-    allow-duplicate,
-    allow-duplicate-failed-only,
-    reject-duplicate,
-    terminate-if-running,
-  }
+  type workflow-id-reuse-policy = placeholder;
 
   /// @nexus.proto "temporal.api.enums.v1.WorkflowIdConflictPolicy" typescript-import="@temporalio/proto"
   /// @nexus.type
@@ -149,11 +144,7 @@ interface model {
   ///   typescript="common.WorkflowIdConflictPolicy"
   ///   dotnet="Temporalio.Api.Enums.V1.WorkflowIdConflictPolicy"
   ///   typescript-import="@temporalio/common"
-  enum workflow-id-conflict-policy {
-    fail,
-    use-existing,
-    terminate-existing,
-  }
+  type workflow-id-conflict-policy = placeholder;
 
   /// @nexus.proto "temporal.api.sdk.v1.UserMetadata" typescript-import="@temporalio/proto"
   /// @nexus.flatten-in-api

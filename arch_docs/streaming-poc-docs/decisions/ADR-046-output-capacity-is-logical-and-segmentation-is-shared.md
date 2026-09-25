@@ -22,6 +22,13 @@ per-topic record-count vector to each segment, including empty segments. Replay 
 capacity and latency policy, validates the recorded logical manifests, and performs the live number
 of event-loop drains once across both directions.
 
+An input schedule also retains activations with no input observation. If the first subscription
+is created late in a task, earlier empty activations in that task precede its first observed
+segment. This keeps the two schedules aligned when an Activity, timer, or another stream causes
+an intervening activation. A prerelease combined marker with different input and output segment
+counts is rejected: the positions of omitted empty input segments cannot generally be inferred
+from those counts, and dropping output segments would weaken replay verification.
+
 When another publish would exceed the record or logical-byte limit, `publish()` waits, the current
 batch is staged with an output-capacity terminal, and Core forces a replacement Workflow Task. A
 single oversized record or manifest is rejected before unsafe external I/O or marker growth.

@@ -24,6 +24,7 @@ import "temporal/api/enums/v1/activity.proto";
 import "temporal/api/enums/v1/nexus.proto";
 import "temporal/api/activity/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/history/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/api/command/v1/message.proto";
@@ -383,6 +384,10 @@ message PollWorkflowTaskQueueResponse {
     //   3. If every group has some pending polls, assign the next poll to a group randomly
     //     according to the weights.
     temporal.api.taskqueue.v1.PollerGroupsInfo poller_groups_info = 19;
+
+    // Stream data attached to this task. Delivered out of band so the payloads
+    // never enter History; only the offset ranges are recorded there.
+    repeated temporal.api.stream.v1.StreamSlice stream_slices = 20;
 }
 
 message RespondWorkflowTaskCompletedRequest {
