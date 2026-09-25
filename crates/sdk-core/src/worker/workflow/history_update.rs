@@ -745,6 +745,10 @@ fn find_end_index_of_next_wft_seq(
         }
 
         if e.event_type() == EventType::WorkflowTaskStarted {
+            // Scoped to this started event. What its own completion consumed says nothing
+            // about the events the scan already passed, so it must not join the flags that
+            // carry across them.
+            let mut completion_consumed_a_range = false;
             wft_started_event_id_to_index.push((e.event_id, ix));
             if let Some(next_event) = events.get(ix + 1) {
                 let next_event_type = next_event.event_type();
@@ -771,11 +775,11 @@ fn find_end_index_of_next_wft_seq(
                         next_event.attributes
                         && !attrs.consumed_stream_ranges.is_empty()
                     {
-                        saw_command = true;
-                        saw_command_or_started = true;
+                        completion_consumed_a_range = true;
                     }
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
+                            && !completion_consumed_a_range
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
                         {
                             // If we've never seen an interesting event and the next two events are
@@ -817,7 +821,10 @@ fn find_end_index_of_next_wft_seq(
                             }
                             return NextWFTSeqEndIndex::Complete(ix);
                         }
-                    } else if !has_last_wft && !saw_command_or_started {
+                    } else if !has_last_wft
+                        && !saw_command_or_started
+                        && !completion_consumed_a_range
+                    {
                         // Don't have enough events to look ahead of the WorkflowTaskCompleted. Need
                         // to fetch more.
                         continue;
@@ -828,7 +835,7 @@ fn find_end_index_of_next_wft_seq(
                 // more.
                 continue;
             }
-            if saw_command_or_started {
+            if saw_command_or_started || completion_consumed_a_range {
                 return NextWFTSeqEndIndex::Complete(ix);
             }
         }
