@@ -87,6 +87,7 @@ use temporalio_common::{
             protocol::v1::Message as ProtocolMessage,
             query::v1::WorkflowQuery,
             sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
+            stream::v1::StreamSlice,
             taskqueue::v1::StickyExecutionAttributes,
             workflowservice::v1::{PollActivityTaskQueueResponse, get_system_info_response},
         },
@@ -1017,6 +1018,7 @@ struct PreparedWFT {
     query_requests: Vec<QueryWorkflow>,
     update: HistoryUpdate,
     messages: Vec<IncomingProtocolMessage>,
+    stream_slices: Vec<StreamSlice>,
 }
 
 impl PreparedWFT {
@@ -1669,6 +1671,13 @@ pub(crate) enum WFMachinesError {
     Nondeterminism(String),
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
+    /// History records that a task consumed stream records and the response that carried the
+    /// task brought none of them, so this worker cannot replay the run. Not the workflow's
+    /// fault: the records only travel with the task, and a worker handed a sticky task for a run
+    /// it no longer holds has no way to fetch them. Treated like a failed history fetch, so a
+    /// legacy query goes unanswered and the server retries it where the records travel.
+    #[error("Workflow task cannot be replayed on this worker: {0}")]
+    MissingRecords(String),
 }
 
 /// Helper macro to create Nondeterminism errors with automatic assertion
@@ -1748,6 +1757,7 @@ impl WFMachinesError {
         match self {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
             WFMachinesError::Fatal(_) => EvictionReason::Fatal,
+            WFMachinesError::MissingRecords(_) => EvictionReason::PaginationOrHistoryFetch,
         }
     }
 

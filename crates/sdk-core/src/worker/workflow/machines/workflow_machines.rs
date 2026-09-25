@@ -72,6 +72,7 @@ use temporalio_common::{
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
+            stream::v1::{StreamRange, StreamSlice},
         },
     },
     worker::WorkerDeploymentVersion,
@@ -88,6 +89,29 @@ pub(crate) struct WorkflowMachines {
     /// kept because the lang side polls & completes for every workflow task, but we do not need
     /// to poll the server that often during replay.
     last_history_from_server: HistoryUpdate,
+    /// Stream ranges an earlier task consumed, keyed by the WorkflowTaskCompleted
+    /// event that recorded each one. Only offsets are in History, so replay is
+    /// served by the server reading the stream again and sending the bytes back
+    /// tagged with that event.
+    stream_slices_by_event: HashMap<i64, Vec<StreamSlice>>,
+    /// Ranges for the task about to run, which no event records yet.
+    current_stream_slices: Vec<StreamSlice>,
+    /// Highest completion event whose recorded range was delivered by looking
+    /// ahead, or 0.
+    ///
+    /// A task's consumed range is recorded on the completion that closes it, so
+    /// it is found one batch early. That same completion is then seen again as
+    /// an ordinary event in the next batch, where its slices are already spent
+    /// and must not be asked for twice.
+    stream_slices_lookahead_through: i64,
+    /// Workflow Task Started id of the last task this instance ran live, or 0.
+    ///
+    /// A task that ran here was handed its stream records as it ran, and the
+    /// completion event recording what it consumed arrives in the next task's
+    /// history. That event needs no bytes from the server, and `replaying` does
+    /// not say so: it is true for a cache hit as well, because the history
+    /// begins after an earlier task.
+    stream_slices_delivered_through: i64,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
@@ -268,7 +292,7 @@ impl WorkflowMachines {
             basics.sdk_version.to_owned(),
         );
         // Peek ahead to determine used flags in the first WFT.
-        if let Some(attrs) = basics.history.peek_next_wft_completed(0) {
+        if let Some((_, attrs)) = basics.history.peek_next_wft_completed(0) {
             observed_internal_flags.add_from_complete(attrs);
         };
         Self {
@@ -278,6 +302,10 @@ impl WorkflowMachines {
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
             drive_me: driven_wf,
+            stream_slices_by_event: Default::default(),
+            current_stream_slices: Default::default(),
+            stream_slices_delivered_through: 0,
+            stream_slices_lookahead_through: 0,
             replaying,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -327,11 +355,31 @@ impl WorkflowMachines {
         &mut self,
         update: HistoryUpdate,
         protocol_messages: Vec<IncomingProtocolMessage>,
+        stream_slices: Vec<StreamSlice>,
     ) -> Result<()> {
         if !self.protocol_msgs.is_empty() {
             dbg_panic!("There are unprocessed protocol messages while receiving new work");
         }
         self.protocol_msgs = protocol_messages;
+        // An untagged slice belongs to the task about to run; a tagged one is
+        // re-supplying a range some earlier task already consumed.
+        self.current_stream_slices.clear();
+        self.stream_slices_by_event.clear();
+        for slice in stream_slices {
+            if slice.workflow_task_completed_event_id == 0 {
+                self.current_stream_slices.push(slice);
+            } else {
+                self.stream_slices_by_event
+                    .entry(slice.workflow_task_completed_event_id)
+                    .or_default()
+                    .push(slice);
+            }
+        }
+        // The order ranges arrive in is something the workflow can branch on, and
+        // the server's order is whatever its iteration happened to produce. Fixing
+        // it here is what makes it the same live and on replay.
+        self.current_stream_slices
+            .sort_by(|a, b| stream_order(&a.stream_id, a.from_offset, &b.stream_id, b.from_offset));
         self.new_history_from_server(update)?;
         Ok(())
     }
@@ -619,19 +667,40 @@ impl WorkflowMachines {
                 }
             }};
         }
+        let mut replayed_slice_events: Vec<(i64, Vec<StreamRange>)> = vec![];
+        // Kept apart from the in-batch ones. An in-batch event whose bytes are
+        // missing is a real inconsistency; a looked-ahead one may simply not
+        // have been sent yet, and demanding it would turn an early delivery
+        // into a new way to fail.
+        let mut lookahead_slice_event: Option<(i64, Vec<StreamRange>)> = None;
         let mut peeked_events = events.iter().peekable();
         while let Some(event) = peeked_events.next() {
             if let Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(ref wtc)) =
                 event.attributes
             {
                 apply_wft_complete_data!(self, wtc);
+                // The event records which offsets that task consumed; the server
+                // sends the bytes back separately, keyed by this event.
+                if !wtc.consumed_stream_ranges.is_empty() {
+                    replayed_slice_events
+                        .push((event.event_id, wtc.consumed_stream_ranges.clone()));
+                }
             }
             if peeked_events.peek().is_none()
-                && let Some(wtc) = self
+                && let Some((wtc_id, wtc)) = self
                     .last_history_from_server
                     .peek_next_wft_completed(event.event_id)
             {
                 apply_wft_complete_data!(self, wtc);
+                // The range this batch's task consumed is recorded on the
+                // completion that closes it, which lands in the *next* batch.
+                // Collecting it only when it appears would hand the workflow
+                // its input one activation after the commands that input
+                // caused, so a read-then-publish task replays with nothing to
+                // decide from and reissues no command. Look ahead for it here.
+                if !wtc.consumed_stream_ranges.is_empty() {
+                    lookahead_slice_event = Some((wtc_id, wtc.consumed_stream_ranges.clone()));
+                }
             }
         }
 
@@ -824,6 +893,91 @@ impl WorkflowMachines {
                     self.handle_protocol_message(pm)?;
                 }
             }
+        }
+
+        // Ranges an earlier task consumed, in the order those tasks ran, so a
+        // replaying workflow observes them exactly as it did the first time.
+        //
+        // Only while replaying. A cache hit is handed the previous task's
+        // completion in its history as well, and that event carries the range
+        // that task consumed, but that task ran here and its messages were
+        // delivered live at the time. There is nothing to re-supply, the server
+        // sends nothing, and re-supplying would hand the workflow the same
+        // messages twice.
+        replayed_slice_events.sort_unstable_by_key(|(event_id, _)| *event_id);
+        for (event_id, cursors) in replayed_slice_events {
+            // Delivered live to this instance when the task ran, so there is
+            // nothing to re-supply and the server sent nothing.
+            if event_id <= self.stream_slices_delivered_through + 1 {
+                self.stream_slices_by_event.remove(&event_id);
+                continue;
+            }
+            // Already handed over when this task was looked ahead to.
+            if event_id <= self.stream_slices_lookahead_through {
+                self.stream_slices_by_event.remove(&event_id);
+                continue;
+            }
+            let slices = self.stream_slices_by_event.remove(&event_id);
+            if slices.is_none()
+                && let Some(cursor) = cursors.iter().find(|c| c.from_offset < c.to_offset)
+            {
+                // History says a task consumed a range and the server sent no
+                // bytes for it. Replaying with less data than the original run
+                // had produces different commands, and the mismatch would
+                // surface later as an unrelated nondeterminism error. Reaching
+                // this from here also means the lookahead did not find the
+                // completion, so the range was due one activation before this.
+                return Err(WFMachinesError::MissingRecords(format!(
+                    "Event {event_id} records that stream {} was consumed from offset {} to {}, \
+                     but the server sent no records for it. The workflow was owed that range \
+                     one activation earlier.",
+                    cursor.stream_id, cursor.from_offset, cursor.to_offset
+                )));
+            }
+            for job in resupplied_deliveries(event_id, cursors, slices.unwrap_or_default())? {
+                self.drive_me.send_job(job);
+            }
+        }
+        // The task about to be replayed, whose range is only visible by looking
+        // ahead to the completion that closes it.
+        if let Some((event_id, cursors)) = lookahead_slice_event
+            && event_id > self.stream_slices_delivered_through + 1
+            && event_id > self.stream_slices_lookahead_through
+        {
+            let slices = self.stream_slices_by_event.remove(&event_id);
+            if slices.is_none()
+                && let Some(cursor) = cursors.iter().find(|c| c.from_offset < c.to_offset)
+            {
+                // The bytes only ever travel on the response that carried this
+                // task, so absent bytes for a range with content mean this
+                // worker was handed a task it cannot replay: a sticky task for a
+                // run it no longer holds, whose history it fetched itself.
+                // Failing here, before the workflow runs on less input than it
+                // had, keeps a legacy query from being answered from the wrong
+                // state, and the server's retry on the normal task queue
+                // carries the records for both task kinds.
+                return Err(WFMachinesError::MissingRecords(format!(
+                    "Event {event_id} records that stream {} was consumed from offset {} to {}, \
+                     but the server sent no records for it. A task dispatched with a partial \
+                     history to a worker that no longer holds the run cannot replay it; the \
+                     retry on the normal task queue carries the records.",
+                    cursor.stream_id, cursor.from_offset, cursor.to_offset
+                )));
+            }
+            for job in resupplied_deliveries(event_id, cursors, slices.unwrap_or_default())? {
+                self.drive_me.send_job(job);
+            }
+            self.stream_slices_lookahead_through = event_id;
+        }
+        // Then the range for the task about to run, which is only meaningful
+        // once we have caught up to it.
+        if !self.replaying {
+            for slice in std::mem::take(&mut self.current_stream_slices) {
+                self.drive_me.send_job(deliver_stream_records_job(slice));
+            }
+            // This task is running here, so whatever it consumes is already in
+            // hand and its completion event will not need re-supplying.
+            self.stream_slices_delivered_through = self.next_started_event_id;
         }
 
         // Only record replay latency if we actually did replay work. This avoids recording
@@ -1838,4 +1992,93 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+/// Turn a slice the server supplied into the job lang sees.
+fn deliver_stream_records_job(slice: StreamSlice) -> OutgoingJob {
+    workflow_activation::DeliverStreamRecords {
+        stream_id: slice.stream_id,
+        from_offset: slice.from_offset,
+        to_offset: slice.to_offset,
+        records: slice.records,
+    }
+    .into()
+}
+
+/// The one order ranges are handed to a workflow in, live and on replay.
+fn stream_order(
+    stream_a: &str,
+    from_offset_a: i64,
+    stream_b: &str,
+    from_offset_b: i64,
+) -> std::cmp::Ordering {
+    (stream_a, from_offset_a).cmp(&(stream_b, from_offset_b))
+}
+
+/// Pair the ranges a completion event recorded with the slices the server sent
+/// back for it, in the order the workflow is handed them.
+///
+/// The event is the record of what the task saw, so the slices have to match
+/// it rather than the other way round. A range that observed nothing needs no
+/// bytes and is rebuilt from the cursor alone; a range with content has to
+/// arrive, and what arrives has to cover exactly the recorded offsets. Anything
+/// else would replay the task with different input than it ran on.
+fn resupplied_deliveries(
+    event_id: i64,
+    mut cursors: Vec<StreamRange>,
+    mut slices: Vec<StreamSlice>,
+) -> Result<Vec<OutgoingJob>> {
+    cursors.sort_by(|a, b| stream_order(&a.stream_id, a.from_offset, &b.stream_id, b.from_offset));
+    let mut jobs = Vec::with_capacity(cursors.len());
+    for cursor in cursors {
+        let slice = slices
+            .iter()
+            .position(|s| s.stream_id == cursor.stream_id)
+            .map(|ix| slices.swap_remove(ix));
+        let slice = match slice {
+            Some(slice)
+                if slice.from_offset == cursor.from_offset
+                    && slice.to_offset == cursor.to_offset =>
+            {
+                slice
+            }
+            Some(slice) => {
+                return Err(nondeterminism!(
+                    "Event {event_id} records that stream {} was consumed from offset {} to {}, \
+                     but the server sent offsets {} to {} for it",
+                    cursor.stream_id,
+                    cursor.from_offset,
+                    cursor.to_offset,
+                    slice.from_offset,
+                    slice.to_offset
+                ));
+            }
+            None if cursor.from_offset == cursor.to_offset => StreamSlice {
+                stream_id: cursor.stream_id,
+                from_offset: cursor.from_offset,
+                to_offset: cursor.to_offset,
+                ..Default::default()
+            },
+            None => {
+                return Err(nondeterminism!(
+                    "Event {event_id} records that stream {} was consumed from offset {} to {}, \
+                     but the server sent no messages for it",
+                    cursor.stream_id,
+                    cursor.from_offset,
+                    cursor.to_offset
+                ));
+            }
+        };
+        jobs.push(deliver_stream_records_job(slice));
+    }
+    if let Some(extra) = slices.first() {
+        return Err(nondeterminism!(
+            "The server sent stream {} from offset {} to {} for event {event_id}, which records \
+             no such range",
+            extra.stream_id,
+            extra.from_offset,
+            extra.to_offset
+        ));
+    }
+    Ok(jobs)
 }
