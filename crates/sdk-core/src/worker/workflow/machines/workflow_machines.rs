@@ -50,7 +50,7 @@ use siphasher::sip::SipHasher13;
 use slotmap::{SlotMap, SparseSecondaryMap};
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     convert::TryInto,
     hash::{Hash, Hasher},
     iter::Peekable,
@@ -168,12 +168,6 @@ pub(crate) struct WorkflowMachines {
     /// Contains extra local-activity related data
     local_activity_data: LocalActivityData,
 
-    /// Streams this run has already issued a subscribe command for. A repeat
-    /// subscription registers nothing and is recorded at wherever the cursor has
-    /// reached, so only the first one can be held to the offset it asked for. A
-    /// cursor put on this run out of band through the stream service leaves no
-    /// event, so there is no seeing that one from here.
-    subscribed_stream_ids: HashSet<String>,
     /// What the server resolved this run's unnamed appends to, learned from the
     /// first one it recorded and shared with the machines that follow.
     default_stream_id: DefaultStreamIdRef,
@@ -317,7 +311,6 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
-            subscribed_stream_ids: Default::default(),
             default_stream_id: Default::default(),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
@@ -1557,10 +1550,8 @@ impl WorkflowMachines {
                     // Never resolves: the event it produces records the
                     // subscription and hands nothing back to the workflow. The
                     // ranges arrive later as their own activation jobs.
-                    let first_for_stream =
-                        self.subscribed_stream_ids.insert(attrs.stream_id.clone());
                     self.add_cmd_to_wf_task(
-                        subscribe_stream(attrs, first_for_stream),
+                        subscribe_stream(attrs),
                         annotations,
                         CommandIdKind::NeverResolves,
                     );

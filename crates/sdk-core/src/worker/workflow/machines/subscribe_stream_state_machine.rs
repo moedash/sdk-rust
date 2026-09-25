@@ -25,33 +25,28 @@ fsm! {
         shared on_command_recorded) --> Done;
 }
 
-/// What the command claimed, kept so the recorded event can be held against it.
+/// The stream the command named, kept so the recorded event can be held against it.
 ///
-/// The offset is only kept when it is one the server echoes back rather than one
-/// it works out for itself. A negative offset asks the server where the stream
-/// stands, and a repeat subscription is recorded at wherever the cursor has
-/// already reached, so in both cases the recorded value is the server's answer
-/// rather than what the command said.
+/// The offset is not kept. Comparing it would only be sound for the run's first
+/// subscribe to a stream, since the server records a later one at wherever the
+/// cursor has already reached, and which one is first cannot be told from here:
+/// a subscription made through the stream service leaves no event at all. A
+/// check that can fire on a run that did nothing wrong costs more than the drift
+/// it would catch.
 #[derive(Default, Clone)]
 pub(super) struct SharedState {
     stream_id: String,
-    start_offset: Option<i64>,
 }
 
 /// Subscribe this workflow to a stream. The command carries only the stream id
 /// and a start offset; the server resolves the addressing, because a workflow
 /// cannot look it up without doing I/O and a value it carried would be a
 /// reading rather than a fact.
-pub(super) fn subscribe_stream(
-    lang_cmd: SubscribeStream,
-    first_for_stream: bool,
-) -> NewMachineWithCommand {
+pub(super) fn subscribe_stream(lang_cmd: SubscribeStream) -> NewMachineWithCommand {
     let sm = SubscribeStreamMachine::from_parts(
         Created {}.into(),
         SharedState {
             stream_id: lang_cmd.stream_id.clone(),
-            start_offset: (first_for_stream && lang_cmd.start_offset >= 0)
-                .then_some(lang_cmd.start_offset),
         },
     );
     NewMachineWithCommand {
@@ -75,26 +70,16 @@ impl CommandIssued {
         dat: &mut SharedState,
         attrs: WorkflowStreamSubscribedEventAttributes,
     ) -> SubscribeStreamMachineTransition<Done> {
-        if dat.stream_id != attrs.stream_id {
-            return TransitionResult::Err(nondeterminism!(
+        if dat.stream_id == attrs.stream_id {
+            TransitionResult::default()
+        } else {
+            TransitionResult::Err(nondeterminism!(
                 "Recorded subscription to stream {:?} does not match the reissued subscription \
                  to stream {:?}",
                 attrs.stream_id,
                 dat.stream_id
-            ));
+            ))
         }
-        if let Some(asked_for) = dat.start_offset
-            && asked_for != attrs.start_offset
-        {
-            return TransitionResult::Err(nondeterminism!(
-                "Recorded subscription to stream {:?} starts at offset {}, and the reissued \
-                 subscription asked for offset {}",
-                attrs.stream_id,
-                attrs.start_offset,
-                asked_for
-            ));
-        }
-        TransitionResult::default()
     }
 }
 
