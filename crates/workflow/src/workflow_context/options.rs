@@ -1,11 +1,13 @@
 use std::{collections::HashMap, time::Duration};
 
 use crate::{MemoValues, WorkflowCancellationToken, runtime::types::ContinueAsNewRequest};
+#[cfg(feature = "experimental")]
+use temporalio_common_wasm::protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior;
 use temporalio_common_wasm::{
     ActivityCloseTimeouts, Priority, RetryPolicy,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData,
+        SerializationContextData, WorkflowSerializationContext,
     },
     protos::{
         coresdk::{
@@ -14,26 +16,31 @@ use temporalio_common_wasm::{
                 ParentClosePolicy as ProtoParentClosePolicy,
             },
             common::VersioningIntent as ProtoVersioningIntent,
-            nexus::NexusOperationCancellationType as ProtoNexusOperationCancellationType,
             workflow_commands::{
                 ActivityCancellationType as ProtoActivityCancellationType,
                 ContinueAsNewWorkflowExecution, ScheduleActivity, ScheduleLocalActivity,
-                ScheduleNexusOperation, SignalExternalWorkflowExecution,
-                StartChildWorkflowExecution, StartTimer, WorkflowCommand,
-                signal_external_workflow_execution, workflow_command,
+                SignalExternalWorkflowExecution, StartChildWorkflowExecution, StartTimer,
+                WorkflowCommand, signal_external_workflow_execution, workflow_command,
             },
         },
         temporal::api::{
             common::v1::Payload,
-            enums::v1::{
-                ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
-                WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
-            },
+            enums::v1::WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
             sdk::v1::{EventGroupMarker, UserMetadata},
         },
     },
     search_attributes::SearchAttributes,
 };
+
+#[cfg(feature = "experimental")]
+mod continue_as_new_versioning;
+#[cfg(feature = "experimental")]
+mod nexus;
+
+#[cfg(feature = "experimental")]
+pub use continue_as_new_versioning::ContinueAsNewVersioningBehavior;
+#[cfg(feature = "experimental")]
+pub use nexus::{NexusOperationCancellationType, NexusOperationOptions};
 
 /// Controls when activity cancellation is reported back to a workflow.
 #[derive(
@@ -232,52 +239,6 @@ impl From<ProtoVersioningIntent> for VersioningIntent {
     }
 }
 
-/// Controls when Nexus operation cancellation is reported to a workflow.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
-)]
-#[non_exhaustive]
-pub enum NexusOperationCancellationType {
-    /// Wait until cancellation has completed.
-    #[default]
-    WaitCancellationCompleted,
-    /// Do not request cancellation.
-    Abandon,
-    /// Request cancellation and report it immediately.
-    TryCancel,
-    /// Wait until the cancellation request is acknowledged.
-    WaitCancellationRequested,
-}
-
-impl From<NexusOperationCancellationType> for ProtoNexusOperationCancellationType {
-    fn from(value: NexusOperationCancellationType) -> Self {
-        match value {
-            NexusOperationCancellationType::WaitCancellationCompleted => {
-                Self::WaitCancellationCompleted
-            }
-            NexusOperationCancellationType::Abandon => Self::Abandon,
-            NexusOperationCancellationType::TryCancel => Self::TryCancel,
-            NexusOperationCancellationType::WaitCancellationRequested => {
-                Self::WaitCancellationRequested
-            }
-        }
-    }
-}
-
-impl From<ProtoNexusOperationCancellationType> for NexusOperationCancellationType {
-    fn from(value: ProtoNexusOperationCancellationType) -> Self {
-        match value {
-            ProtoNexusOperationCancellationType::WaitCancellationCompleted => {
-                Self::WaitCancellationCompleted
-            }
-            ProtoNexusOperationCancellationType::Abandon => Self::Abandon,
-            ProtoNexusOperationCancellationType::TryCancel => Self::TryCancel,
-            ProtoNexusOperationCancellationType::WaitCancellationRequested => {
-                Self::WaitCancellationRequested
-            }
-        }
-    }
-}
 /// Options for scheduling an activity
 #[derive(Debug, bon::Builder, Clone)]
 #[non_exhaustive]
@@ -325,9 +286,9 @@ pub struct ActivityOptions {
     pub do_not_eagerly_execute: bool,
     /// Event group markers to attach to the resulting `ScheduleActivityTask` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
+    #[cfg(feature = "experimental")]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -366,6 +327,10 @@ impl ActivityOptions {
         args: Vec<Payload>,
         headers: HashMap<String, Payload>,
     ) -> WorkflowCommand {
+        #[cfg(feature = "experimental")]
+        let event_group_markers = self.event_group_markers;
+        #[cfg(not(feature = "experimental"))]
+        let event_group_markers = Vec::new();
         command_with_metadata(
             workflow_command::Variant::ScheduleActivity(ScheduleActivity {
                 seq,
@@ -397,7 +362,7 @@ impl ActivityOptions {
             }),
             self.summary,
             None,
-            self.event_group_markers,
+            event_group_markers,
         )
     }
 }
@@ -431,7 +396,7 @@ pub struct LocalActivityOptions {
     /// Enabling this makes the arguments visible in Workflow history and increases its size.
     /// Defaults to `false`.
     #[builder(default)]
-    pub include_arguments_into_marker: bool,
+    pub include_arguments_in_marker: bool,
     /// Cancellation token for this local activity. `None` inherits workflow cancellation.
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Indicates how long the caller is willing to wait for local activity completion. Limits how
@@ -453,9 +418,9 @@ pub struct LocalActivityOptions {
     pub summary: Option<String>,
     /// Event group markers to attach to the resulting `RecordMarker` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
+    #[cfg(feature = "experimental")]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -478,6 +443,10 @@ impl LocalActivityOptions {
         // activity timeouts are normalized before the command is emitted.
         self.schedule_to_close_timeout
             .get_or_insert(Duration::from_secs(100));
+        #[cfg(feature = "experimental")]
+        let event_group_markers = self.event_group_markers;
+        #[cfg(not(feature = "experimental"))]
+        let event_group_markers = Vec::new();
         command_with_metadata(
             workflow_command::Variant::ScheduleLocalActivity(ScheduleLocalActivity {
                 seq,
@@ -492,7 +461,7 @@ impl LocalActivityOptions {
                     .timer_backoff_threshold
                     .and_then(|duration| duration.try_into().ok()),
                 cancellation_type: ProtoActivityCancellationType::from(self.cancel_type).into(),
-                include_arguments_into_marker: self.include_arguments_into_marker,
+                include_arguments_in_marker: self.include_arguments_in_marker,
                 schedule_to_close_timeout: self
                     .schedule_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
@@ -505,7 +474,7 @@ impl LocalActivityOptions {
             }),
             self.summary,
             None,
-            self.event_group_markers,
+            event_group_markers,
         )
     }
 }
@@ -543,15 +512,18 @@ pub struct ChildWorkflowOptions {
     pub task_timeout: Option<Duration>,
     /// Optionally set a cron schedule for the workflow
     pub cron_schedule: Option<String>,
+    /// Optionally set a retry policy for the child workflow. If unset, the child workflow is not
+    /// retried by the server.
+    pub retry_policy: Option<RetryPolicy>,
     /// Additional search attributes to set on the child workflow.
     pub search_attributes: Option<SearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
     /// Event group markers to attach to the resulting `StartChildWorkflowExecution` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
+    #[cfg(feature = "experimental")]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -572,6 +544,10 @@ impl ChildWorkflowOptions {
         headers: HashMap<String, Payload>,
         workflow_id: String,
     ) -> WorkflowCommand {
+        #[cfg(feature = "experimental")]
+        let event_group_markers = self.event_group_markers;
+        #[cfg(not(feature = "experimental"))]
+        let event_group_markers = Vec::new();
         command_with_metadata(
             workflow_command::Variant::StartChildWorkflowExecution(StartChildWorkflowExecution {
                 seq,
@@ -600,13 +576,14 @@ impl ChildWorkflowOptions {
                     .task_timeout
                     .and_then(|duration| duration.try_into().ok()),
                 cron_schedule: self.cron_schedule.unwrap_or_default(),
+                retry_policy: self.retry_policy.map(Into::into),
                 search_attributes: self.search_attributes.map(|t| t.into_proto()),
                 priority: self.priority.map(Into::into),
                 ..Default::default()
             }),
             self.static_summary,
             self.static_details,
-            self.event_group_markers,
+            event_group_markers,
         )
     }
 }
@@ -624,9 +601,9 @@ pub struct TimerOptions {
     pub summary: Option<String>,
     /// Event group markers to attach to the resulting `StartTimer` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
+    #[cfg(feature = "experimental")]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -648,6 +625,10 @@ impl From<Duration> for TimerOptions {
 
 impl TimerOptions {
     pub(crate) fn into_command(self, seq: u32) -> WorkflowCommand {
+        #[cfg(feature = "experimental")]
+        let event_group_markers = self.event_group_markers;
+        #[cfg(not(feature = "experimental"))]
+        let event_group_markers = Vec::new();
         command_with_metadata(
             workflow_command::Variant::StartTimer(StartTimer {
                 seq,
@@ -659,7 +640,7 @@ impl TimerOptions {
             }),
             self.summary,
             None,
-            self.event_group_markers,
+            event_group_markers,
         )
     }
 }
@@ -682,9 +663,9 @@ pub struct SignalWorkflowOptions {
     pub summary: Option<String>,
     /// Event group markers to attach to the resulting `SignalExternalWorkflowExecution` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
+    #[cfg(feature = "experimental")]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -698,6 +679,10 @@ impl SignalWorkflowOptions {
         headers: HashMap<String, Payload>,
         target: signal_external_workflow_execution::Target,
     ) -> WorkflowCommand {
+        #[cfg(feature = "experimental")]
+        let event_group_markers = self.event_group_markers;
+        #[cfg(not(feature = "experimental"))]
+        let event_group_markers = Vec::new();
         command_with_metadata(
             workflow_command::Variant::SignalExternalWorkflowExecution(
                 SignalExternalWorkflowExecution {
@@ -710,128 +695,8 @@ impl SignalWorkflowOptions {
             ),
             self.summary,
             None,
-            self.event_group_markers,
+            event_group_markers,
         )
-    }
-}
-
-/// Options for Nexus Operations
-#[derive(Debug, Clone, bon::Builder)]
-#[builder(on(String, into))]
-#[non_exhaustive]
-pub struct NexusOperationOptions {
-    /// Endpoint name, must exist in the endpoint registry or this command will fail.
-    pub endpoint: String,
-    /// Service name.
-    pub service: String,
-    /// Operation name.
-    pub operation: String,
-    /// Input for the operation. The server converts this into Nexus request content and the
-    /// appropriate content headers internally when sending the StartOperation request. On the
-    /// handler side, if it is also backed by Temporal, the content is transformed back to the
-    /// original Payload sent in this command.
-    pub input: Option<Payload>,
-    /// Schedule-to-close timeout for this operation.
-    /// Indicates how long the caller is willing to wait for operation completion.
-    /// Calls are retried internally by the server.
-    pub schedule_to_close_timeout: Option<Duration>,
-    /// Header to attach to the Nexus request.
-    /// Users are responsible for encrypting sensitive data in this header as it is stored in
-    /// workflow history and transmitted to external services as-is. This is useful for propagating
-    /// tracing information. Note these headers are not the same as Temporal headers on internal
-    /// activities and child workflows, these are transmitted to Nexus operations that may be
-    /// external and are not traditional payloads.
-    #[builder(default)]
-    pub nexus_header: HashMap<String, String>,
-    /// Cancellation type for the operation
-    pub cancellation_type: Option<NexusOperationCancellationType>,
-    /// Cancellation token for this operation. `None` inherits workflow cancellation.
-    pub cancellation_token: Option<WorkflowCancellationToken>,
-    /// Schedule-to-start timeout for this operation.
-    /// Indicates how long the caller is willing to wait for the operation to be started (or completed if synchronous)
-    /// by the handler. If the operation is not started within this timeout, it will fail with
-    /// TIMEOUT_TYPE_SCHEDULE_TO_START.
-    /// If not set or zero, no schedule-to-start timeout is enforced.
-    pub schedule_to_start_timeout: Option<Duration>,
-    /// Start-to-close timeout for this operation.
-    /// Indicates how long the caller is willing to wait for an asynchronous operation to complete after it has been
-    /// started. If the operation does not complete within this timeout after starting, it will fail with
-    /// TIMEOUT_TYPE_START_TO_CLOSE.
-    /// Only applies to asynchronous operations. Synchronous operations ignore this timeout.
-    /// If not set or zero, no start-to-close timeout is enforced.
-    pub start_to_close_timeout: Option<Duration>,
-}
-
-impl NexusOperationOptions {
-    pub(crate) fn into_command(self, seq: u32) -> WorkflowCommand {
-        workflow_command::Variant::ScheduleNexusOperation(ScheduleNexusOperation {
-            seq,
-            endpoint: self.endpoint,
-            service: self.service,
-            operation: self.operation,
-            input: self.input,
-            schedule_to_close_timeout: self
-                .schedule_to_close_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            schedule_to_start_timeout: self
-                .schedule_to_start_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            start_to_close_timeout: self
-                .start_to_close_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            nexus_header: self.nexus_header,
-            cancellation_type: ProtoNexusOperationCancellationType::from(
-                self.cancellation_type
-                    .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted),
-            )
-            .into(),
-        })
-        .into()
-    }
-}
-
-/// Versioning behavior to use for the first workflow task of a new continue-as-new run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[non_exhaustive]
-pub enum ContinueAsNewVersioningBehavior {
-    /// No initial versioning behavior was specified.
-    #[default]
-    Unspecified,
-    /// Start the new run with AutoUpgrade behavior.
-    AutoUpgrade,
-    /// Start the new run on the task queue's ramping deployment version.
-    UseRampingVersion,
-}
-
-impl From<ContinueAsNewVersioningBehavior> for ProtoContinueAsNewVersioningBehavior {
-    fn from(value: ContinueAsNewVersioningBehavior) -> Self {
-        match value {
-            ContinueAsNewVersioningBehavior::Unspecified => {
-                ProtoContinueAsNewVersioningBehavior::Unspecified
-            }
-            ContinueAsNewVersioningBehavior::AutoUpgrade => {
-                ProtoContinueAsNewVersioningBehavior::AutoUpgrade
-            }
-            ContinueAsNewVersioningBehavior::UseRampingVersion => {
-                ProtoContinueAsNewVersioningBehavior::UseRampingVersion
-            }
-        }
-    }
-}
-
-impl From<ProtoContinueAsNewVersioningBehavior> for ContinueAsNewVersioningBehavior {
-    fn from(value: ProtoContinueAsNewVersioningBehavior) -> Self {
-        match value {
-            ProtoContinueAsNewVersioningBehavior::Unspecified => {
-                ContinueAsNewVersioningBehavior::Unspecified
-            }
-            ProtoContinueAsNewVersioningBehavior::AutoUpgrade => {
-                ContinueAsNewVersioningBehavior::AutoUpgrade
-            }
-            ProtoContinueAsNewVersioningBehavior::UseRampingVersion => {
-                ContinueAsNewVersioningBehavior::UseRampingVersion
-            }
-        }
     }
 }
 
@@ -866,6 +731,7 @@ pub struct ContinueAsNewOptions {
     /// This experimental option is only meaningful for workers using worker deployment
     /// versioning. `AutoUpgrade` routes the new run to the current deployment version;
     /// `UseRampingVersion` routes it to the ramping deployment version when one is configured.
+    #[cfg(feature = "experimental")]
     pub initial_versioning_behavior: Option<ContinueAsNewVersioningBehavior>,
 }
 
@@ -877,8 +743,8 @@ impl ContinueAsNewOptions {
         headers: HashMap<String, Payload>,
         payload_converter: &PayloadConverter,
     ) -> Result<ContinueAsNewRequest, PayloadConversionError> {
-        let context =
-            SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let context = SerializationContext::new(&context_data, payload_converter);
         let memo = self
             .memo
             .map(|memo| {
@@ -892,6 +758,14 @@ impl ContinueAsNewOptions {
             })
             .transpose()?
             .unwrap_or_default();
+        #[cfg(feature = "experimental")]
+        let initial_versioning_behavior = ProtoContinueAsNewVersioningBehavior::from(
+            self.initial_versioning_behavior
+                .unwrap_or(ContinueAsNewVersioningBehavior::Unspecified),
+        )
+        .into();
+        #[cfg(not(feature = "experimental"))]
+        let initial_versioning_behavior = Default::default();
         Ok(ContinueAsNewWorkflowExecution {
             workflow_type: self.workflow_type.unwrap_or(workflow_type),
             task_queue: self.task_queue.unwrap_or_default(),
@@ -914,11 +788,7 @@ impl ContinueAsNewOptions {
                     .unwrap_or(VersioningIntent::Unspecified),
             )
             .into(),
-            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::from(
-                self.initial_versioning_behavior
-                    .unwrap_or(ContinueAsNewVersioningBehavior::Unspecified),
-            )
-            .into(),
+            initial_versioning_behavior,
         })
     }
 }
@@ -941,7 +811,8 @@ fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Opt
         return None;
     }
     let converter = PayloadConverter::default();
-    let context = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+    let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+    let context = SerializationContext::new(&context_data, &converter);
     Some(UserMetadata {
         summary: summary.map(|value| {
             converter
@@ -999,10 +870,6 @@ mod tests {
             WorkflowIdReusePolicy::Unspecified
         );
         assert_eq!(VersioningIntent::default(), VersioningIntent::Unspecified);
-        assert_eq!(
-            NexusOperationCancellationType::default(),
-            NexusOperationCancellationType::WaitCancellationCompleted
-        );
     }
 
     #[test]
@@ -1087,7 +954,7 @@ mod tests {
             HashMap::new(),
         );
         let enabled_command = LocalActivityOptions::builder()
-            .include_arguments_into_marker(true)
+            .include_arguments_in_marker(true)
             .build()
             .into_command(1, "test".to_string(), vec![], HashMap::new());
 
@@ -1101,8 +968,8 @@ mod tests {
         else {
             panic!("expected ScheduleLocalActivity command");
         };
-        assert!(!default_command.include_arguments_into_marker);
-        assert!(enabled_command.include_arguments_into_marker);
+        assert!(!default_command.include_arguments_in_marker);
+        assert!(enabled_command.include_arguments_in_marker);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use temporalio_client::{
 use temporalio_common::{
     data_converters::{
         GenericPayloadConverter, PayloadConverter, RawValue, SerializationContext,
-        SerializationContextData,
+        SerializationContextData, WorkflowSerializationContext,
     },
     protos::{
         coresdk::{
@@ -99,6 +99,10 @@ impl NexusBasicWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_basic(
@@ -308,6 +312,10 @@ impl AsyncCompleter {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_async(
@@ -340,15 +348,16 @@ async fn nexus_async(
     let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
-    let schedule_to_close_timeout = if outcome == Outcome::CancelAfterRecordedBeforeStarted {
-        None
-    } else {
-        Some(Duration::from_secs(5))
+    let schedule_to_close_timeout = match outcome {
+        Outcome::CancelAfterRecordedBeforeStarted => None,
+        Outcome::Timeout => Some(Duration::from_secs(5)),
+        _ => Some(Duration::from_secs(60)),
     };
 
     let submitter = worker.get_submitter_handle();
     let converter = PayloadConverter::default();
-    let ser_ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+    let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+    let ser_ctx = SerializationContext::new(&context_data, &converter);
     let wf_handle = worker
         .submit_workflow(
             NexusAsyncWf::run,
@@ -566,6 +575,10 @@ impl NexusCancelBeforeStartWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[tokio::test]
 async fn nexus_cancel_before_start() {
     let wf_name = "nexus_cancel_before_start";
@@ -630,6 +643,10 @@ impl NexusRootCancellationWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[tokio::test]
 async fn workflow_cancellation_propagates_to_started_nexus_operation() {
     let wf_name = "workflow_cancellation_propagates_to_started_nexus_operation";
@@ -764,6 +781,10 @@ impl NexusMustCompleteTaskWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_must_complete_task_to_shutdown(#[values(true, false)] use_grace_period: bool) {
@@ -942,6 +963,10 @@ impl AsyncCompleterWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_cancellation_types(
