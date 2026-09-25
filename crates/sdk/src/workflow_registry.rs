@@ -5,22 +5,17 @@ use temporalio_common::{
     WorkflowDefinition,
     data_converters::{
         DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
-        SerializationContextData,
+        SerializationContextData, WorkflowSerializationContext,
     },
     protos::{
         coresdk::workflow_activation::InitializeWorkflow, temporal::api::common::v1::Payload,
     },
 };
 use temporalio_workflow::{
-    BaseWorkflowContext, PatchActivationCallback,
-    runtime::{
-        entry::WorkflowImplementation,
-        guest::WorkflowInstance,
-        host::WorkflowHost,
-        instance::{GuestWorkflowInstance, instantiate_workflow},
-        types::{WorkflowDefinitionDescriptor, WorkflowInit},
-    },
+    __private::sdk::{GuestWorkflowInstance, WorkflowHost, WorkflowInit, WorkflowInstance},
+    BaseWorkflowContext, InternalPatchActivationCallback as PatchActivationCallback,
     workflow_interceptors::WorkflowInterceptorConstructor,
+    workflows::{WorkflowDefinitionDescriptor, WorkflowImplementation},
 };
 
 /// Host-owned execution inputs used to instantiate a single workflow run.
@@ -75,6 +70,8 @@ pub struct WorkflowDefinitions {
 }
 
 impl WorkflowDefinitions {
+    // Only used by Plugins so feature flagged to avoid dead code.
+    #[cfg(feature = "experimental")]
     pub(crate) fn extend(&mut self, other: &Self) -> Result<(), WorkflowRegistrationError> {
         for workflow in other.workflows.values() {
             self.insert_workflow(workflow.definition.clone(), workflow.factory.clone())?;
@@ -98,7 +95,7 @@ impl WorkflowDefinitions {
     {
         let factory = Arc::new(move |input| {
             let (payloads, payload_converter, base_ctx) = workflow_input_parts(input);
-            instantiate_workflow::<W>(payloads, payload_converter, base_ctx)
+            GuestWorkflowInstance::<W>::instantiate(payloads, payload_converter, base_ctx)
                 .context("Failed to instantiate native workflow")
         });
         self.insert_workflow(W::definition(), factory)?;
@@ -126,8 +123,9 @@ impl WorkflowDefinitions {
 
         let factory = Arc::new(move |input| {
             let (payloads, payload_converter, base_ctx) = workflow_input_parts(input);
-            let ser_ctx =
-                SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let ser_ctx = SerializationContext::new(&context_data, &payload_converter);
             let input: <W::Run as WorkflowDefinition>::Input =
                 payload_converter.from_payloads(&ser_ctx, payloads)?;
 

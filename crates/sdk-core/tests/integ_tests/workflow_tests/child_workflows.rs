@@ -198,7 +198,7 @@ async fn abandoned_child_bug_repro() {
 
 #[workflow]
 struct AbandonedChildResolvesPostCancelParent {
-    barr: Arc<Barrier>,
+    ready: Arc<Notify>,
 }
 
 #[workflow_methods(factory_only)]
@@ -217,8 +217,7 @@ impl AbandonedChildResolvesPostCancelParent {
             )
             .await
             .expect("Child should start OK");
-        let barr = ctx.state(|wf| wf.barr.clone());
-        barr.wait().await;
+        ctx.state(|wf| wf.ready.notify_one());
         ctx.cancelled().await;
         started.cancel("Die reason".to_string());
         ctx.timer(Duration::from_secs(1)).await;
@@ -242,12 +241,12 @@ impl AbandonedChildResolvesPostCancelChild {
 #[tokio::test]
 async fn abandoned_child_resolves_post_cancel() {
     let mut starter = CoreWfStarter::new("child-workflow-resolves-post-cancel");
-    let barr = Arc::new(Barrier::new(2));
-    let barr_clone = barr.clone();
+    let ready = Arc::new(Notify::new());
+    let ready_clone = ready.clone();
     starter
         .sdk_config
         .register_workflow_with_factory(move || AbandonedChildResolvesPostCancelParent {
-            barr: barr_clone.clone(),
+            ready: ready_clone.clone(),
         })
         .unwrap();
     starter
@@ -267,7 +266,7 @@ async fn abandoned_child_resolves_post_cancel() {
         .unwrap();
     let client = starter.get_core_client().await;
     let canceller = async {
-        barr.wait().await;
+        ready.notified().await;
         handle
             .cancel(WorkflowCancelOptions::builder().reason("die").build())
             .await
@@ -277,6 +276,7 @@ async fn abandoned_child_resolves_post_cancel() {
         worker.run_until_done().await.unwrap();
     };
     tokio::join!(canceller, runner);
+    handle.get_result(Default::default()).await.unwrap();
 
     // Verify no WFT failures on the child workflow. A failure here indicates
     // the child couldn't deserialize its input (e.g., sending a payload when none expected).
@@ -284,10 +284,10 @@ async fn abandoned_child_resolves_post_cancel() {
         client.get_workflow_handle::<UntypedWorkflow>("abandoned-child-resolve-post-cancel");
     let history = child_handle
         .fetch_history(Default::default())
+        .into_events()
         .await
         .unwrap();
     let wft_failures: Vec<_> = history
-        .events()
         .iter()
         .filter(|e| {
             matches!(
@@ -420,6 +420,7 @@ impl UnusedChildWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::signal_then_result(true)]
 #[case::signal_and_result_concurrent(false)]
@@ -485,6 +486,7 @@ impl ParentCancelsChildWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn cancel_child_workflow() {
     let t = canned_histories::single_child_workflow_cancelled("child-id-1");
@@ -813,6 +815,7 @@ impl PassChildWorkflowSummaryToMetadata {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_child_workflow_summary_to_metadata() {
     let wf_id = "1";
@@ -938,6 +941,7 @@ impl ParentWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest(
     mock_cfg,
     case::success(child_workflow_happy_hist()),
@@ -972,6 +976,7 @@ async fn single_child_workflow_until_completion(mut mock_cfg: MockPollCfg) {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn single_child_workflow_start_fail() {
     let child_wf_id = "child-id-1";
@@ -1040,6 +1045,7 @@ impl CancelBeforeSendWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn single_child_workflow_cancel_before_sent() {
     let mut t = TestHistoryBuilder::default();
@@ -1153,6 +1159,7 @@ impl CancelChildBeforeStartedCannedWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn cancel_child_before_started_event_exposes_cancelled_error() {
     let t = canned_histories::cancel_child_workflow_before_started_event("child-id-1");
@@ -1235,9 +1242,12 @@ async fn cancel_child_wf_before_started_event_real_server() {
     // Verify no unexpected workflow task failures in history. The bug manifests as a WFT failure
     // with a nondeterminism error. UnhandledCommand failures are acceptable since the server
     // may reject a cancel command if it races with the child workflow start.
-    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
     let unexpected_wft_failures: Vec<_> = history
-        .events()
         .iter()
         .filter(|e| {
             if let Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(attrs)) =
@@ -1488,6 +1498,7 @@ impl UnitChildParentWf {
 /// Parent that starts a typed child returning () and awaits its result.
 /// With a canned history whose completion is missing a result (simulating a
 /// non-Rust child workflow that might not have a result payload).
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn child_workflow_unit_result_none_payload() {
     // single_child_workflow produces a completion with result: None

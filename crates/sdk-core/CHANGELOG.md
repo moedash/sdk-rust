@@ -33,10 +33,28 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
+  retain their slot during backoff, while resource-exhaustion errors still reduce the target.
+* Workflow poll balancing now lets non-sticky pollers use capacity after sticky pollers reach their
+  configured or autoscaled polling limit.
+* Every path that fails a workflow task now only reports the failure to server
+  on the task's first attempt, and later attempts are left to time out. Previously `PayloadsTooLarge`
+  failures and history fetch failures were re-reported on every attempt.
+* The `workflow_task_execution_failed` metric is now recorded for every failed workflow task
+  attempt, including attempts whose failure was not sent to the server, and its `failure_reason`
+  tag distinguishes `GrpcMessageTooLarge`, `PayloadsTooLarge`, and `RequestTooLarge` on every path.
+
+## [0.9.0] - 2026-09-04
+
+## [0.8.0] - 2026-09-02
+
 ### Added
 * Added the Core protocol for replay-safe Workflow-originated external stream output, including
   exact Workflow Task History floors, compact staged-output marker proofs, and shared input/output
   replay segmentation.
+* External workflow signal and cancellation resolution activations now include the typed server
+  failure cause alongside the existing failure.
 * Language SDKs can opt in to recording local activity arguments in the local activity marker's
   `input` detail.
 * Core console logs can now be emitted as newline-delimited JSON when an SDK selects the JSON log
@@ -87,6 +105,11 @@ relevant information.
   can only be honored while a task is held.
 * Workers now defensively buffer a replacement workflow task if it reaches a run that still owns
   one, preserving the outstanding task token in release builds.
+* Worker shutdown now drains activity completions that are still flushing their result to the
+  server before finishing. Previously such a completion — typically one whose final heartbeat RPC
+  was still in flight — could be permanently stranded by shutdown: the activity's result was
+  never reported (the server had to time the attempt out before retrying it), and workers missed
+  shutdown's slot-permit release deadline, panicking in debug builds.
 * The Prometheus exporter now appends `_total` to counter metric names when an SDK enables the
   counter suffix option.
 * Update-with-start `ExecuteMultiOperation` calls now use Core's long-poll timeout instead of the

@@ -24,7 +24,7 @@ use temporalio_sdk_core::replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ApplicationFailure, CancellableFuture, ChildWorkflowOptions, SignalWorkflowOptions,
-    SyncWorkflowContext, WorkflowContext, WorkflowResult,
+    SyncWorkflowContext, WorkflowContext, WorkflowResult, WorkflowSignalError,
     workflow_interceptors::{
         HandleSignalInput, HandleSignalResult, WorkflowInterceptor, WorkflowInterceptorConstructor,
         WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext,
@@ -56,7 +56,7 @@ impl SignalSender {
             )
             .await;
         if expect_failure {
-            assert!(sigres.is_err());
+            assert_matches!(sigres, Err(WorkflowSignalError::NotFound(_)));
         } else {
             sigres.unwrap();
         }
@@ -337,6 +337,7 @@ impl SignalSenderCanned {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::succeeds(false)]
 #[case::fails(true)]
@@ -408,6 +409,7 @@ impl CancelsBeforeSending {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn cancels_before_sending() {
     let mut t = TestHistoryBuilder::default();

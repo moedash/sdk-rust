@@ -152,7 +152,15 @@ struct RandomReplayWf;
 impl RandomReplayWf {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
-        Ok(format!("{}:{}", ctx.random::<u64>(), ctx.uuid4()))
+        let orders = ctx.random_stream("example.com/orders");
+        let first_order = orders.random::<u64>();
+        let _ = ctx.random_stream("example.com/telemetry").random::<u64>();
+        let second_order = ctx.random_stream("example.com/orders").random::<u64>();
+        Ok(format!(
+            "{}:{}:{first_order}:{second_order}",
+            ctx.random::<u64>(),
+            ctx.uuid4()
+        ))
     }
 }
 
@@ -212,6 +220,7 @@ impl TimerWfFailsOnce {
 
 /// Verifies that workflow panics (which in this case the Rust SDK turns into workflow activation
 /// failures) are turned into unspecified WFT failures.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn test_panic_wf_task_rejected_properly() {
     let wf_id = "fakeid";
@@ -271,6 +280,7 @@ impl NondeterministicTimerWf {
 
 /// Verifies nondeterministic behavior in workflows results in automatic WFT failure with the
 /// appropriate nondeterminism cause.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::with_cache(true)]
 #[case::without_cache(false)]
@@ -370,6 +380,7 @@ impl ActivityIdOrTypeChangeWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[tokio::test]
 async fn activity_id_or_type_change_is_nondeterministic(
@@ -459,6 +470,7 @@ impl ChildWfIdOrTypeChangeWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[tokio::test]
 async fn child_wf_id_or_type_change_is_nondeterministic(
@@ -617,6 +629,7 @@ impl ReproChannelMissingWf {
 /// us to want to auto-fail the workflow task while there is also an outstanding eviction, the wf
 /// would get evicted but then try to send some info down the completion channel afterward, causing
 /// a panic.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn repro_channel_missing_because_nondeterminism() {
     for _ in 1..50 {

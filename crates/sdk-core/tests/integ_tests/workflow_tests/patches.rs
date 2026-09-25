@@ -212,8 +212,12 @@ async fn patch_activation_callback_is_memoized_across_replay() {
         (false, false)
     );
     assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    assert!(!history.events().iter().any(|event| matches!(
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    assert!(!history.iter().any(|event| matches!(
         &event.attributes,
         Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
             if attrs.marker_name == PATCH_MARKER_NAME
@@ -305,8 +309,12 @@ async fn declined_patch_can_roll_out_to_old_worker() {
     });
     run_result.unwrap();
     assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    assert!(!history.events().iter().any(|event| matches!(
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    assert!(!history.iter().any(|event| matches!(
         &event.attributes,
         Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
             if attrs.marker_name == PATCH_MARKER_NAME
@@ -369,8 +377,12 @@ async fn activated_patch_replays_without_consulting_declining_callback() {
     });
     run_result.unwrap();
     assert_eq!(activated_calls.load(Ordering::Relaxed), 1);
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    assert!(history.events().iter().any(|event| matches!(
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    assert!(history.iter().any(|event| matches!(
         &event.attributes,
         Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
             if attrs.marker_name == PATCH_MARKER_NAME
@@ -756,6 +768,7 @@ impl PatchWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::v1_breaks_on_normal_marker(false, MarkerType::NotDeprecated, 1)]
 #[case::v1_accepts_dep_marker(false, MarkerType::Deprecated, 1)]
@@ -815,6 +828,7 @@ async fn v1_and_v4_changes(
 }
 
 // Note that the not-replaying and no-marker cases don't make sense and hence are absent
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::v2_marker_new_path(false, MarkerType::NotDeprecated, 2)]
 #[case::v2_dep_marker_new_path(false, MarkerType::Deprecated, 2)]
@@ -959,6 +973,7 @@ impl SameChangeMultipleSpotsWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::has_change_replay(true, true)]
 #[case::no_change_replay(false, true)]
@@ -1072,6 +1087,7 @@ impl ManyPatchesWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::happy_path(50)]
 // We start exceeding the 2k size limit at 180 patches with this format
@@ -1179,9 +1195,12 @@ async fn patch_marker_size_overflow_replay_is_deterministic() {
 
     // Confirm that the original execution did in fact hit the size limit: the last upsert SA
     // event in history must contain fewer than the total number of patches issued by the workflow.
-    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
     let last_upsert_patches = history
-        .events()
         .iter()
         .rev()
         .find_map(|e| match &e.attributes {

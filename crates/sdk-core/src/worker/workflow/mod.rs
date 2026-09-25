@@ -26,16 +26,16 @@ use crate::{
     internal_flags::InternalFlags,
     pollers::TrackedPermittedTqResp,
     protosext::{ValidPollWFTQResponse, protocol_messages::IncomingProtocolMessage},
-    telemetry::{
-        VecDisplayer,
-        metrics::{self, FailureReason},
-    },
+    telemetry::{VecDisplayer, metrics},
     worker::{
         ActivitySlotKind, CompleteWfError, LocalActRequest, LocalActivityExecutionResult,
         LocalActivityResolution, NamespaceCapabilities, PollError, PostActivateHookData,
         WorkflowSlotKind,
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
-        client::{LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion},
+        client::{
+            LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion,
+            payload_limit_violation_from,
+        },
         workflow::{
             history_update::HistoryPaginator,
             machines::MachineError,
@@ -67,7 +67,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use temporalio_client::{MESSAGE_TOO_LARGE_KEY, payload_limit_violation_from};
+use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::{
     payload_limits::PayloadLimitViolation,
     protos::{
@@ -364,18 +364,9 @@ impl Workflows {
                         }
                     }
                 },
-                WorkflowStreamAction::FailUnstoredWft {
-                    run_id,
-                    task_token,
-                    cause,
-                    failure,
-                } => {
-                    self.handle_activation_failed(
-                        &run_id,
-                        Instant::now(),
-                        FailedActivationWFTReport::Report(task_token, cause, failure),
-                    )
-                    .await;
+                WorkflowStreamAction::FailUnstoredWft { run_id, report } => {
+                    self.handle_activation_failed(&run_id, Instant::now(), *report)
+                        .await;
                 }
             }
         }
@@ -471,47 +462,43 @@ impl Workflows {
                             );
                         }
                         Err(e) => {
-                            let cause_reason_failure = if e
-                                .metadata()
-                                .contains_key(REQUEST_TOO_LARGE_KEY)
-                                && attempt < 2
-                            {
-                                // Completion exceeds the namespace's recombined size limit, so the
-                                // worker failed it proactively rather than sending doomed pages.
-                                Some((
-                                    WorkflowTaskFailedCause::RequestTooLarge,
-                                    FailureReason::RequestTooLarge,
-                                    make_request_too_large_failure(),
-                                ))
-                            } else if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY)
-                                && attempt < 2
-                            {
-                                // gRPC message too large from server; skip on nonfirst attempts to
-                                // avoid spamming.
-                                Some((
-                                    WorkflowTaskFailedCause::GrpcMessageTooLarge,
-                                    FailureReason::GrpcMessageTooLarge,
-                                    make_grpc_message_too_large_failure(),
-                                ))
-                            } else {
-                                // Client layer rejected the completion for exceeding the worker's
-                                // payload error limit.
-                                payload_limit_violation_from(&e).map(|violation| {
-                                    (
-                                        WorkflowTaskFailedCause::PayloadsTooLarge,
-                                        FailureReason::PayloadsTooLarge,
-                                        make_payloads_too_large_failure(violation),
-                                    )
-                                })
-                            };
-                            if let Some((cause, reason, failure)) = cause_reason_failure {
-                                let new_outcome =
-                                    FailedActivationWFTReport::Report(task_token, cause, failure);
-                                self.handle_activation_failed(run_id, completion_time, new_outcome)
-                                    .await;
-                                run_metrics
-                                    .with_new_attrs([metrics::failure_reason(reason)])
-                                    .wf_task_failed();
+                            let cause_and_failure =
+                                if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
+                                    // Completion exceeds the namespace's recombined size limit, so the
+                                    // worker failed it proactively rather than sending doomed pages.
+                                    Some((
+                                        WorkflowTaskFailedCause::RequestTooLarge,
+                                        make_request_too_large_failure(),
+                                    ))
+                                } else if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY) {
+                                    Some((
+                                        WorkflowTaskFailedCause::GrpcMessageTooLarge,
+                                        make_grpc_message_too_large_failure(),
+                                    ))
+                                } else {
+                                    // Client layer rejected the completion for exceeding the worker's
+                                    // payload error limit.
+                                    payload_limit_violation_from(&e).map(|violation| {
+                                        (
+                                            WorkflowTaskFailedCause::PayloadsTooLarge,
+                                            make_payloads_too_large_failure(violation),
+                                        )
+                                    })
+                                };
+                            if let Some((cause, failure)) = cause_and_failure {
+                                self.handle_activation_failed(
+                                    run_id,
+                                    completion_time,
+                                    FailedActivationWFTReport::new(
+                                        task_token,
+                                        attempt,
+                                        cause,
+                                        failure,
+                                        WftFailureKind::Task,
+                                        &run_metrics,
+                                    ),
+                                )
+                                .await;
                             }
                             return Err(e);
                         }
@@ -540,35 +527,52 @@ impl Workflows {
         }
     }
 
+    /// The single point through which every workflow task failure passes on its way to the
+    /// server. A task failure is only sent for the first attempt of a task. Later attempts almost
+    /// always fail the same way, so reporting them would just spam the server with failures it
+    /// already knows about. Instead they are left to time out.
     async fn handle_activation_failed(
         &self,
         run_id: &str,
         completion_time: Instant,
-        outcome: FailedActivationWFTReport,
+        report: FailedActivationWFTReport,
     ) -> WFTReportStatus {
-        match outcome {
-            FailedActivationWFTReport::Report(tt, cause, failure) => {
-                warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
-                self.handle_wft_reporting_errs(run_id, || async {
-                    self.client
-                        .fail_workflow_task(tt, cause, failure.failure)
-                        .await
-                })
-                .await;
-                WFTReportStatus::Reported {
-                    reset_last_started_to: None,
-                    completion_time,
-                }
-            }
-            FailedActivationWFTReport::ReportLegacyQueryFailure(task_token, failure) => {
+        let FailedActivationWFTReport {
+            task_token,
+            attempt,
+            cause,
+            failure,
+            kind,
+        } = report;
+        match kind {
+            WftFailureKind::LegacyQuery => {
                 warn!(run_id=%run_id, failure=?failure, "Failing legacy query request");
                 self.respond_legacy_query(task_token, LegacyQueryResult::Failed(failure))
                     .await;
-                WFTReportStatus::Reported {
-                    reset_last_started_to: None,
-                    completion_time,
-                }
             }
+            WftFailureKind::RetryableLegacyQuery => {
+                debug!(run_id=%run_id, failure=?failure,
+                       "Dropping legacy query with retryable failure");
+                return WFTReportStatus::DropWft { completion_time };
+            }
+            WftFailureKind::Task if attempt > 1 => {
+                debug!(run_id=%run_id, attempt, failure=?failure,
+                       "Not reporting workflow task failure on non-first attempt");
+                return WFTReportStatus::DropWft { completion_time };
+            }
+            WftFailureKind::Task => {
+                warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
+                self.handle_wft_reporting_errs(run_id, || async {
+                    self.client
+                        .fail_workflow_task(task_token, cause, failure.failure)
+                        .await
+                })
+                .await;
+            }
+        }
+        WFTReportStatus::Reported {
+            reset_last_started_to: None,
+            completion_time,
         }
     }
 
@@ -590,12 +594,9 @@ impl Workflows {
                 )
                 .await
             }
-            ActivationCompleteOutcome::ReportWFTFail(outcome) => {
-                self.handle_activation_failed(run_id, completion_time, outcome)
+            ActivationCompleteOutcome::ReportWFTFail(report) => {
+                self.handle_activation_failed(run_id, completion_time, *report)
                     .await
-            }
-            ActivationCompleteOutcome::WFTFailedDontReport => {
-                WFTReportStatus::DropWft { completion_time }
             }
             ActivationCompleteOutcome::DoNothing => WFTReportStatus::NotReported,
         }
@@ -711,7 +712,7 @@ impl Workflows {
             run_id: run_id.into(),
             message: message.into(),
             reason,
-            auto_reply_fail_tt: None,
+            auto_reply_fail: None,
         });
     }
 
@@ -1120,9 +1121,7 @@ enum WorkflowStreamAction {
     #[display("FailUnstoredWft(run_id={run_id})")]
     FailUnstoredWft {
         run_id: String,
-        task_token: TaskToken,
-        cause: WorkflowTaskFailedCause,
-        failure: Failure,
+        report: Box<FailedActivationWFTReport>,
     },
 }
 
@@ -1243,10 +1242,59 @@ struct WorkflowTaskInfo {
     wf_id: String,
 }
 
+/// Everything needed to tell the server a workflow task failed. Every path that fails a WFT
+/// must produce one of these via [FailedActivationWFTReport::new] and feed it to
+/// [Workflows::handle_activation_failed].
 #[derive(Debug)]
-enum FailedActivationWFTReport {
-    Report(TaskToken, WorkflowTaskFailedCause, Failure),
-    ReportLegacyQueryFailure(TaskToken, Failure),
+struct FailedActivationWFTReport {
+    task_token: TaskToken,
+    attempt: u32,
+    cause: WorkflowTaskFailedCause,
+    failure: Failure,
+    kind: WftFailureKind,
+}
+impl FailedActivationWFTReport {
+    /// Records the task-failed metric as part of constructing the report.
+    fn new(
+        task_token: TaskToken,
+        attempt: u32,
+        cause: WorkflowTaskFailedCause,
+        failure: Failure,
+        kind: WftFailureKind,
+        metrics: &MetricsContext,
+    ) -> Self {
+        metrics
+            .with_new_attrs([metrics::failure_reason(cause.into())])
+            .wf_task_failed();
+        Self {
+            task_token,
+            attempt,
+            cause,
+            failure,
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum WftFailureKind {
+    /// A normal workflow task, failed via the task failure API.
+    Task,
+    /// A legacy query, answered through the query response API rather than by failing the task.
+    /// The caller is blocked until an answer arrives, so these are always reported.
+    LegacyQuery,
+    /// A legacy query whose failure is transient and may succeed if retried. Failing the query
+    /// would surface that transient error to the caller, so the task is dropped unanswered.
+    RetryableLegacyQuery,
+}
+
+/// Identifies a WFT whose failure must be reported outside the normal activation completion path,
+/// because the run it belongs to was never stored or is being torn down.
+#[derive(Debug, Clone)]
+struct UnstoredWftFailInfo {
+    task_token: TaskToken,
+    attempt: u32,
+    workflow_type: String,
 }
 
 struct ServerCommandsWithWorkflowInfo {
@@ -1282,16 +1330,17 @@ pub(crate) enum ActivationAction {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum EvictionRequestResult {
-    EvictionRequested(Option<u32>, RunUpdateAct),
+    EvictionRequested(RunUpdateAct),
     NotFound,
-    EvictionAlreadyRequested(Option<u32>),
+    EvictionAlreadyRequested,
 }
 impl EvictionRequestResult {
     fn into_run_update_resp(self) -> RunUpdateAct {
         match self {
-            EvictionRequestResult::EvictionRequested(_, resp) => resp,
-            EvictionRequestResult::NotFound
-            | EvictionRequestResult::EvictionAlreadyRequested(_) => None,
+            EvictionRequestResult::EvictionRequested(resp) => resp,
+            EvictionRequestResult::NotFound | EvictionRequestResult::EvictionAlreadyRequested => {
+                None
+            }
         }
     }
 }
@@ -1372,9 +1421,9 @@ struct RequestEvictMsg {
     message: String,
     reason: EvictionReason,
     /// If set, we requested eviction because something went wrong processing a brand new poll task,
-    /// which means we won't have stored the WFT and we need to track the task token separately so
-    /// we can reply with a failure to server after the evict goes through.
-    auto_reply_fail_tt: Option<TaskToken>,
+    /// which means we won't have stored the WFT and we need to track it separately so we can
+    /// reply with a failure to server after the evict goes through.
+    auto_reply_fail: Option<UnstoredWftFailInfo>,
 }
 #[derive(Debug)]
 pub(crate) struct HeartbeatTimeoutMsg {
@@ -1520,12 +1569,9 @@ enum ActivationCompleteOutcome {
     /// The WFT must be reported as successful to the server using the contained information.
     ReportWFTSuccess(ServerCommandsWithWorkflowInfo),
     /// The WFT must be reported as failed to the server using the contained information.
-    ReportWFTFail(FailedActivationWFTReport),
+    ReportWFTFail(Box<FailedActivationWFTReport>),
     /// There's nothing to do right now. EX: The workflow needs to keep replaying.
     DoNothing,
-    /// The workflow task failed, but we shouldn't report it. EX: We have failed 2 or more attempts
-    /// in a row.
-    WFTFailedDontReport,
 }
 /// Did we report, or not, completion of a WFT to server?
 #[derive(Debug, Copy, Clone)]
@@ -1538,7 +1584,7 @@ enum WFTReportStatus {
     /// work to be done. EX: Running LAs.
     NotReported,
     /// We didn't report, but we want to clear the outstanding workflow task anyway. See
-    /// [ActivationCompleteOutcome::WFTFailedDontReport].
+    /// [Workflows::handle_activation_failed] for when this happens.
     DropWft { completion_time: Instant },
 }
 impl WFTReportStatus {

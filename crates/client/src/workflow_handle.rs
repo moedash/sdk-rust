@@ -1,26 +1,33 @@
 use crate::{
     CancelWorkflowInput, DescribeWorkflowInput, DescribeWorkflowOutput,
-    FetchWorkflowHistoryPageInput, FetchWorkflowHistoryPageOutput, NamespacedClient, Next,
-    PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput, QueryWorkflowOutput,
-    RpcOptions, SignalWorkflowInput, StartWorkflowUpdateInput, StartWorkflowUpdateOutput,
-    TerminateWorkflowInput, WorkflowCancelOptions, WorkflowDescribeOptions,
-    WorkflowExecuteUpdateOptions, WorkflowExecutionStatus, WorkflowFetchHistoryOptions,
-    WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions,
-    WorkflowStartUpdateOptions, WorkflowTerminateOptions,
+    FetchWorkflowHistoryPageInput, FetchWorkflowHistoryPageOutput, HistoryEventFilterType,
+    NamespacedClient, Next, PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput,
+    QueryWorkflowOutput, RpcOptions, SignalWorkflowInput, StartWorkflowUpdateInput,
+    StartWorkflowUpdateOutput, TerminateWorkflowInput, WorkflowCancelOptions,
+    WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecutionStatus,
+    WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
+    WorkflowSignalOptions, WorkflowStartUpdateOptions, WorkflowTerminateOptions,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowUpdateError,
     },
     grpc::WorkflowService,
     interceptors,
 };
-use futures_util::future::BoxFuture;
-use std::{fmt::Debug, marker::PhantomData};
+use futures_util::{TryStreamExt, future::BoxFuture, stream, stream::Stream};
+use std::{
+    collections::VecDeque,
+    fmt::Debug,
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
+};
 pub use temporalio_common::UntypedWorkflow;
 use temporalio_common::{
     HasWorkflowDefinition, QueryDefinition, SignalDefinition, UpdateDefinition, WorkflowDefinition,
     data_converters::{
         DataConverter, DecodablePayloads, GenericPayloadConverter, PayloadConversionError,
         PayloadConverter, RawValue, SerializationContext, SerializationContextData,
+        WorkflowSerializationContext,
     },
     error::IncomingError,
     payload_visitor::decode_payloads,
@@ -29,7 +36,11 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             common::v1::{Header, Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution},
-            enums::v1::{HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage},
+            enums::v1::{
+                HistoryEventFilterType as ProtoHistoryEventFilterType,
+                QueryRejectCondition as ProtoQueryRejectCondition,
+                UpdateWorkflowExecutionLifecycleStage,
+            },
             history::{
                 self,
                 v1::{History, HistoryEvent, history_event::Attributes},
@@ -93,13 +104,16 @@ impl WorkflowResultDetails {
     ) -> Result<Self, PayloadConversionError> {
         let payloads = data_converter
             .codec()
-            .decode(&SerializationContextData::Workflow, payloads)
+            .decode(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                payloads,
+            )
             .await?;
         Ok(Self {
             payloads: DecodablePayloads::new(
                 payloads,
                 data_converter.payload_converter().clone(),
-                SerializationContextData::Workflow,
+                SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             ),
         })
     }
@@ -171,11 +185,13 @@ impl WorkflowExecutionDescription {
         decode_payloads(
             &mut raw_description,
             data_converter.codec(),
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
         .await?;
-        let decoded_metadata =
-            decode_user_metadata(&SerializationContextData::Workflow, raw_user_metadata)?;
+        let decoded_metadata = decode_user_metadata(
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            raw_user_metadata,
+        )?;
         let history_length_raw = raw_description
             .workflow_execution_info
             .as_ref()
@@ -255,7 +271,7 @@ impl WorkflowExecutionDescription {
         crate::Memo::from_raw(
             self.workflow_info().memo.clone(),
             self.data_converter.payload_converter().clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -328,53 +344,69 @@ impl WorkflowExecutionDescription {
     }
 }
 
-// TODO [rust-sdk-branch]: Could implment stream a-la ListWorkflowsStream
-/// Workflow execution history returned by `WorkflowHandle::fetch_history`.
-#[derive(Debug, Clone)]
+/// Workflow execution history returned by [`WorkflowHandle::fetch_history`].
+///
+/// Events and their containing pages are fetched lazily as this stream is polled. Use
+/// [`into_events`](Self::into_events) to fetch and collect all events at once.
+#[derive(derive_more::Debug)]
 pub struct WorkflowHistory {
-    events: Vec<HistoryEvent>,
+    #[debug(skip)]
+    inner: Pin<Box<dyn Stream<Item = Result<HistoryEvent, WorkflowInteractionError>> + Send>>,
     workflow_id: Option<String>,
 }
-impl From<WorkflowHistory> for history::v1::History {
-    fn from(h: WorkflowHistory) -> Self {
-        Self { events: h.events }
-    }
-}
 
-/// Error converting a workflow history to or from JSON.
-#[derive(Debug, thiserror::Error)]
-#[error("failed to convert workflow history JSON: {0}")]
-pub struct WorkflowHistoryJsonError(#[from] serde_json::Error);
-
-impl WorkflowHistory {
-    fn new(events: Vec<HistoryEvent>, workflow_id: Option<String>) -> Self {
+impl From<history::v1::History> for WorkflowHistory {
+    fn from(history: history::v1::History) -> Self {
+        let workflow_id =
+            history
+                .events
+                .first()
+                .and_then(|event| match event.attributes.as_ref() {
+                    Some(Attributes::WorkflowExecutionStartedEventAttributes(attributes))
+                        if !attributes.workflow_id.is_empty() =>
+                    {
+                        Some(attributes.workflow_id.clone())
+                    }
+                    _ => None,
+                });
         Self {
-            events,
+            inner: Box::pin(stream::iter(history.events.into_iter().map(Ok))),
             workflow_id,
         }
     }
+}
 
+impl Stream for WorkflowHistory {
+    type Item = Result<HistoryEvent, WorkflowInteractionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Error fetching or converting a workflow history.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WorkflowHistoryError {
+    /// Fetching the workflow history failed.
+    #[error("failed to fetch workflow history: {0}")]
+    Fetch(#[from] WorkflowInteractionError),
+    /// Converting the workflow history JSON failed.
+    #[error("failed to convert workflow history JSON: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl WorkflowHistory {
     /// Decode a workflow history from JSON bytes.
-    pub fn from_json(bytes: &[u8]) -> Result<Self, WorkflowHistoryJsonError> {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, WorkflowHistoryError> {
         let history: History = serde_json::from_slice(bytes)?;
-        let workflow_id = history
-            .events
-            .first()
-            .and_then(|event| match event.attributes.as_ref() {
-                Some(Attributes::WorkflowExecutionStartedEventAttributes(attributes)) => {
-                    Some(attributes)
-                }
-                _ => None,
-            })
-            .map(|attributes| attributes.workflow_id.clone())
-            .filter(|wfid| !wfid.is_empty());
-        Ok(Self::new(history.events, workflow_id))
+        Ok(history.into())
     }
 
-    /// Encode this workflow history as JSON bytes.
-    pub fn to_json(&self) -> Result<Vec<u8>, WorkflowHistoryJsonError> {
+    /// Fetch all remaining events and encode this workflow history as JSON bytes.
+    pub async fn to_json(self) -> Result<Vec<u8>, WorkflowHistoryError> {
         Ok(serde_json::to_vec(&History {
-            events: self.events.clone(),
+            events: self.into_events().await?,
         })?)
     }
 
@@ -383,14 +415,9 @@ impl WorkflowHistory {
         self.workflow_id.as_deref()
     }
 
-    /// The history events.
-    pub fn events(&self) -> &[HistoryEvent] {
-        &self.events
-    }
-
-    /// Consume the history and return the events.
-    pub fn into_events(self) -> Vec<HistoryEvent> {
-        self.events
+    /// Fetch all remaining history pages and collect their events.
+    pub async fn into_events(self) -> Result<Vec<HistoryEvent>, WorkflowInteractionError> {
+        self.inner.try_collect().await
     }
 }
 
@@ -594,7 +621,7 @@ where
         opts: WorkflowGetResultOptions,
     ) -> Result<W::Output, WorkflowGetResultError>
     where
-        CT: WorkflowService + NamespacedClient + Clone,
+        CT: WorkflowService + NamespacedClient + Clone + 'static,
     {
         let raw = self.get_result_raw(opts).await?;
         match raw {
@@ -619,7 +646,7 @@ where
         opts: WorkflowGetResultOptions,
     ) -> Result<WorkflowExecutionResult<W::Output>, WorkflowInteractionError>
     where
-        CT: WorkflowService + NamespacedClient + Clone,
+        CT: WorkflowService + NamespacedClient + Clone + 'static,
     {
         let mut run_id = self.info.run_id.clone().unwrap_or_default();
         let fetch_opts = WorkflowFetchHistoryOptions::builder()
@@ -630,8 +657,8 @@ where
             .build();
 
         loop {
-            let history = self.fetch_history_for_run(&run_id, &fetch_opts).await?;
-            let mut events = history.into_events();
+            let history = self.fetch_history_for_run(&run_id, fetch_opts.clone());
+            let mut events = history.into_events().await?;
 
             if events.is_empty() {
                 continue;
@@ -658,7 +685,7 @@ where
                         .and_then(|p| p.payloads.into_iter().next())
                         .unwrap_or_default();
                     let result: W::Output = dc
-                        .from_payload(&SerializationContextData::Workflow, payload)
+                        .from_payload(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), payload)
                         .await?;
                     Ok(WorkflowExecutionResult::Succeeded(result))
                 }
@@ -668,13 +695,13 @@ where
                     decode_payloads(
                         &mut failure,
                         dc.codec(),
-                        &SerializationContextData::Workflow,
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     )
                     .await?;
                     let error = dc.failure_converter().to_error(
                         failure,
                         dc.payload_converter(),
-                        &SerializationContextData::Workflow,
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     )?;
                     Ok(WorkflowExecutionResult::Failed(error))
                 }
@@ -753,13 +780,17 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
                         let payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), unencoded_payloads?)
                             .await?;
                         let mut request = SignalWorkflowExecutionRequest {
                             namespace: client.namespace(),
@@ -821,13 +852,17 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
                         let payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), unencoded_payloads?)
                             .await?;
                         let mut request = QueryWorkflowRequest {
                             namespace: client.namespace(),
@@ -842,8 +877,8 @@ where
                             }),
                             query_reject_condition: options
                                 .reject_condition
-                                .map(|condition| condition as i32)
-                                .unwrap_or(1),
+                                .map(|condition| ProtoQueryRejectCondition::from(condition) as i32)
+                                .unwrap_or(ProtoQueryRejectCondition::None as i32),
                         }
                         .into_request();
                         options.rpc_options.apply_to(&mut request);
@@ -874,7 +909,10 @@ where
 
         self.client
             .data_converter()
-            .from_payloads(&SerializationContextData::Workflow, result_payloads)
+            .from_payloads(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                result_payloads,
+            )
             .await
             .map_err(WorkflowQueryError::from)
     }
@@ -931,16 +969,22 @@ where
                             let data_converter = client.data_converter().clone();
                             let unencoded_payloads = {
                                 let payload_converter = data_converter.payload_converter();
-                                let context = SerializationContext::new(
-                                    &SerializationContextData::Workflow,
-                                    payload_converter,
+                                let context_data = SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
                                 );
+                                let context =
+                                    SerializationContext::new(&context_data, payload_converter);
                                 args.serialize_payloads(&context)
                             };
                             drop(args);
                             let payloads = data_converter
                                 .codec()
-                                .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                                .encode(
+                                    &SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    ),
+                                    unencoded_payloads?,
+                                )
                                 .await?;
                             let update_id = options
                                 .update_id
@@ -987,6 +1031,29 @@ where
             output.run_id.or_else(|| self.info().run_id.clone()),
             output.known_outcome,
         ))
+    }
+
+    /// Get a handle to an existing update.
+    ///
+    /// The update definition determines the result type. The returned handle uses this workflow
+    /// handle's workflow and run IDs and does not validate the update ID until
+    /// [`get_result`](WorkflowUpdateHandle::get_result) is called.
+    pub fn get_update_handle<U>(
+        &self,
+        update: U,
+        update_id: impl Into<String>,
+    ) -> WorkflowUpdateHandle<CT, U::Output>
+    where
+        U: UpdateDefinition<Workflow = W::Run>,
+    {
+        let _ = update;
+        WorkflowUpdateHandle::new(
+            self.client.clone(),
+            update_id.into(),
+            self.info.workflow_id.clone(),
+            self.info.run_id.clone(),
+            None,
+        )
     }
 
     /// Request cancellation of this workflow.
@@ -1140,91 +1207,124 @@ where
             .await
             .map_err(WorkflowInteractionError::from)
     }
-    /// Fetch workflow execution history.
-    pub async fn fetch_history(
-        &self,
-        opts: WorkflowFetchHistoryOptions,
-    ) -> Result<WorkflowHistory, WorkflowInteractionError>
+    /// Fetch workflow execution history as a lazy stream.
+    ///
+    /// No request is sent until the returned stream is polled.
+    pub fn fetch_history(&self, opts: WorkflowFetchHistoryOptions) -> WorkflowHistory
     where
-        CT: NamespacedClient,
+        CT: NamespacedClient + 'static,
     {
         let run_id = self.info.run_id.clone().unwrap_or_default();
-        self.fetch_history_for_run(&run_id, &opts).await
+        self.fetch_history_for_run(&run_id, opts)
     }
 
-    /// Fetch history for a specific run_id, handling pagination.
-    async fn fetch_history_for_run(
+    fn fetch_history_for_run(
         &self,
         run_id: &str,
-        opts: &WorkflowFetchHistoryOptions,
-    ) -> Result<WorkflowHistory, WorkflowInteractionError>
+        opts: WorkflowFetchHistoryOptions,
+    ) -> WorkflowHistory
     where
-        CT: NamespacedClient,
+        CT: NamespacedClient + 'static,
     {
-        let mut all_events = Vec::new();
-        let mut next_page_token = vec![];
+        let client = self.client.clone();
+        let workflow_id = self.info.workflow_id.clone();
+        let history_workflow_id = workflow_id.clone();
+        let run_id = run_id.to_string();
 
-        loop {
-            let output = interceptors::call_fetch_workflow_history_page(
-                self.client.client_interceptors(),
-                FetchWorkflowHistoryPageInput {
-                    workflow_id: self.info.workflow_id.clone(),
-                    run_id: run_id.to_string(),
-                    next_page_token,
-                    options: opts.clone(),
-                },
-                Next::new({
-                    let mut client = self.client.clone();
-                    move |input: FetchWorkflowHistoryPageInput| -> BoxFuture<
-                        '_,
-                        Result<FetchWorkflowHistoryPageOutput, WorkflowInteractionError>,
-                    > {
-                        Box::pin(async move {
-                            let mut request = GetWorkflowExecutionHistoryRequest {
-                                namespace: client.namespace(),
-                                execution: Some(ProtoWorkflowExecution {
-                                    workflow_id: input.workflow_id,
-                                    run_id: input.run_id,
-                                }),
-                                next_page_token: input.next_page_token,
-                                skip_archival: input.options.skip_archival,
-                                wait_new_event: input.options.wait_new_event,
-                                history_event_filter_type: input.options.event_filter_type as i32,
-                                ..Default::default()
+        let stream = stream::unfold(
+            (Vec::new(), VecDeque::new(), false),
+            move |(mut next_page_token, mut buffer, mut exhausted)| {
+                let client = client.clone();
+                let workflow_id = workflow_id.clone();
+                let run_id = run_id.clone();
+                let opts = opts.clone();
+
+                async move {
+                    loop {
+                        if let Some(event) = buffer.pop_front() {
+                            return Some((Ok(event), (next_page_token, buffer, exhausted)));
+                        }
+
+                        if exhausted {
+                            return None;
+                        }
+
+                        let output = interceptors::call_fetch_workflow_history_page(
+                            client.client_interceptors(),
+                            FetchWorkflowHistoryPageInput {
+                                workflow_id: workflow_id.clone(),
+                                run_id: run_id.clone(),
+                                next_page_token: next_page_token.clone(),
+                                options: opts.clone(),
+                            },
+                            Next::new({
+                                let mut rpc_client = client.clone();
+                                move |input: FetchWorkflowHistoryPageInput| -> BoxFuture<
+                                    '_,
+                                    Result<
+                                        FetchWorkflowHistoryPageOutput,
+                                        WorkflowInteractionError,
+                                    >,
+                                > {
+                                    Box::pin(async move {
+                                        let mut request = GetWorkflowExecutionHistoryRequest {
+                                            namespace: rpc_client.namespace(),
+                                            execution: Some(ProtoWorkflowExecution {
+                                                workflow_id: input.workflow_id,
+                                                run_id: input.run_id,
+                                            }),
+                                            next_page_token: input.next_page_token,
+                                            skip_archival: input.options.skip_archival,
+                                            wait_new_event: input.options.wait_new_event,
+                                            history_event_filter_type:
+                                                ProtoHistoryEventFilterType::from(
+                                                    input.options.event_filter_type,
+                                                )
+                                                    as i32,
+                                            ..Default::default()
+                                        }
+                                        .into_request();
+                                        input.options.rpc_options.apply_to(&mut request);
+                                        let response =
+                                            WorkflowService::get_workflow_execution_history(
+                                                &mut rpc_client,
+                                                request,
+                                            )
+                                            .await
+                                            .map_err(WorkflowInteractionError::from_status)?
+                                            .into_inner();
+                                        Ok(FetchWorkflowHistoryPageOutput::new(
+                                            response
+                                                .history
+                                                .map(|history| history.events)
+                                                .unwrap_or_default(),
+                                            response.next_page_token,
+                                        ))
+                                    })
+                                }
+                            }),
+                        )
+                        .await;
+
+                        match output {
+                            Ok(output) => {
+                                exhausted = output.next_page_token.is_empty();
+                                next_page_token = output.next_page_token;
+                                buffer = output.events.into();
                             }
-                            .into_request();
-                            input.options.rpc_options.apply_to(&mut request);
-                            let response = WorkflowService::get_workflow_execution_history(
-                                &mut client,
-                                request,
-                            )
-                            .await
-                            .map_err(WorkflowInteractionError::from_status)?
-                            .into_inner();
-                            Ok(FetchWorkflowHistoryPageOutput::new(
-                                response
-                                    .history
-                                    .map(|history| history.events)
-                                    .unwrap_or_default(),
-                                response.next_page_token,
-                            ))
-                        })
+                            Err(error) => {
+                                return Some((Err(error), (next_page_token, buffer, true)));
+                            }
+                        }
                     }
-                }),
-            )
-            .await?;
+                }
+            },
+        );
 
-            all_events.extend(output.events);
-            if output.next_page_token.is_empty() {
-                break;
-            }
-            next_page_token = output.next_page_token;
+        WorkflowHistory {
+            inner: Box::pin(stream),
+            workflow_id: Some(history_workflow_id),
         }
-
-        Ok(WorkflowHistory::new(
-            all_events,
-            Some(self.info.workflow_id.clone()),
-        ))
     }
 }
 
@@ -1346,7 +1446,10 @@ where
             Some(update::v1::outcome::Value::Success(success)) => self
                 .client
                 .data_converter()
-                .from_payloads(&SerializationContextData::Workflow, success.payloads)
+                .from_payloads(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    success.payloads,
+                )
                 .await
                 .map_err(WorkflowUpdateError::from),
             Some(update::v1::outcome::Value::Failure(failure)) => {
@@ -1362,8 +1465,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::XorCodec;
-    use std::collections::HashMap;
+    use crate::{ClientInterceptor, test_helpers::XorCodec};
+    use futures_util::{FutureExt, StreamExt};
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
     use temporalio_common::{
         data_converters::DefaultFailureConverter,
         protos::temporal::api::{
@@ -1372,11 +1482,13 @@ mod tests {
             history::v1::WorkflowExecutionStartedEventAttributes,
             sdk::v1::UserMetadata,
             workflow::v1::WorkflowExecutionConfig,
+            workflowservice::v1::GetWorkflowExecutionHistoryResponse,
         },
     };
+    use tonic::{Request, Response};
 
-    #[test]
-    fn workflow_history_workflow_id_roundtrips() {
+    #[tokio::test]
+    async fn workflow_history_workflow_id_roundtrips() {
         let event = HistoryEvent {
             event_id: 1,
             attributes: Some(Attributes::WorkflowExecutionStartedEventAttributes(
@@ -1388,24 +1500,168 @@ mod tests {
             )),
             ..Default::default()
         };
-        let history = WorkflowHistory::new(vec![event], None);
+        let history = WorkflowHistory {
+            inner: Box::pin(stream::iter(std::iter::once(Ok(event)))),
+            workflow_id: None,
+        };
 
-        let bytes = history.to_json().unwrap();
+        let bytes = history.to_json().await.unwrap();
 
         let decoded = WorkflowHistory::from_json(&bytes).unwrap();
         assert_eq!(decoded.workflow_id(), Some("workflow-id"));
+    }
+
+    #[derive(Clone)]
+    struct MockHistoryClient {
+        responses: Arc<Mutex<VecDeque<Result<GetWorkflowExecutionHistoryResponse, tonic::Status>>>>,
+        calls: Arc<AtomicUsize>,
+        interceptors: Vec<Arc<dyn ClientInterceptor>>,
+    }
+
+    impl NamespacedClient for MockHistoryClient {
+        fn namespace(&self) -> String {
+            "test-namespace".to_owned()
+        }
+
+        fn identity(&self) -> String {
+            "test-identity".to_owned()
+        }
+
+        fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+            &self.interceptors
+        }
+    }
+
+    impl WorkflowService for MockHistoryClient {
+        fn get_workflow_execution_history(
+            &mut self,
+            _request: Request<GetWorkflowExecutionHistoryRequest>,
+        ) -> BoxFuture<'_, Result<Response<GetWorkflowExecutionHistoryResponse>, tonic::Status>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let response = self.responses.lock().unwrap().pop_front().unwrap();
+            async move { response.map(Response::new) }.boxed()
+        }
+    }
+
+    struct CountingHistoryInterceptor(Arc<AtomicUsize>);
+
+    impl ClientInterceptor for CountingHistoryInterceptor {
+        fn fetch_workflow_history_page<'a>(
+            &'a self,
+            input: FetchWorkflowHistoryPageInput,
+            next: Next<
+                'a,
+                FetchWorkflowHistoryPageInput,
+                BoxFuture<'a, Result<FetchWorkflowHistoryPageOutput, WorkflowInteractionError>>,
+            >,
+        ) -> BoxFuture<'a, Result<FetchWorkflowHistoryPageOutput, WorkflowInteractionError>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            next.run(input)
+        }
+    }
+
+    fn history_response(
+        event_ids: impl IntoIterator<Item = i64>,
+        next_page_token: &[u8],
+    ) -> GetWorkflowExecutionHistoryResponse {
+        GetWorkflowExecutionHistoryResponse {
+            history: Some(History {
+                events: event_ids
+                    .into_iter()
+                    .map(|event_id| HistoryEvent {
+                        event_id,
+                        ..Default::default()
+                    })
+                    .collect(),
+            }),
+            next_page_token: next_page_token.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn history_handle(
+        responses: impl IntoIterator<Item = Result<GetWorkflowExecutionHistoryResponse, tonic::Status>>,
+        calls: Arc<AtomicUsize>,
+        interceptors: Vec<Arc<dyn ClientInterceptor>>,
+    ) -> WorkflowHandle<MockHistoryClient, UntypedWorkflow> {
+        WorkflowHandle::new(
+            MockHistoryClient {
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                calls,
+                interceptors,
+            },
+            WorkflowExecutionInfo {
+                namespace: "test-namespace".to_owned(),
+                workflow_id: "workflow-id".to_owned(),
+                run_id: Some("run-id".to_owned()),
+                first_execution_run_id: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn workflow_history_fetches_pages_lazily() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let interceptor_calls = Arc::new(AtomicUsize::new(0));
+        let handle = history_handle(
+            [
+                Ok(history_response([], b"second-page")),
+                Ok(history_response([1, 2], b"third-page")),
+                Ok(history_response([3], b"")),
+            ],
+            calls.clone(),
+            vec![Arc::new(CountingHistoryInterceptor(
+                interceptor_calls.clone(),
+            ))],
+        );
+
+        let mut history = handle.fetch_history(WorkflowFetchHistoryOptions::default());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(history.next().await.unwrap().unwrap().event_id, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(history.next().await.unwrap().unwrap().event_id, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(history.next().await.unwrap().unwrap().event_id, 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(history.next().await.is_none());
+        assert_eq!(interceptor_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn workflow_history_yields_page_error_then_ends() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handle = history_handle(
+            [
+                Ok(history_response([1], b"second-page")),
+                Err(tonic::Status::unavailable("history unavailable")),
+            ],
+            calls.clone(),
+            Vec::new(),
+        );
+        let mut history = handle.fetch_history(WorkflowFetchHistoryOptions::default());
+
+        assert_eq!(history.next().await.unwrap().unwrap().event_id, 1);
+        assert!(matches!(
+            history.next().await.unwrap(),
+            Err(WorkflowInteractionError::Rpc(status)) if status.code() == tonic::Code::Unavailable
+        ));
+        assert!(history.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn workflow_result_details_support_typed_decoding() {
         let converter = DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             XorCodec,
         );
         let payloads = converter
             .to_payloads(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 &"workflow-result-details".to_owned(),
             )
             .await
@@ -1438,12 +1694,12 @@ mod tests {
     async fn workflow_description_memo_uses_saved_converter() {
         let converter = DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             XorCodec,
         );
         let encoded = converter
             .to_payload(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 &"memo-value".to_owned(),
             )
             .await
@@ -1474,19 +1730,31 @@ mod tests {
     async fn workflow_description_accessors_expose_decoded_fields() {
         let converter = DataConverter::default();
         let memo_payload = converter
-            .to_payload(&SerializationContextData::Workflow, &"memo-value")
+            .to_payload(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &"memo-value",
+            )
             .await
             .unwrap();
         let search_attr_payload = converter
-            .to_payload(&SerializationContextData::Workflow, &"search-value")
+            .to_payload(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &"search-value",
+            )
             .await
             .unwrap();
         let summary_payload = converter
-            .to_payload(&SerializationContextData::Workflow, &"workflow summary")
+            .to_payload(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &"workflow summary",
+            )
             .await
             .unwrap();
         let details_payload = converter
-            .to_payload(&SerializationContextData::Workflow, &"workflow details")
+            .to_payload(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &"workflow details",
+            )
             .await
             .unwrap();
         let description = WorkflowExecutionDescription::new(
