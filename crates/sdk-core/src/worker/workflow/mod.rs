@@ -1978,10 +1978,12 @@ pub(crate) enum WFMachinesError {
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
     /// History records that a task consumed stream records and the response that carried the
-    /// task brought none of them, so this worker cannot replay the run. Not the workflow's
-    /// fault: the records only travel with the task, and a worker handed a sticky task for a run
-    /// it no longer holds has no way to fetch them. Treated like a failed history fetch, so a
-    /// legacy query goes unanswered and the server retries it where the records travel.
+    /// task did not bring them, so this worker cannot replay the run. Covers a response that
+    /// brought none of them and one whose records do not cover what History says the task read.
+    /// Not the workflow's fault either way: both sides of that comparison come from the server,
+    /// and a worker handed a sticky task for a run it no longer holds has no way to fetch the
+    /// records. Treated like a failed history fetch, so a legacy query goes unanswered and the
+    /// server retries it where the records travel.
     #[error("Workflow task cannot be replayed on this worker: {0}")]
     MissingRecords(String),
 }

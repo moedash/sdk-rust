@@ -194,9 +194,10 @@ impl HistoryForReplay {
     /// read a stream cannot be replayed from its history alone. Each slice carries the records
     /// for one recorded range, tagged with the `WorkflowTaskCompleted` event that recorded it,
     /// the same shape the server puts on a poll response when it re-supplies them. Replay hands
-    /// each range to the activation of the task that consumed it and fails the task as
-    /// nondeterministic when a slice disagrees with the recorded range or a recorded range with
-    /// content has no slice.
+    /// each range to the activation of the task that consumed it. A slice that disagrees with
+    /// the recorded range, and a recorded range with content that has no slice, both fail the
+    /// task as the worker's failure rather than the workflow's: the history and the slices are
+    /// both given to replay, so neither says the workflow diverged.
     pub fn with_stream_slices(mut self, slices: impl IntoIterator<Item = StreamSlice>) -> Self {
         self.stream_slices = slices.into_iter().collect();
         self

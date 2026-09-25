@@ -2289,6 +2289,11 @@ fn stream_order(
 /// bytes and is rebuilt from the cursor alone; a range with content has to
 /// arrive, and what arrives has to cover exactly the recorded offsets. Anything
 /// else would replay the task with different input than it ran on.
+///
+/// Every disagreement here is between two things the server produced, History
+/// on one side and the poll response on the other. The workflow's own commands
+/// reach none of it, so none of these is the workflow's fault and none of them
+/// is nondeterminism.
 fn resupplied_deliveries(
     event_id: i64,
     mut cursors: Vec<StreamRange>,
@@ -2309,7 +2314,7 @@ fn resupplied_deliveries(
                 slice
             }
             Some(slice) => {
-                return Err(nondeterminism!(
+                return Err(WFMachinesError::MissingRecords(format!(
                     "Event {event_id} records that stream {} was consumed from offset {} to {}, \
                      but the server sent offsets {} to {} for it",
                     cursor.stream_id,
@@ -2317,7 +2322,7 @@ fn resupplied_deliveries(
                     cursor.to_offset,
                     slice.from_offset,
                     slice.to_offset
-                ));
+                )));
             }
             None if cursor.from_offset == cursor.to_offset => StreamSlice {
                 stream_id: cursor.stream_id,
@@ -2326,25 +2331,21 @@ fn resupplied_deliveries(
                 ..Default::default()
             },
             None => {
-                return Err(nondeterminism!(
+                return Err(WFMachinesError::MissingRecords(format!(
                     "Event {event_id} records that stream {} was consumed from offset {} to {}, \
                      but the server sent no messages for it",
-                    cursor.stream_id,
-                    cursor.from_offset,
-                    cursor.to_offset
-                ));
+                    cursor.stream_id, cursor.from_offset, cursor.to_offset
+                )));
             }
         };
         jobs.push(deliver_stream_records_job(slice));
     }
     if let Some(extra) = slices.first() {
-        return Err(nondeterminism!(
+        return Err(WFMachinesError::MissingRecords(format!(
             "The server sent stream {} from offset {} to {} for event {event_id}, which records \
              no such range",
-            extra.stream_id,
-            extra.from_offset,
-            extra.to_offset
-        ));
+            extra.stream_id, extra.from_offset, extra.to_offset
+        )));
     }
     Ok(jobs)
 }
