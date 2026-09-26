@@ -1,3 +1,4 @@
+mod append_stream_records_state_machine;
 mod workflow_machines;
 
 mod activity_state_machine;
@@ -15,6 +16,7 @@ mod modify_workflow_properties_state_machine;
 mod nexus_operation_state_machine;
 mod patch_state_machine;
 mod signal_external_state_machine;
+mod subscribe_stream_state_machine;
 mod timer_state_machine;
 mod update_state_machine;
 mod upsert_search_attributes_state_machine;
@@ -31,6 +33,7 @@ use crate::{
     worker::workflow::{WFMachinesError, fatal, nondeterminism},
 };
 use activity_state_machine::ActivityMachine;
+use append_stream_records_state_machine::AppendStreamRecordsMachine;
 use cancel_external_state_machine::CancelExternalMachine;
 use cancel_workflow_state_machine::CancelWorkflowMachine;
 use child_workflow_state_machine::ChildWorkflowMachine;
@@ -46,6 +49,7 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt::{Debug, Display},
 };
+use subscribe_stream_state_machine::SubscribeStreamMachine;
 use temporalio_common::{
     fsm_trait::{StateMachine, TransitionResult},
     protos::temporal::api::{
@@ -80,6 +84,8 @@ enum Machines {
     WorkflowTaskMachine,
     UpsertSearchAttributesMachine,
     ModifyWorkflowPropertiesMachine,
+    SubscribeStreamMachine,
+    AppendStreamRecordsMachine,
     UpdateMachine,
     NexusOperationMachine,
 }

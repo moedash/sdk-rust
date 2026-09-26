@@ -1493,6 +1493,23 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for SubscribeStream {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "SubscribeStream({})", self.stream_name_or_id)
+                }
+            }
+
+            impl Display for AppendStreamRecords {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "AppendStreamRecords({}, {} records)",
+                        self.stream_name,
+                        self.records.len()
+                    )
+                }
+            }
+
             impl Display for StartTimer {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "StartTimer({})", self.seq)
@@ -1888,6 +1905,28 @@ pub mod temporal {
                     impl Display for command::Attributes {
                         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                             write!(f, "{:?}", self.as_type())
+                        }
+                    }
+
+                    impl From<workflow_commands::AppendStreamRecords> for command::Attributes {
+                        fn from(s: workflow_commands::AppendStreamRecords) -> Self {
+                            Self::AppendStreamRecordsCommandAttributes(
+                                AppendStreamRecordsCommandAttributes {
+                                    stream_name: s.stream_name,
+                                    records: s.records,
+                                },
+                            )
+                        }
+                    }
+
+                    impl From<workflow_commands::SubscribeStream> for command::Attributes {
+                        fn from(s: workflow_commands::SubscribeStream) -> Self {
+                            Self::SubscribeStreamCommandAttributes(
+                                SubscribeStreamCommandAttributes {
+                                    stream_name_or_id: s.stream_name_or_id,
+                                    start_offset: s.start_offset,
+                                },
+                            )
                         }
                     }
 
