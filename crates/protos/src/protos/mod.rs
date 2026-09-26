@@ -1374,6 +1374,13 @@ pub mod coresdk {
                                 fin.reason()
                             )
                         }
+                        workflow_activation_job::Variant::DeliverStreamRecords(d) => {
+                            write!(
+                                f,
+                                "DeliverStreamRecords({}, {}..{})",
+                                d.stream_id, d.from_offset, d.to_offset
+                            )
+                        }
                     }
                 }
             }
@@ -1580,6 +1587,23 @@ pub mod coresdk {
                         None => write!(f, "Empty"),
                         Some(v) => write!(f, "{v}"),
                     }
+                }
+            }
+
+            impl Display for SubscribeStream {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "SubscribeStream({})", self.stream_name_or_id)
+                }
+            }
+
+            impl Display for AppendStreamRecords {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "AppendStreamRecords({}, {} records)",
+                        self.stream_name,
+                        self.records.len()
+                    )
                 }
             }
 
@@ -2060,6 +2084,28 @@ pub mod temporal {
                     impl Display for command::Attributes {
                         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                             write!(f, "{:?}", self.as_type())
+                        }
+                    }
+
+                    impl From<workflow_commands::AppendStreamRecords> for command::Attributes {
+                        fn from(s: workflow_commands::AppendStreamRecords) -> Self {
+                            Self::AppendStreamRecordsCommandAttributes(
+                                AppendStreamRecordsCommandAttributes {
+                                    stream_name: s.stream_name,
+                                    records: s.records,
+                                },
+                            )
+                        }
+                    }
+
+                    impl From<workflow_commands::SubscribeStream> for command::Attributes {
+                        fn from(s: workflow_commands::SubscribeStream) -> Self {
+                            Self::SubscribeStreamCommandAttributes(
+                                SubscribeStreamCommandAttributes {
+                                    stream_name_or_id: s.stream_name_or_id,
+                                    start_offset: s.start_offset,
+                                },
+                            )
                         }
                     }
 

@@ -66,6 +66,7 @@ mod machine_coverage_report {
     use super::*;
     use crate::worker::workflow::machines::{
         StateMachine, activity_state_machine::ActivityMachine,
+        append_stream_records_state_machine::AppendStreamRecordsMachine,
         cancel_external_state_machine::CancelExternalMachine,
         cancel_workflow_state_machine::CancelWorkflowMachine,
         child_workflow_state_machine::ChildWorkflowMachine,
@@ -76,7 +77,8 @@ mod machine_coverage_report {
         local_activity_state_machine::LocalActivityMachine,
         modify_workflow_properties_state_machine::ModifyWorkflowPropertiesMachine,
         nexus_operation_state_machine::NexusOperationMachine, patch_state_machine::PatchMachine,
-        signal_external_state_machine::SignalExternalMachine, timer_state_machine::TimerMachine,
+        signal_external_state_machine::SignalExternalMachine,
+        subscribe_stream_state_machine::SubscribeStreamMachine, timer_state_machine::TimerMachine,
         update_state_machine::UpdateMachine,
         upsert_search_attributes_state_machine::UpsertSearchAttributesMachine,
         workflow_task_state_machine::WorkflowTaskMachine,
@@ -119,6 +121,8 @@ mod machine_coverage_report {
         let mut update = UpdateMachine::visualizer().to_owned();
         let mut nexus = NexusOperationMachine::visualizer().to_owned();
         let mut external_stream = ExternalStreamMachine::visualizer().to_owned();
+        let mut subscribe_stream = SubscribeStreamMachine::visualizer().to_owned();
+        let mut append_stream_records = AppendStreamRecordsMachine::visualizer().to_owned();
 
         // This isn't at all efficient but doesn't need to be.
         // Replace transitions in the vizzes with green color if they are covered.
@@ -147,6 +151,12 @@ mod machine_coverage_report {
                 m @ "UpdateMachine" => cover_transitions(m, &mut update, coverage),
                 m @ "NexusOperationMachine" => cover_transitions(m, &mut nexus, coverage),
                 m @ "ExternalStreamMachine" => cover_transitions(m, &mut external_stream, coverage),
+                m @ "SubscribeStreamMachine" => {
+                    cover_transitions(m, &mut subscribe_stream, coverage)
+                }
+                m @ "AppendStreamRecordsMachine" => {
+                    cover_transitions(m, &mut append_stream_records, coverage)
+                }
                 m => panic!("Unknown machine {m}"),
             }
         }

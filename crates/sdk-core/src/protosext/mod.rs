@@ -39,6 +39,7 @@ use temporalio_common::protos::{
         history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes, history_event},
         query::v1::WorkflowQuery,
         sdk::v1::{EventGroupMarker, UserMetadata},
+        stream::v1::StreamSlice,
         workflowservice::v1::PollWorkflowTaskQueueResponse,
     },
     utilities::TryIntoOrNone,
@@ -64,6 +65,10 @@ pub(crate) struct ValidPollWFTQResponse {
     pub(crate) query_requests: Vec<QueryWorkflow>,
     /// Protocol messages
     pub(crate) messages: Vec<IncomingProtocolMessage>,
+    /// Ranges of streams this workflow subscribed to. A slice tagged with a
+    /// completed-event id is re-supplying what an earlier task consumed; an
+    /// untagged one belongs to the task about to run.
+    pub(crate) stream_slices: Vec<StreamSlice>,
 
     /// Zero-size field to prevent explicit construction
     _cant_construct_me: (),
@@ -109,6 +114,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                 query,
                 queries,
                 messages,
+                stream_slices,
                 ..
             } => {
                 if task_token.is_empty() {
@@ -133,6 +139,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                     legacy_query: query,
                     query_requests,
                     messages,
+                    stream_slices,
                     _cant_construct_me: (),
                 })
             }

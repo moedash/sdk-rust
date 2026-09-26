@@ -26,6 +26,7 @@ use temporalio_common::protos::{
         enums::v1::{EventType, TaskQueueKind, WorkflowTaskFailedCause},
         failure::v1::{CanceledFailureInfo, Failure, failure},
         history::v1::{history_event::Attributes, *},
+        stream::v1::StreamRange,
         taskqueue::v1::TaskQueue,
         update,
         update::v1::outcome,
@@ -130,6 +131,49 @@ impl TestHistoryBuilder {
             ..Default::default()
         });
         self.previous_task_completed_id = id;
+    }
+
+    /// Add a workflow task completed event recording the stream offsets that
+    /// task consumed. Only the range is in History; the payloads come back from
+    /// the server on the poll response.
+    pub fn add_workflow_task_completed_with_consumed_stream_ranges(
+        &mut self,
+        cursors: Vec<StreamRange>,
+    ) -> i64 {
+        let id = self.add(WorkflowTaskCompletedEventAttributes {
+            scheduled_event_id: self.workflow_task_scheduled_event_id,
+            consumed_stream_ranges: cursors,
+            ..Default::default()
+        });
+        self.previous_task_completed_id = id;
+        id
+    }
+
+    /// Add the event a subscribe-stream command produces.
+    pub fn add_stream_subscribed(&mut self, stream_id: &str, start_offset: i64) -> i64 {
+        let attrs = WorkflowStreamSubscribedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            stream_id: stream_id.to_string(),
+            start_offset,
+        };
+        self.add(attrs)
+    }
+
+    /// Add the event an append-stream-records command produces. The range is
+    /// half-open, as it is on the event.
+    pub fn add_stream_records_appended(
+        &mut self,
+        stream_id: &str,
+        from_offset: i64,
+        to_offset: i64,
+    ) -> i64 {
+        let attrs = WorkflowStreamRecordsAppendedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            stream_id: stream_id.to_string(),
+            from_offset,
+            to_offset,
+        };
+        self.add(attrs)
     }
 
     /// Add a workflow task timed out event.

@@ -300,9 +300,11 @@ impl ManagedRun {
             if is_incremental {
                 self.metrics.sticky_cache_hit();
             }
-            self.wfm
-                .machines
-                .new_work_from_server(work.update, work.messages)?;
+            self.wfm.machines.new_work_from_server(
+                work.update,
+                work.messages,
+                work.stream_slices,
+            )?;
         }
 
         // A wake Signal reaches Core as a history event, so it can only be classified once that
@@ -788,7 +790,10 @@ impl ManagedRun {
                 EvictionReason::Unspecified | EvictionReason::PaginationOrHistoryFetch
             );
 
-        let rur = if is_no_report_query_fail {
+        // An unreported query failure leaves an intact run in the cache for the retry to use. A
+        // run whose machines broke while it was being brought up to the query is given up
+        // instead, since it can produce nothing more, so the retry starts from history.
+        let rur = if is_no_report_query_fail && !self.am_broken {
             None
         } else {
             // Blow up any cached data associated with the workflow

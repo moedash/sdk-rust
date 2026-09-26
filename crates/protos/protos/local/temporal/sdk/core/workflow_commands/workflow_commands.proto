@@ -15,6 +15,7 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/sdk/v1/event_group_marker.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
@@ -61,6 +62,10 @@ message WorkflowCommand {
         ExternalStreamFinalized external_stream_finalized = 26;
         WorkflowOutputStreamCommit workflow_output_stream_commit = 27;
         WorkflowOutputStreamBuffered workflow_output_stream_buffered = 28;
+        // The two numbers below are shared with the native stream tree, which
+        // leaves 23 to 28 to the commands above, and must not be reused.
+        SubscribeStream subscribe_stream = 29;
+        AppendStreamRecords append_stream_records = 30;
     }
 }
 
@@ -148,6 +153,43 @@ message WorkflowOutputStreamCommit {
 // open Workflow Task until the earliest reported deadline and then asks lang to finalize it.
 message WorkflowOutputStreamBuffered {
     google.protobuf.Duration max_publish_latency = 1;
+}
+
+// Append a batch of records to a stream this workflow owns.
+//
+// The bodies go to the stream's own log rather than into History, which gets
+// one fixed-size event naming the offset range. That is what makes the batch
+// size free: a thousand records cost the same in History as one. The server
+// stores each record with an empty producer id, because the workflow is the
+// producer here.
+message AppendStreamRecords {
+    // Name of a stream this workflow owns, scoped to the workflow. Created on
+    // first use. Empty means the workflow's default output stream. A workflow
+    // cannot append to a stream in another execution, so this is never the id
+    // of a standalone stream.
+    string stream_name = 1;
+    repeated temporal.api.stream.v1.StreamRecord records = 2;
+}
+
+// Subscribe this workflow to a stream, so later Workflow Tasks carry the
+// ranges it has not consumed yet.
+//
+// The stream's addressing is resolved by the server. A workflow cannot look it
+// up without doing I/O, and a value it carried would be a reading rather than a
+// fact, so it could differ on replay.
+message SubscribeStream {
+    // Stream to consume, named either way round: a stream this workflow owns
+    // by the name it appends under, a stream in another execution by its id.
+    // The server tries them in that order, so a workflow that owns a stream
+    // under this name cannot reach a standalone stream with the same id. When
+    // neither exists the workflow gets a stream of its own by that name, which
+    // is how a reader subscribes before the first record is written.
+    string stream_name_or_id = 1;
+    // Where to start, as an absolute offset. Any negative value means the head
+    // of the stream as of registration, and they all mean the same thing. The
+    // server resolves it and records the result, so replay does not resolve it
+    // again.
+    int64 start_offset = 2;
 }
 
 message StartTimer {
