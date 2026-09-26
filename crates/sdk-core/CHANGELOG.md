@@ -33,6 +33,19 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Workflows can subscribe to server-side streams and append batches of records to them with the
+  `SubscribeStream` and `AppendStreamRecords` commands. Consumed ranges reach the workflow as
+  `DeliverStreamRecords` activation jobs, and replay hands each recorded range back in the
+  activation of the task that consumed it.
+* A history fed to a replay worker can carry the stream records its tasks consumed
+  (`HistoryForReplay::with_stream_slices`), so a language replayer that fetched them from the
+  stream service can replay a consuming workflow. History alone holds only the offsets.
+* A task whose history records a consumed range with content that the response carried no
+  records for fails before the workflow runs, rather than after it ran on less input. A legacy
+  query dispatched that way to a worker that no longer holds the run goes unanswered, so the
+  server retries it on the normal task queue, where the records travel with it.
+
 ### Fixed
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
@@ -68,18 +81,6 @@ relevant information.
   metrics now carry a `failure_reason` attribute. Each is now split into one time series per
   reason, which may affect existing dashboards.
 * Workflow task completions larger than the gRPC request size limit are now paginated automatically when the namespace supports it. Paginated workflow task completions require Temporal Server 1.32.0 or later.
-* Workflows can subscribe to server-side streams and append batches of records to them with the
-  `SubscribeStream` and `AppendStreamRecords` commands. Consumed ranges reach the workflow as
-  `DeliverStreamRecords` activation jobs, and replay hands each recorded range back in the
-  activation of the task that consumed it.
-* A history fed to a replay worker can carry the stream records its tasks consumed
-  (`HistoryForReplay::with_stream_slices`), so a language replayer that fetched them from the
-  stream service can replay a consuming workflow. History alone holds only the offsets.
-* A task whose history records a consumed range with content that the response carried no
-  records for fails before the workflow runs, rather than after it ran on less input. A legacy
-  query dispatched that way to a worker that no longer holds the run goes unanswered, so the
-  server retries it on the normal task queue, where the records travel with it.
-
 ### Breaking Changes :boom:
 * The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,
   `WorkerCallbacks`, `WorkflowExecutionInfo`, `ActivityCloseTimeouts`,
