@@ -29,8 +29,9 @@ use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    runtime::{AutoscalingOptions, PollerBehavior},
 };
-use temporalio_sdk_core::{CoreRuntime, PollerBehavior, TunerHolder};
+use temporalio_sdk_core::{CoreRuntime, TunerHolder};
 use tracing::info;
 
 struct JitteryEchoActivities;
@@ -133,17 +134,21 @@ async fn poller_load_spiky() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 100));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 100)));
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
     starter
         .sdk_config
         .register_activities(JitteryEchoActivities)
@@ -171,13 +176,12 @@ async fn poller_load_spiky() {
             .await
             .unwrap();
         workflow_handles.push(
-            WorkflowExecutionInfo {
-                namespace: client.namespace(),
-                workflow_id: wfid,
-                run_id: Some(rid),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(client.clone()),
+            WorkflowExecutionInfo::builder()
+                .namespace(client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(rid))
+                .build()
+                .bind_untyped(client.clone()),
         );
     }
     info!("Done starting workflows");
@@ -209,13 +213,12 @@ async fn poller_load_spiky() {
                 .await
                 .unwrap();
             workflow_handles.push(
-                WorkflowExecutionInfo {
-                    namespace: client.namespace(),
-                    workflow_id: wfid,
-                    run_id: Some(rid),
-                    first_execution_run_id: None,
-                }
-                .bind_untyped(client.clone()),
+                WorkflowExecutionInfo::builder()
+                    .namespace(client.namespace())
+                    .workflow_id(wfid)
+                    .maybe_run_id(Some(rid))
+                    .build()
+                    .bind_untyped(client.clone()),
             );
         }
         stream::iter(workflow_handles)
@@ -277,12 +280,14 @@ async fn poller_load_sustained() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100)));
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
     starter
         .sdk_config
         .register_workflow::<PollerLoadSustainedWf>()
@@ -308,13 +313,12 @@ async fn poller_load_sustained() {
             .await
             .unwrap();
         workflow_handles.push(
-            WorkflowExecutionInfo {
-                namespace: client.namespace(),
-                workflow_id: wfid,
-                run_id: Some(rid),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(client.clone()),
+            WorkflowExecutionInfo::builder()
+                .namespace(client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(rid))
+                .build()
+                .bind_untyped(client.clone()),
         );
     }
     info!("Done starting workflows");
@@ -354,17 +358,21 @@ async fn poller_load_spike_then_sustained() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100)));
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
     starter
         .sdk_config
         .register_activities(JitteryEchoActivities)
@@ -392,13 +400,12 @@ async fn poller_load_spike_then_sustained() {
             .await
             .unwrap();
         workflow_handles.push(
-            WorkflowExecutionInfo {
-                namespace: client.namespace(),
-                workflow_id: wfid,
-                run_id: Some(rid),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(client.clone()),
+            WorkflowExecutionInfo::builder()
+                .namespace(client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(rid))
+                .build()
+                .bind_untyped(client.clone()),
         );
     }
     info!("Done starting workflows");
@@ -429,13 +436,12 @@ async fn poller_load_spike_then_sustained() {
                 .await
                 .unwrap();
             workflow_handles.push(
-                WorkflowExecutionInfo {
-                    namespace: client.namespace(),
-                    workflow_id: wfid,
-                    run_id: Some(rid),
-                    first_execution_run_id: None,
-                }
-                .bind_untyped(client.clone()),
+                WorkflowExecutionInfo::builder()
+                    .namespace(client.namespace())
+                    .workflow_id(wfid)
+                    .maybe_run_id(Some(rid))
+                    .build()
+                    .bind_untyped(client.clone()),
             );
             tokio::time::sleep(Duration::from_secs(1)).await;
         }

@@ -2,7 +2,10 @@ use crate::{
     abstractions::UsedMeteredSemPermit,
     pollers::{BoxedNexusPoller, NexusPollItem, new_nexus_task_poller},
     telemetry::metrics::{self, FailureReason, MetricsContext},
-    worker::{CompleteNexusError, NexusSlotKind, PollError, client::WorkerClient},
+    worker::{
+        CompleteNexusError, NexusSlotKind, PollError,
+        client::{WorkerClient, payload_limit_violation_from},
+    },
 };
 use anyhow::anyhow;
 use futures_util::{
@@ -18,7 +21,6 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use temporalio_client::payload_limit_violation_from;
 use temporalio_common::{
     payload_limits::PayloadLimitViolation,
     protos::{
@@ -398,7 +400,7 @@ where
                                 }
                             }
 
-                            let tt = TaskToken(t.resp.task_token.clone());
+                            let tt: TaskToken = t.resp.task_token.clone().into();
                             let mut timeout_task = None;
                             let mut request_deadline: Option<Timestamp> = None;
                             if let Some(timeout_str) = t
@@ -418,7 +420,7 @@ where
                                         "Timing out nexus task due to elapsed local timeout timer"
                                     );
                                         let _ = cancels_tx.send(CancelNexusTask {
-                                            task_token: tt_clone.0,
+                                            task_token: tt_clone.into_inner(),
                                             reason: NexusTaskCancelReason::TimedOut.into(),
                                         });
                                     }));
@@ -508,7 +510,7 @@ where
                         tokio::time::sleep(gp).await;
                         for (tt, _) in outstanding_task_clone.lock().iter() {
                             let _ = cancels_tx_clone.send(CancelNexusTask {
-                                task_token: tt.0.clone(),
+                                task_token: tt.clone().into_inner(),
                                 reason: NexusTaskCancelReason::WorkerShutdown.into(),
                             });
                         }

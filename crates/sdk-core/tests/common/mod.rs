@@ -3,7 +3,6 @@
 
 pub(crate) mod activity_functions;
 pub(crate) mod fake_grpc_server;
-pub(crate) mod http_proxy;
 pub(crate) mod workflows;
 
 use anyhow::bail;
@@ -23,7 +22,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -32,6 +31,7 @@ use temporalio_client::{
     Client, ClientOptions, ClientTlsOptions, Connection, ConnectionOptions, GrpcCompression,
     NamespacedClient, TlsOptions, UntypedWorkflow, UntypedWorkflowHandle, WorkflowExecutionInfo,
     WorkflowGetResultOptions, WorkflowHandle, WorkflowStartOptions,
+    envconfig::LoadClientConfigProfileOptions,
     errors::{WorkflowGetResultError, WorkflowStartError},
     grpc::WorkflowService,
 };
@@ -40,7 +40,7 @@ use temporalio_common::{
     data_converters::{DataConverter, RawValue},
     protos::{
         coresdk::{
-            workflow_activation::WorkflowActivation,
+            workflow_activation::{WorkflowActivation, remove_from_cache::EvictionReason},
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
@@ -55,15 +55,13 @@ use temporalio_common::{
 };
 use temporalio_sdk::{
     Worker, WorkerOptions,
-    interceptors::{
-        FailOnNondeterminismInterceptor, ReturnWorkflowExitValueInterceptor, WorkerInterceptor,
-    },
+    interceptors::{ReturnWorkflowExitValueInterceptor, WorkerInterceptor},
 };
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use temporalio_sdk_core::test_help::NAMESPACE;
 use temporalio_sdk_core::{
-    CoreRuntime, RuntimeOptions, Worker as CoreWorker, WorkerConfig, WorkerVersioningStrategy,
-    init_replay_worker, init_worker,
+    CoreRuntime, RuntimeOptions, Worker as CoreWorker, WorkerConfig,
+    WorkerTuner as CoreWorkerTuner, WorkerVersioningStrategy, init_replay_worker, init_worker,
     replay::{HistoryForReplay, ReplayWorkerInput},
     test_help::{MockPollCfg, build_mock_pollers, mock_worker},
 };
@@ -77,6 +75,7 @@ pub(crate) const INTEG_SERVER_TARGET_ENV_VAR: &str = "TEMPORAL_SERVICE_ADDRESS";
 pub(crate) const INTEG_NAMESPACE_ENV_VAR: &str = "TEMPORAL_NAMESPACE";
 pub(crate) const INTEG_USE_TLS_ENV_VAR: &str = "TEMPORAL_USE_TLS";
 pub(crate) const INTEG_API_KEY: &str = "TEMPORAL_API_KEY_PATH";
+pub(crate) const TEST_ENV_CONFIG_SERVER_ENV_VAR: &str = "TEMPORAL_TEST_ENV_CONFIG_SERVER";
 pub(crate) static SEARCH_ATTR_TXT: &str = "CustomTextField";
 pub(crate) static SEARCH_ATTR_INT: &str = "CustomIntField";
 /// If set, turn export traces and metrics to the OTel collector at the given URL
@@ -91,6 +90,36 @@ pub(crate) const INTEG_CLIENT_IDENTITY: &str = "integ_tester";
 pub(crate) const INTEG_CLIENT_NAME: &str = "temporal-core";
 pub(crate) const INTEG_CLIENT_VERSION: &str = "0.1.0";
 
+// Envconfig can read TOML profiles and TLS credentials from files. Load one immutable snapshot so
+// concurrently-created clients and workers cannot observe different configuration during a test
+// run.
+static ENV_CONFIG_CLIENT_CONFIG: LazyLock<(ConnectionOptions, String)> = LazyLock::new(|| {
+    let (mut connection_options, client_options) =
+        ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())
+            .unwrap_or_else(|err| panic!("Failed to load integration test envconfig: {err}"));
+    connection_options.identity = INTEG_CLIENT_IDENTITY.to_string();
+    (connection_options, client_options.namespace)
+});
+
+/// Causes test workers to fail immediately when Core evicts a workflow for nondeterminism.
+pub(crate) struct FailOnNondeterminismInterceptor {}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for FailOnNondeterminismInterceptor {
+    async fn on_workflow_activation(
+        &self,
+        activation: &WorkflowActivation,
+    ) -> Result<(), anyhow::Error> {
+        if matches!(
+            activation.eviction_reason(),
+            Some(EvictionReason::Nondeterminism)
+        ) {
+            bail!("Workflow is being evicted because of nondeterminism! {activation}");
+        }
+        Ok(())
+    }
+}
+
 /// Create a worker instance which will use the provided test name to base the task queue and wf id
 /// upon. Returns the instance.
 pub(crate) async fn init_core_and_create_wf(test_name: &str) -> CoreWfStarter {
@@ -101,7 +130,12 @@ pub(crate) async fn init_core_and_create_wf(test_name: &str) -> CoreWfStarter {
 }
 
 pub(crate) fn integ_namespace() -> String {
-    env::var(INTEG_NAMESPACE_ENV_VAR).unwrap_or(NAMESPACE.to_string())
+    if env::var_os(TEST_ENV_CONFIG_SERVER_ENV_VAR).is_some() {
+        let (_, namespace) = &*ENV_CONFIG_CLIENT_CONFIG;
+        namespace.clone()
+    } else {
+        env::var(INTEG_NAMESPACE_ENV_VAR).unwrap_or(NAMESPACE.to_string())
+    }
 }
 
 pub(crate) fn integ_worker_config(tq: &str) -> WorkerConfig {
@@ -123,10 +157,12 @@ pub(crate) fn integ_worker_config(tq: &str) -> WorkerConfig {
 pub(crate) fn integ_sdk_config(tq: &str) -> WorkerOptions {
     WorkerOptions::new(tq)
         .deployment_options(
-            WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-                deployment_name: "".to_owned(),
-                build_id: "test_build_id".to_owned(),
-            })
+            WorkerDeploymentOptions::new(
+                WorkerDeploymentVersion::builder()
+                    .deployment_name("".to_owned())
+                    .build_id("test_build_id".to_owned())
+                    .build(),
+            )
             .build(),
         )
         .build()
@@ -319,6 +355,7 @@ pub(crate) struct CoreWfStarter {
     /// Run when initializing, allows for altering the config used to init the core worker
     #[allow(clippy::type_complexity)] // It's not tho
     core_config_mutator: Option<Arc<dyn Fn(&mut WorkerConfig)>>,
+    core_tuner_override: Option<Arc<dyn CoreWorkerTuner + Send + Sync>>,
     core_task_types: Option<WorkerTaskTypes>,
 }
 struct InitializedWorker {
@@ -444,6 +481,7 @@ impl CoreWfStarter {
             client_override,
             min_local_server_version: None,
             core_config_mutator: None,
+            core_tuner_override: None,
             core_task_types: None,
         }
     }
@@ -460,6 +498,7 @@ impl CoreWfStarter {
             min_local_server_version: self.min_local_server_version.clone(),
             initted_worker: Default::default(),
             core_config_mutator: self.core_config_mutator.clone(),
+            core_tuner_override: self.core_tuner_override.clone(),
             core_task_types: self.core_task_types,
         }
     }
@@ -475,9 +514,10 @@ impl CoreWfStarter {
         let interceptor_router = TestWorkerInterceptorRouter::default();
         let mut sdk_config = self.sdk_config.clone();
         sdk_config.worker_interceptor(interceptor_router.clone());
-        let sdk = Worker::new_from_core_options(worker, client.options().clone(), sdk_config)
-            .expect("SDK worker should initialize from core worker and options");
-        let mut w = TestWorker::new_with_interceptor_router(sdk, interceptor_router);
+        let sdk =
+            Worker::new_from_core_options(worker.clone(), client.options().clone(), sdk_config)
+                .expect("SDK worker should initialize from core worker and options");
+        let mut w = TestWorker::new_with_interceptor_router(sdk, worker, interceptor_router);
         w.client = Some(client);
 
         w
@@ -485,6 +525,10 @@ impl CoreWfStarter {
 
     pub(crate) fn set_core_cfg_mutator(&mut self, mutator: impl Fn(&mut WorkerConfig) + 'static) {
         self.core_config_mutator = Some(Arc::new(mutator))
+    }
+
+    pub(crate) fn set_core_tuner(&mut self, tuner: Arc<dyn CoreWorkerTuner + Send + Sync>) {
+        self.core_tuner_override = Some(tuner);
     }
 
     pub(crate) fn set_core_task_types(&mut self, task_types: WorkerTaskTypes) {
@@ -577,9 +621,9 @@ impl CoreWfStarter {
         let events = client
             .get_workflow_handle::<UntypedWorkflow>(self.get_wf_id())
             .fetch_history(Default::default())
+            .into_events()
             .await
-            .unwrap()
-            .into_events();
+            .unwrap();
         History { events }
     }
 
@@ -640,6 +684,9 @@ impl CoreWfStarter {
                 if let Some(ref ccm) = self.core_config_mutator {
                     ccm(&mut core_config);
                 }
+                if let Some(tuner) = &self.core_tuner_override {
+                    core_config.tuner = Some(tuner.clone());
+                }
                 let worker =
                     init_worker(rt, core_config, connection).expect("Worker inits cleanly");
                 InitializedWorker {
@@ -654,6 +701,7 @@ impl CoreWfStarter {
 /// Provides conveniences for running integ tests with the SDK (against real server or mocks)
 pub(crate) struct TestWorker {
     inner: Worker,
+    core_worker: Arc<CoreWorker>,
     interceptor_router: Option<TestWorkerInterceptorRouter>,
     client: Option<Client>,
     pub started_workflows: Arc<Mutex<Vec<WorkflowExecutionInfo>>>,
@@ -663,9 +711,10 @@ pub(crate) struct TestWorker {
 }
 impl TestWorker {
     /// Create a new test worker
-    pub(crate) fn new(sdk: Worker) -> Self {
+    pub(crate) fn new(sdk: Worker, core_worker: Arc<CoreWorker>) -> Self {
         Self {
             inner: sdk,
+            core_worker,
             interceptor_router: None,
             client: None,
             started_workflows: Arc::new(Mutex::new(vec![])),
@@ -675,11 +724,12 @@ impl TestWorker {
 
     fn new_with_interceptor_router(
         sdk: Worker,
+        core_worker: Arc<CoreWorker>,
         interceptor_router: TestWorkerInterceptorRouter,
     ) -> Self {
         Self {
             interceptor_router: Some(interceptor_router),
-            ..Self::new(sdk)
+            ..Self::new(sdk, core_worker)
         }
     }
 
@@ -749,12 +799,13 @@ impl TestWorker {
         }
         let wfid = options.workflow_id.clone();
         let handle = c.start_workflow(workflow, input, options).await?;
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: c.namespace(),
-            workflow_id: wfid,
-            run_id: handle.info().run_id.clone(),
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(c.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(handle.info().run_id.clone())
+                .build(),
+        );
         Ok(handle)
     }
 
@@ -763,16 +814,18 @@ impl TestWorker {
         wf_id: impl Into<String>,
         run_id: Option<String>,
     ) {
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: self
-                .client
-                .as_ref()
-                .map(|c| c.namespace())
-                .unwrap_or(NAMESPACE.to_owned()),
-            workflow_id: wf_id.into(),
-            run_id,
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(
+                    self.client
+                        .as_ref()
+                        .map(|c| c.namespace())
+                        .unwrap_or(NAMESPACE.to_owned()),
+                )
+                .workflow_id(wf_id.into())
+                .maybe_run_id(run_id)
+                .build(),
+        );
     }
 
     /// Runs until all expected workflows have completed and then shuts down the worker
@@ -816,7 +869,7 @@ impl TestWorker {
     }
 
     pub(crate) fn core_worker(&self) -> Arc<temporalio_sdk_core::Worker> {
-        self.inner.core_worker()
+        self.core_worker.clone()
     }
 }
 
@@ -847,12 +900,13 @@ impl TestWorkerSubmitterHandle {
             )
             .await?;
         let run_id = handle.run_id().unwrap().to_string();
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: self.client.namespace(),
-            workflow_id: wfid,
-            run_id: Some(run_id.clone()),
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(self.client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(run_id.clone()))
+                .build(),
+        );
         Ok(run_id)
     }
 }
@@ -908,6 +962,11 @@ impl TestWorkerCompletionIceptor {
 }
 /// Returns the connection options used to connect to the server used for integration tests.
 pub(crate) fn get_integ_server_options() -> ConnectionOptions {
+    if env::var_os(TEST_ENV_CONFIG_SERVER_ENV_VAR).is_some() {
+        let (connection_options, _) = &*ENV_CONFIG_CLIENT_CONFIG;
+        return connection_options.clone();
+    }
+
     let temporal_server_address = env::var(INTEG_SERVER_TARGET_ENV_VAR)
         .unwrap_or_else(|_| "http://localhost:7233".to_owned());
     let url = Url::try_from(&*temporal_server_address).unwrap();
@@ -1033,7 +1092,7 @@ where
         worker: &mut TestWorker,
     ) -> Result<Option<Payload>, anyhow::Error> {
         let wf_id = self.info().workflow_id.clone();
-        let events = self.fetch_history(Default::default()).await?.into_events();
+        let events = self.fetch_history(Default::default()).into_events().await?;
         let with_id = HistoryForReplay::new(events, wf_id);
         let replay_worker = init_core_replay_preloaded(worker.inner.task_queue(), [with_id]);
         worker.inner.with_new_core_worker(Arc::new(replay_worker));
@@ -1166,7 +1225,7 @@ pub(crate) fn mock_sdk_cfg_with_options(
     poll_cfg.using_rust_sdk = true;
     let mut mock = build_mock_pollers(poll_cfg);
     mock.worker_cfg(mutator);
-    let core = mock_worker(mock);
+    let core = Arc::new(mock_worker(mock));
     let interceptor_router = TestWorkerInterceptorRouter::default();
     let client_options = ClientOptions::new(core.get_config().namespace.clone())
         .data_converter(DataConverter::default())
@@ -1175,9 +1234,9 @@ pub(crate) fn mock_sdk_cfg_with_options(
         .worker_interceptor(interceptor_router.clone())
         .build();
     options_mutator(&mut worker_options);
-    let sdk = Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+    let sdk = Worker::new_from_core_options(core.clone(), client_options, worker_options)
         .expect("mock worker options are valid");
-    TestWorker::new_with_interceptor_router(sdk, interceptor_router)
+    TestWorker::new_with_interceptor_router(sdk, core, interceptor_router)
 }
 
 #[derive(Default)]
@@ -1264,6 +1323,10 @@ pub(crate) fn integ_dev_server_config(
             "frontend.workerCommandsEnabled=true".to_owned(),
             "--dynamic-config-value".to_owned(),
             "system.enableCancelActivityWorkerCommand=true".to_owned(),
+            "--dynamic-config-value".to_owned(),
+            "history.enableWorkflowTaskCompletionPagination=true".to_owned(),
+            "--dynamic-config-value".to_owned(),
+            "system.transactionSizeLimit=33554432".to_owned(),
             "--dynamic-config-value".to_owned(),
             "matching.rps=12000".to_owned(),
             "--search-attribute".to_string(),

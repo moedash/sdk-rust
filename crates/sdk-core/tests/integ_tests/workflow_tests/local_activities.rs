@@ -1,7 +1,7 @@
 use crate::common::{
-    ActivationAssertionsInterceptor, CoreWfStarter, WorkflowHandleExt,
-    activity_functions::StdActivities, history_from_proto_binary, init_core_replay_preloaded,
-    workflows::LaProblemWorkflow,
+    ActivationAssertionsInterceptor, CoreWfStarter, FailOnNondeterminismInterceptor,
+    WorkflowHandleExt, activity_functions::StdActivities, history_from_proto_binary,
+    init_core_replay_preloaded, workflows::LaProblemWorkflow,
 };
 use anyhow::anyhow;
 use crossbeam_queue::SegQueue;
@@ -40,7 +40,7 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::{RecordMarkerCommandAttributes, command},
-            common::v1::RetryPolicy,
+            common::v1::{Payload, RetryPolicy},
             enums::v1::{
                 CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
             },
@@ -56,7 +56,7 @@ use temporalio_sdk::{
     CancellableFuture, LocalActivityOptions, TimeoutType, Worker, WorkflowContext,
     WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
-    interceptors::{FailOnNondeterminismInterceptor, WorkerInterceptor},
+    interceptors::WorkerInterceptor,
 };
 use temporalio_sdk_core::{
     PollError, TunerHolder, prost_dur,
@@ -276,7 +276,7 @@ impl LocalActFanoutWf {
 async fn local_act_fanout() {
     let wf_name = "local_act_fanout";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 1, 1, 1)));
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
@@ -944,16 +944,16 @@ async fn repro_nondeterminism_with_timer_bug() {
         .unwrap();
     worker.run_until_done().await.unwrap();
     let client = starter.get_core_client().await;
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: wf_name.into(),
-        run_id: Some(handle.run_id().unwrap().to_string()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(wf_name)
+        .maybe_run_id(Some(handle.run_id().unwrap().to_string()))
+        .build()
+        .bind_untyped(client.clone());
     handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[tokio::test]
 async fn weird_la_nondeterminism_repro(#[values(true, false)] fix_hist: bool) {
@@ -980,6 +980,7 @@ async fn weird_la_nondeterminism_repro(#[values(true, false)] fix_hist: bool) {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn second_weird_la_nondeterminism_repro() {
     let mut hist =
@@ -1002,6 +1003,7 @@ async fn second_weird_la_nondeterminism_repro() {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn third_weird_la_nondeterminism_repro() {
     let mut hist =
@@ -1111,13 +1113,12 @@ async fn la_resolve_same_time_as_other_cancel() {
         .unwrap();
     worker.run_until_done().await.unwrap();
     let client = starter.get_core_client().await;
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: wf_name.into(),
-        run_id: Some(handle.run_id().unwrap().to_string()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(wf_name)
+        .maybe_run_id(Some(handle.run_id().unwrap().to_string()))
+        .build()
+        .bind_untyped(client.clone());
     handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
@@ -1352,6 +1353,7 @@ async fn local_activity_with_summary() {
 
 /// This test verifies that when replaying we are able to resolve local activities whose data we
 /// don't see until after the workflow issues the command
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::replay(true, true)]
 #[case::not_replay(false, true)]
@@ -1409,6 +1411,7 @@ async fn local_act_two_wfts_before_marker(#[case] replay: bool, #[case] cached: 
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn local_act_many_concurrent() {
     let mut t = TestHistoryBuilder::default();
@@ -1443,6 +1446,7 @@ async fn local_act_many_concurrent() {
 ///
 /// The test with shutdown verifies if we call shutdown while the local activity is running that
 /// shutdown does not complete until it's finished.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::with_shutdown(true)]
 #[case::normal_complete(false)]
@@ -1535,6 +1539,7 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
     runres.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::retry_then_pass(true)]
 #[case::retry_until_fail(false)]
@@ -1620,6 +1625,7 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
     assert_eq!(expected_attempts, attempts.load(Ordering::Relaxed));
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn local_act_retry_long_backoff_uses_timer() {
     let mut t = TestHistoryBuilder::default();
@@ -1700,6 +1706,7 @@ async fn local_act_retry_long_backoff_uses_timer() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn local_act_null_result() {
     let mut t = TestHistoryBuilder::default();
@@ -1736,6 +1743,7 @@ async fn local_act_null_result() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn local_act_command_immediately_follows_la_marker() {
     // This repro only works both when cache is off, and there is at least one heartbeat wft
@@ -2035,6 +2043,7 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
     core.drain_pollers_and_shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn test_schedule_to_start_timeout() {
     let mut t = TestHistoryBuilder::default();
@@ -2087,6 +2096,7 @@ async fn test_schedule_to_start_timeout() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::sched_to_start(true)]
 #[case::sched_to_close(false)]
@@ -2192,6 +2202,7 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[tokio::test]
 async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_completes: bool) {
@@ -2307,6 +2318,7 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
     assert_eq!(cancels.load(Ordering::Acquire), num_cancels);
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn wft_failure_cancels_running_las() {
     let mut t = TestHistoryBuilder::default();
@@ -2371,6 +2383,7 @@ async fn wft_failure_cancels_running_las() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn resolved_las_not_recorded_if_wft_fails_many_times() {
     // We shouldn't record any LA results if the workflow activation is repeatedly failing. There
@@ -2428,6 +2441,7 @@ async fn resolved_las_not_recorded_if_wft_fails_many_times() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn local_act_records_nonfirst_attempts_ok() {
     let mut t = TestHistoryBuilder::default();
@@ -2671,6 +2685,7 @@ async fn queries_can_be_received_while_heartbeating() {
     core.drain_pollers_and_shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::current_history(false)]
 #[case::old_heartbeat_history_replay(true)]
@@ -2770,6 +2785,7 @@ async fn local_activity_after_wf_complete_is_discarded(#[case] old_heartbeat_his
     core.drain_pollers_and_shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn local_act_retry_explicit_delay() {
     let mut t = TestHistoryBuilder::default();
@@ -2881,6 +2897,7 @@ impl LaWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::incremental(false, true)]
 #[case::replay(true, true)]
@@ -2979,6 +2996,77 @@ async fn one_la_success(#[case] replay: bool, #[case] completes_ok: bool) {
     }
 
     worker.run().await.unwrap();
+}
+
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[rstest]
+#[case::excluded(false)]
+#[case::included(true)]
+#[tokio::test]
+async fn local_activity_marker_optionally_includes_arguments(#[case] include_arguments: bool) {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_workflow_task_scheduled_and_started();
+
+    let arguments: Vec<Payload> = vec![b"first".into(), b"second".into()];
+    let expected_arguments = arguments.clone();
+    let mut mock_cfg = MockPollCfg::from_hist_builder(history);
+    mock_cfg.make_poll_stream_interminable = true;
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            assert_eq!(wft.commands.len(), 2);
+            let marker = assert_matches!(
+                wft.commands[0].attributes.as_ref(),
+                Some(command::Attributes::RecordMarkerCommandAttributes(marker)) => marker
+            );
+            let marker_input = marker.details.get("input");
+            if include_arguments {
+                assert_eq!(marker_input.unwrap().payloads, expected_arguments);
+            } else {
+                assert!(marker_input.is_none());
+            }
+            assert_eq!(
+                wft.commands[1].command_type(),
+                CommandType::CompleteWorkflowExecution
+            );
+        });
+    });
+    let core = mock_worker(build_mock_pollers(mock_cfg));
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        ScheduleLocalActivity {
+            seq: 1,
+            activity_id: "1".to_string(),
+            activity_type: "test_act".to_string(),
+            arguments,
+            start_to_close_timeout: Some(prost_dur!(from_secs(30))),
+            include_arguments_in_marker: include_arguments,
+            ..Default::default()
+        }
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let activity_task = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: activity_task.task_token,
+        result: Some(ActivityExecutionResult::ok(b"result".into())),
+    })
+    .await
+    .unwrap();
+
+    let resolution = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolution.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+        }]
+    );
+    core.complete_execution(&resolution.run_id).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[workflow]
@@ -3119,6 +3207,7 @@ async fn local_activity_resolutions_are_delivered_incrementally() {
 /// been delivered and the task answered. Resolutions queued while an earlier one is outstanding with
 /// lang may schedule further activities, and the markers for all of them belong on the completion
 /// that finally answers the task.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn zero_cache_doesnt_evict_before_wft_is_answered() {
     let wfid = "fake_wf_id";
@@ -3279,6 +3368,7 @@ impl OldBatchedLocalActivityHistoryWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn old_batched_local_activity_history_replays() {
     let mut history = TestHistoryBuilder::default();
@@ -3399,6 +3489,7 @@ impl HeartbeatGatedActivity {
 
 /// Verifies lookahead preserves completion order when one LA resolves before a heartbeat and the
 /// other resolves after it.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[tokio::test]
 async fn mixed_la_completion_times(#[values(true, false)] replay: bool) {
@@ -3485,6 +3576,7 @@ async fn mixed_la_completion_times(#[values(true, false)] replay: bool) {
 
 /// Both LAs remain outstanding through a heartbeat, then resolve in the following WFT. Replay must
 /// deliver their resolutions in marker order, even when that differs from schedule order.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[tokio::test]
 async fn two_las_with_heartbeat(
@@ -3588,6 +3680,7 @@ impl ResolvedActivity {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[tokio::test]
 async fn two_sequential_las(
@@ -3712,6 +3805,7 @@ impl LaTimerLaWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::incremental(false)]
 #[case::replay(true)]
@@ -3788,6 +3882,7 @@ async fn las_separated_by_timer(#[case] replay: bool) {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn one_la_heartbeating_wft_failure_still_executes() {
     let mut t = TestHistoryBuilder::default();
@@ -3821,6 +3916,7 @@ async fn one_la_heartbeating_wft_failure_still_executes() {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[tokio::test]
 async fn immediate_cancel(
@@ -3882,6 +3978,7 @@ async fn immediate_cancel(
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::incremental(false)]
 #[case::replay(true)]
@@ -4316,9 +4413,9 @@ async fn replay_out_of_order_local_activity_markers_is_deterministic() {
     let workflow_id = handle.info().workflow_id.clone();
     let events = handle
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let marker_order = events
         .iter()
         .filter_map(|event| match event.attributes.as_ref() {

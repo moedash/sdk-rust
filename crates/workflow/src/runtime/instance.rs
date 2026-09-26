@@ -6,7 +6,10 @@ use crate::{
         InterceptedFuturePollGuard, InterceptedFuturePollKind, InterceptedFutureStatus,
         entry::{WorkflowError, WorkflowImplementation},
         guest::WorkflowInstance,
-        model::{TimerResult, UnblockEvent, WorkflowTermination},
+        model::{
+            CancelExternalWfFailure, SignalExternalWfFailure, TimerResult, UnblockEvent,
+            WorkflowTermination,
+        },
         types::{
             ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
             QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePendingState,
@@ -14,12 +17,13 @@ use crate::{
             UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation, WorkflowFailure,
         },
     },
+    workflow_context::HandlerExecutionGuard,
     workflow_interceptors::{
         ExecuteWorkflowInput, ExecuteWorkflowResult, HandleQueryInput, HandleQueryResult,
         HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
         InitializeWorkflowInput, InitializeWorkflowOutput, SyncWorkflowInterceptorContext,
         ValidateUpdateInput, ValidateUpdateResult, WorkflowInterceptor, WorkflowInterceptorContext,
-        WorkflowInterceptorFuture, WorkflowNext, serialize_workflow_output,
+        WorkflowInterceptorFuture, WorkflowNext, WorkflowOutputValue, serialize_workflow_output,
         wrong_workflow_input_type,
     },
 };
@@ -43,7 +47,7 @@ use temporalio_common_wasm::{
     WorkflowDefinition,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData,
+        SerializationContextData, WorkflowSerializationContext,
     },
     error::{ApplicationFailure, OutgoingError, OutgoingWorkflowError},
     protos::{
@@ -58,6 +62,7 @@ use temporalio_common_wasm::{
     },
 };
 
+/// Owns the deterministic execution state for one native workflow instance.
 pub struct GuestWorkflowInstance<W: WorkflowImplementation> {
     base_ctx: BaseWorkflowContext,
     ctx: WorkflowContext<W>,
@@ -81,6 +86,7 @@ enum GuestRoutine {
 struct InterceptedFuture<T> {
     inner: Fuse<LocalBoxFuture<'static, T>>,
     status: InterceptedFutureStatus,
+    _handler_execution: Option<HandlerExecutionGuard>,
 }
 
 impl<T> InterceptedFuture<T> {
@@ -88,6 +94,19 @@ impl<T> InterceptedFuture<T> {
         Self {
             inner: inner.fuse(),
             status,
+            _handler_execution: None,
+        }
+    }
+
+    fn with_handler_execution(
+        inner: LocalBoxFuture<'static, T>,
+        status: InterceptedFutureStatus,
+        handler_execution: HandlerExecutionGuard,
+    ) -> Self {
+        Self {
+            inner: inner.fuse(),
+            status,
+            _handler_execution: Some(handler_execution),
         }
     }
 
@@ -292,6 +311,7 @@ fn intercepted_signal_future<W>(
     base_ctx: BaseWorkflowContext,
     interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
     input: HandleSignalInput,
+    handler_execution: HandlerExecutionGuard,
 ) -> InterceptedFuture<HandleSignalResult>
 where
     W: WorkflowImplementation,
@@ -310,7 +330,7 @@ where
         call_handle_signal(&interceptors, interceptor_ctx, input, next).await
     }
     .boxed_local();
-    InterceptedFuture::new(future, status)
+    InterceptedFuture::with_handler_execution(future, status, handler_execution)
 }
 
 fn intercepted_update_future<W>(
@@ -318,6 +338,7 @@ fn intercepted_update_future<W>(
     base_ctx: BaseWorkflowContext,
     interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
     input: HandleUpdateInput,
+    handler_execution: HandlerExecutionGuard,
 ) -> InterceptedFuture<HandleUpdateResult>
 where
     W: WorkflowImplementation,
@@ -336,13 +357,15 @@ where
         call_handle_update(&interceptors, interceptor_ctx, input, next).await
     }
     .boxed_local();
-    InterceptedFuture::new(future, status)
+    InterceptedFuture::with_handler_execution(future, status, handler_execution)
 }
 
 impl<W: WorkflowImplementation> GuestWorkflowInstance<W>
 where
     <W::Run as WorkflowDefinition>::Input: Send,
 {
+    /// Deserializes workflow input, runs initialization interceptors, and creates an executable
+    /// workflow instance.
     pub fn instantiate(
         payloads: Vec<Payload>,
         converter: PayloadConverter,
@@ -350,10 +373,8 @@ where
     ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
         let view = base_ctx.view();
         let interceptors = base_ctx.workflow_interceptors();
-        let ser_ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ser_ctx = SerializationContext::new(&context_data, &converter);
         let input = converter.from_payloads(&ser_ctx, payloads)?;
         let (init_input, run_input) = if W::INIT_TAKES_INPUT {
             (Some(input), None)
@@ -392,6 +413,7 @@ where
         )))
     }
 
+    /// Creates an executable instance around an already initialized workflow value.
     pub fn new_with_workflow(
         workflow: W,
         base_ctx: BaseWorkflowContext,
@@ -436,10 +458,8 @@ where
         }
 
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
         QueryResponse {
             result: converter
                 .to_payload(
@@ -469,14 +489,14 @@ where
             }
         };
         self.base_ctx.data_converter().to_failure(
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             OutgoingError::Workflow(outgoing),
         )
     }
 
     fn message_to_failure(&self, message: String) -> Failure {
         self.base_ctx.data_converter().to_failure(
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::new(message),
             ))),
@@ -532,11 +552,13 @@ where
         let future = match W::decode_signal_input(&name, payloads, converter) {
             Ok(Some(input)) => {
                 let input = HandleSignalInput::new(name.clone(), input, signal.headers);
+                let handler_execution = self.base_ctx.track_handler();
                 let mut future = intercepted_signal_future::<W>(
                     self.ctx.clone(),
                     self.base_ctx.clone(),
                     self.interceptors.clone(),
                     input,
+                    handler_execution,
                 );
                 if let ConstructionPoll::Ready(result) =
                     Self::poll_for_construction(&self.base_ctx, &mut future)?
@@ -580,6 +602,7 @@ where
             None => return Ok(self.rejection_for_missing_update_handler(name)),
         };
 
+        let mut handler_execution = None;
         if run_validator && has_validator {
             let payloads = Payloads {
                 payloads: input.clone(),
@@ -598,6 +621,8 @@ where
             };
             let validation_input =
                 ValidateUpdateInput::new(id.clone(), name.clone(), decoded_input, headers.clone());
+            let guard = self.base_ctx.track_handler();
+            let _read_only = self.base_ctx.enter_read_only();
             let validation_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
             let workflow_ctx = self.ctx.clone();
             let validation_next = WorkflowNext::new(move |input: ValidateUpdateInput| {
@@ -626,6 +651,7 @@ where
                     )));
                 }
             }
+            handler_execution = Some(guard);
         }
 
         let payloads = Payloads { payloads: input };
@@ -633,11 +659,14 @@ where
         let future = match W::decode_update_input(&name, payloads, converter) {
             Ok(Some(input)) => {
                 let input = HandleUpdateInput::new(id.clone(), name.clone(), input, headers);
+                let handler_execution =
+                    handler_execution.unwrap_or_else(|| self.base_ctx.track_handler());
                 let mut future = intercepted_update_future::<W>(
                     self.ctx.clone(),
                     self.base_ctx.clone(),
                     self.interceptors.clone(),
                     input,
+                    handler_execution,
                 );
                 if let ConstructionPoll::Ready(result) =
                     Self::poll_for_construction(&self.base_ctx, &mut future)?
@@ -700,6 +729,7 @@ where
             decoded_input,
             query.headers,
         );
+        let _read_only = self.base_ctx.enter_read_only();
         let interceptor_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
         let workflow_ctx = self.ctx.clone();
         let query_next = WorkflowNext::new(move |input: HandleQueryInput| {
@@ -732,10 +762,22 @@ where
                 UnblockEvent::WorkflowComplete(event.seq, Box::new(expect_resolution(event.result)))
             }
             ActivationVariant::ResolveSignalExternalWorkflow(event) => {
-                UnblockEvent::SignalExternal(event.seq, event.failure)
+                let cause = event.cause();
+                UnblockEvent::SignalExternal(
+                    event.seq,
+                    event
+                        .failure
+                        .map(|failure| SignalExternalWfFailure { failure, cause }),
+                )
             }
             ActivationVariant::ResolveRequestCancelExternalWorkflow(event) => {
-                UnblockEvent::CancelExternal(event.seq, event.failure)
+                let cause = event.cause();
+                UnblockEvent::CancelExternal(
+                    event.seq,
+                    event
+                        .failure
+                        .map(|failure| CancelExternalWfFailure { failure, cause }),
+                )
             }
             ActivationVariant::ResolveNexusOperationStart(event) => {
                 UnblockEvent::NexusOperationStart(
@@ -767,7 +809,28 @@ where
         match result {
             Ok(result) => Ok(TerminalOutcome::Completed(result)),
             Err(WorkflowTermination::ContinueAsNew(req)) => Ok(TerminalOutcome::ContinueAsNew(req)),
-            Err(WorkflowTermination::Cancelled) => Ok(TerminalOutcome::Cancelled),
+            Err(WorkflowTermination::Cancelled { details }) => {
+                let details = details
+                    .map(|details| {
+                        (&*details as &dyn WorkflowOutputValue)
+                            .serialize_payloads(&SerializationContext::new(
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                                self.ctx.payload_converter(),
+                            ))
+                            .map(|payloads| Payloads { payloads })
+                    })
+                    .transpose()
+                    .map_err(|err| TaskFailure {
+                        failure: Box::new(Failure {
+                            message: format!("Workflow payload conversion failed: {err}"),
+                            ..Default::default()
+                        }),
+                        force_cause: None,
+                    })?;
+                Ok(TerminalOutcome::Cancelled(details))
+            }
             Err(WorkflowTermination::Evicted) => {
                 panic!("workflow instances must not explicitly return eviction")
             }
@@ -781,12 +844,16 @@ where
                 })
             }
             Err(WorkflowTermination::Failed(err)) => {
-                if self.base_ctx.cancellation_token().is_cancelled() && err.as_cancelled().is_some()
+                if self.base_ctx.cancellation_token().is_cancelled()
+                    && let Some(cancelled) = err.as_cancelled()
                 {
-                    return Ok(TerminalOutcome::Cancelled);
+                    let details = cancelled.raw_details().map(|payloads| Payloads {
+                        payloads: payloads.to_vec(),
+                    });
+                    return Ok(TerminalOutcome::Cancelled(details));
                 }
                 let failure = self.base_ctx.data_converter().to_failure(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     temporalio_common_wasm::error::OutgoingError::Workflow(err),
                 );
                 Ok(TerminalOutcome::Failed(Box::new(failure)))
@@ -1112,17 +1179,6 @@ where
     }
 }
 
-pub fn instantiate_workflow<W: WorkflowImplementation>(
-    payloads: Vec<Payload>,
-    converter: PayloadConverter,
-    base_ctx: BaseWorkflowContext,
-) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError>
-where
-    <W::Run as WorkflowDefinition>::Input: Send,
-{
-    GuestWorkflowInstance::<W>::instantiate(payloads, converter, base_ctx)
-}
-
 /// Attempts to turn caught panics into something printable
 fn panic_formatter(panic: Box<dyn Any>) -> Box<dyn Display> {
     _panic_formatter::<&str>(panic)
@@ -1170,7 +1226,7 @@ mod tests {
     use std::{
         cell::Cell,
         rc::Rc,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
         task::Waker,
     };
     use temporalio_common_wasm::{
@@ -1431,13 +1487,19 @@ mod tests {
     fn interceptor_constructors_run_before_workflow_input_decoding() {
         let constructor_calls = Arc::new(AtomicUsize::new(0));
         let execute_calls = Arc::new(AtomicUsize::new(0));
+        let constructor_random = Arc::new(AtomicU64::new(0));
         let constructor_calls_ref = constructor_calls.clone();
         let execute_calls_ref = execute_calls.clone();
+        let constructor_random_ref = constructor_random.clone();
         let constructor = WorkflowInterceptorConstructor::new(move |ctx| {
             assert_eq!(ctx.namespace(), "default");
             assert_eq!(ctx.task_queue(), "task-queue");
             assert_eq!(ctx.run_id(), "run-id");
             assert_eq!(ctx.workflow_type(), DecodeFailureWorkflow::name());
+            constructor_random_ref.store(
+                ctx.random_stream("plugin").random::<u64>(),
+                Ordering::Relaxed,
+            );
             constructor_calls_ref.fetch_add(1, Ordering::Relaxed);
             CountingExecuteInterceptor {
                 calls: execute_calls_ref.clone(),
@@ -1449,9 +1511,20 @@ mod tests {
             run_id: "run-id".to_string(),
             initialize_workflow: InitializeWorkflow {
                 workflow_type: DecodeFailureWorkflow::name().to_string(),
+                randomness_seed: 42,
                 ..Default::default()
             },
         };
+        let expected_base_ctx = BaseWorkflowContext::from_raw(
+            init.clone(),
+            DataConverter::default(),
+            Rc::new(NoopHost),
+            None,
+            Vec::new(),
+        );
+        let expected_random = expected_base_ctx.random_stream("plugin");
+        let expected_constructor_random = expected_random.random::<u64>();
+        let expected_next_random = expected_random.random::<u64>();
         let base_ctx = BaseWorkflowContext::from_raw(
             init,
             DataConverter::default(),
@@ -1459,6 +1532,7 @@ mod tests {
             None,
             vec![constructor],
         );
+        let next_random = base_ctx.random_stream("plugin").random::<u64>();
 
         let result = GuestWorkflowInstance::<DecodeFailureWorkflow>::instantiate(
             vec![Payload::default()],
@@ -1469,5 +1543,10 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(constructor_calls.load(Ordering::Relaxed), 1);
         assert_eq!(execute_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            constructor_random.load(Ordering::Relaxed),
+            expected_constructor_random
+        );
+        assert_eq!(next_random, expected_next_random);
     }
 }

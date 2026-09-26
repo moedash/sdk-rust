@@ -82,17 +82,15 @@
 //! ```
 
 use crate::{
-    ActivityOptions, BaseWorkflowContext, CancellableFuture, CancellableFutureWithReason,
-    ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
-    NexusOperationOptions, SignalWorkflowOptions, StartChildWorkflowOutput, StartedChildWorkflow,
-    StartedNexusOperation, TimerOptions, WorkflowCancellationToken, WorkflowContextView,
+    ActivityOptions, BaseWorkflowContext, CancelExternalWorkflowError, CancellableFuture,
+    CancellableFutureWithReason, ChildWorkflowOptions, ContinueAsNewOptions,
+    ExternalWorkflowHandle, LocalActivityOptions, SignalWorkflowOptions, StartChildWorkflowOutput,
+    StartedChildWorkflow, TimerOptions, WorkflowCancellationToken, WorkflowContextFuture,
+    WorkflowContextKey, WorkflowContextView, WorkflowRandomStream,
     cancellation::WorkflowCancellationRegistration,
     runtime::{
         entry::WorkflowError,
-        model::{
-            CancelExternalWfResult, NexusStartResult, TimerResult, WorkflowResult,
-            WorkflowTermination,
-        },
+        model::{TimerResult, WorkflowResult, WorkflowTermination},
     },
 };
 use futures_util::{
@@ -115,14 +113,20 @@ use temporalio_common_wasm::{
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
         SerializationContextData, TemporalDeserializable, TemporalSerializable,
+        WorkflowSerializationContext,
     },
     error::{
         ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
         WorkflowSignalError,
     },
-    protos::temporal::api::{common::v1::Payload, failure::v1::Failure},
+    protos::temporal::api::common::v1::Payload,
     search_attributes::SearchAttributes,
 };
+
+#[cfg(feature = "experimental")]
+pub(crate) use nexus::call_start_nexus_operation;
+#[cfg(feature = "experimental")]
+pub use nexus::{StartNexusOperationInput, StartNexusOperationResult};
 
 mod workflow_output_value {
     use super::*;
@@ -132,6 +136,11 @@ mod workflow_output_value {
             &self,
             context: &SerializationContext<'_>,
         ) -> Result<Payload, PayloadConversionError>;
+
+        fn to_workflow_payloads(
+            &self,
+            context: &SerializationContext<'_>,
+        ) -> Result<Vec<Payload>, PayloadConversionError>;
     }
 
     impl<T> Sealed for T
@@ -143,6 +152,13 @@ mod workflow_output_value {
             context: &SerializationContext<'_>,
         ) -> Result<Payload, PayloadConversionError> {
             context.converter.to_payload(context, self)
+        }
+
+        fn to_workflow_payloads(
+            &self,
+            context: &SerializationContext<'_>,
+        ) -> Result<Vec<Payload>, PayloadConversionError> {
+            context.converter.to_payloads(context, self)
         }
     }
 }
@@ -174,16 +190,21 @@ impl dyn WorkflowOutputValue {
     ) -> Result<Payload, PayloadConversionError> {
         self.to_workflow_payload(context)
     }
+
+    pub(crate) fn serialize_payloads(
+        &self,
+        context: &SerializationContext<'_>,
+    ) -> Result<Vec<Payload>, PayloadConversionError> {
+        self.to_workflow_payloads(context)
+    }
 }
 
 pub(crate) fn serialize_workflow_output(
     output: &dyn WorkflowOutputValue,
     converter: &PayloadConverter,
 ) -> Result<Payload, PayloadConversionError> {
-    let ctx = SerializationContext {
-        data: &SerializationContextData::Workflow,
-        converter,
-    };
+    let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+    let ctx = SerializationContext::new(&context_data, converter);
     output.serialize_payload(&ctx)
 }
 
@@ -259,6 +280,33 @@ impl WorkflowInterceptorContext {
         Self { base }
     }
 
+    /// Return the value associated with key type `K` in the current workflow context scope.
+    pub fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.base.context_value::<K>()
+    }
+
+    /// Poll `future` with `value` installed for key type `K`.
+    ///
+    /// Inbound interceptors can use this to establish context around `next.run(input)`. Outbound
+    /// interceptors invoked by the workflow inside that scope observe the value with
+    /// [`Self::context_value`]. The previous context is restored after each poll.
+    pub fn with_context_value<K: WorkflowContextKey, F: Future>(
+        &self,
+        value: K::Value,
+        future: F,
+    ) -> WorkflowContextFuture<F> {
+        self.base.with_context_value::<K, F>(value, future)
+    }
+
+    /// Run synchronous interceptor code with `value` installed for key type `K`.
+    pub fn with_context_value_sync<K: WorkflowContextKey, R>(
+        &self,
+        value: K::Value,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        self.base.with_context_value_sync::<K, R>(value, f)
+    }
+
     /// Return the workflow's unique identifier.
     pub fn workflow_id(&self) -> &str {
         self.base.workflow_id()
@@ -319,6 +367,16 @@ impl WorkflowInterceptorContext {
         self.base.cancellation_token()
     }
 
+    /// Returns the deterministic pseudo-random stream associated with `name`.
+    ///
+    /// Named streams let interceptors consume replay-safe randomness without changing the
+    /// workflow's default random sequence or another interceptor's named sequence. Query and
+    /// update-validator interceptors receive [`SyncWorkflowInterceptorContext`], which does not
+    /// expose random streams because those handlers are read-only.
+    pub fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
+        self.base.random_stream(name)
+    }
+
     /// Request to create a timer through the workflow outbound interceptor chain.
     pub fn timer<T: Into<TimerOptions>>(
         &self,
@@ -376,14 +434,6 @@ impl WorkflowInterceptorContext {
     ) -> ExternalWorkflowHandle {
         self.base.external_workflow(workflow_id, run_id)
     }
-
-    /// Start a Nexus operation through the workflow outbound interceptor chain.
-    pub fn start_nexus_operation(
-        &self,
-        opts: NexusOperationOptions,
-    ) -> impl CancellableFuture<Output = NexusStartResult> {
-        self.base.start_nexus_operation(opts)
-    }
 }
 
 /// Workflow execution context available to sync-only inbound interceptors.
@@ -395,6 +445,22 @@ pub struct SyncWorkflowInterceptorContext {
 impl SyncWorkflowInterceptorContext {
     pub(crate) fn new(base: BaseWorkflowContext) -> Self {
         Self { base }
+    }
+
+    /// Return the value associated with key type `K` in the current workflow context scope.
+    pub fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.base.context_value::<K>()
+    }
+
+    /// Run synchronous interceptor code with `value` installed for key type `K`.
+    ///
+    /// This is intended for query and update-validator interceptor chains, which cannot await.
+    pub fn with_context_value<K: WorkflowContextKey, R>(
+        &self,
+        value: K::Value,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        self.base.with_context_value_sync::<K, R>(value, f)
     }
 
     /// Return the workflow's unique identifier.
@@ -1345,32 +1411,6 @@ impl ContinueAsNewInput {
 
 typed_outbound_input!(ContinueAsNewInput);
 
-/// Input passed to [`WorkflowInterceptor::start_nexus_operation`].
-#[non_exhaustive]
-pub struct StartNexusOperationInput {
-    options: NexusOperationOptions,
-}
-
-impl StartNexusOperationInput {
-    pub(crate) fn new(options: NexusOperationOptions) -> Self {
-        Self { options }
-    }
-
-    pub(crate) fn into_options(self) -> NexusOperationOptions {
-        self.options
-    }
-
-    /// Nexus operation options.
-    pub fn options(&self) -> &NexusOperationOptions {
-        &self.options
-    }
-
-    /// Mutably access Nexus operation options.
-    pub fn options_mut(&mut self) -> &mut NexusOperationOptions {
-        &mut self.options
-    }
-}
-
 /// Result of an intercepted activity call.
 pub type ScheduleActivityResult = Result<Box<dyn WorkflowOutboundValue>, ActivityExecutionError>;
 
@@ -1381,11 +1421,11 @@ pub type ChildWorkflowOutboundResult =
 /// Result of an intercepted signal call.
 pub type SignalWorkflowResult = Result<(), WorkflowSignalError>;
 
+/// Result of requesting cancellation of an external workflow.
+pub type CancelExternalWorkflowResult = Result<(), CancelExternalWorkflowError>;
+
 /// Result of an intercepted child workflow start.
 pub type StartChildWorkflowResult = Result<StartChildWorkflowOutput, ChildWorkflowStartError>;
-
-/// Result of an intercepted Nexus operation start.
-pub type StartNexusOperationResult = Result<StartedNexusOperation, Failure>;
 
 /// Result of an intercepted continue-as-new call.
 pub type ContinueAsNewResult = Result<Infallible, WorkflowTermination>;
@@ -1570,9 +1610,9 @@ pub trait WorkflowInterceptor: 'static {
         next: WorkflowNext<
             'static,
             CancelExternalWorkflowInput,
-            WorkflowOutboundFuture<CancelExternalWfResult>,
+            WorkflowOutboundFuture<CancelExternalWorkflowResult>,
         >,
-    ) -> WorkflowOutboundFuture<CancelExternalWfResult> {
+    ) -> WorkflowOutboundFuture<CancelExternalWorkflowResult> {
         next.run(input)
     }
 
@@ -1587,6 +1627,7 @@ pub trait WorkflowInterceptor: 'static {
     }
 
     /// Called when the workflow starts a Nexus operation.
+    #[cfg(feature = "experimental")]
     fn start_nexus_operation(
         &self,
         _ctx: WorkflowInterceptorContext,
@@ -1634,6 +1675,9 @@ macro_rules! outbound_chain {
     };
 }
 
+#[cfg(feature = "experimental")]
+mod nexus;
+
 outbound_chain!(
     call_start_timer,
     start_timer,
@@ -1674,7 +1718,7 @@ outbound_chain!(
     cancel_external_workflow,
     WorkflowInterceptorContext,
     CancelExternalWorkflowInput,
-    WorkflowOutboundFuture<CancelExternalWfResult>
+    WorkflowOutboundFuture<CancelExternalWorkflowResult>
 );
 outbound_chain!(
     call_continue_as_new,
@@ -1683,14 +1727,6 @@ outbound_chain!(
     ContinueAsNewInput,
     ContinueAsNewResult
 );
-outbound_chain!(
-    call_start_nexus_operation,
-    start_nexus_operation,
-    WorkflowInterceptorContext,
-    StartNexusOperationInput,
-    CancellableWorkflowOutboundFuture<StartNexusOperationResult>
-);
-
 type WorkflowInterceptorConstructorFn =
     dyn Fn(&WorkflowContextView) -> Arc<dyn WorkflowInterceptor> + Send + Sync + 'static;
 
