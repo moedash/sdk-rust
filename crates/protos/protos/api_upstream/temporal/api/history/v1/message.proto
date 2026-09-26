@@ -17,6 +17,7 @@ import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/update.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
@@ -379,6 +380,16 @@ message WorkflowTaskCompletedEventAttributes {
     // The Worker Deployment Version that completed this task. Must be set if `versioning_behavior`
     // is set. This value updates workflow execution's `versioning_info.deployment_version`.
     temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 11;
+
+    // Offset ranges this Workflow Task consumed from streams it subscribes to.
+    // Recorded on every task where a subscription is active, including when it
+    // observed nothing: an empty range is a fact replay must reproduce, and
+    // omitting it would let replay deliver records the Workflow did not have.
+    repeated temporal.api.stream.v1.StreamRange consumed_stream_ranges = 20;
+
+    // Held for fields added on the main line, so a rebase does not land one of
+    // them on a number this fork already writes.
+    reserved 14 to 19;
 }
 
 message WorkflowTaskTimedOutEventAttributes {
@@ -955,6 +966,41 @@ message ActivityPropertiesModifiedExternallyEventAttributes {
     temporal.api.common.v1.RetryPolicy new_retry_policy = 2;
 }
 
+message WorkflowStreamSubscribedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command created this
+    // subscription.
+    int64 workflow_task_completed_event_id = 1;
+    // The stream the Workflow subscribed to, as the command addressed it:
+    // either the name of a stream this Workflow owns or the id of one in
+    // another execution.
+    string stream_id = 2;
+    // The offset the subscription actually starts from. Resolved by the server
+    // when the subscription is registered and recorded here, so replay reads
+    // the resolved value rather than resolving it again against a stream that
+    // has since moved.
+    int64 start_offset = 3;
+}
+
+message WorkflowStreamRecordsAppendedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command appended this
+    // batch.
+    int64 workflow_task_completed_event_id = 1;
+    // Name of the stream the Workflow appended to.
+    string stream_id = 2;
+    // Inclusive. Same range vocabulary as StreamRange and StreamSlice, so a
+    // reader does not have to remember which of the three counts and which
+    // bounds.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" and "to" name a half-open offset range. --)
+    int64 from_offset = 3;
+    // Exclusive. With from_offset this names the range without carrying any of
+    // it, which is what keeps this event a fixed size no matter how large the
+    // batch or its payloads are.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" and "to" name a half-open offset range. --)
+    int64 to_offset = 4;
+}
+
 message WorkflowExecutionUpdateAcceptedEventAttributes {
     // The instance ID of the update protocol that generated this event.
     string protocol_instance_id = 1;
@@ -1278,6 +1324,8 @@ message HistoryEvent {
         WorkflowExecutionPausedEventAttributes workflow_execution_paused_event_attributes = 63;
         WorkflowExecutionUnpausedEventAttributes workflow_execution_unpaused_event_attributes = 64;
         WorkflowExecutionTimeSkippingTransitionedEventAttributes workflow_execution_time_skipping_transitioned_event_attributes = 65;
+        WorkflowStreamSubscribedEventAttributes workflow_stream_subscribed_event_attributes = 66;
+        WorkflowStreamRecordsAppendedEventAttributes workflow_stream_records_appended_event_attributes = 67;
     }
 }
 

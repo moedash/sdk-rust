@@ -829,6 +829,11 @@ const NOT_VALIDATED_FIELDS: &[&str] = &[
     "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.continued_failure",
     "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.last_completion_result",
     "temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest.details",
+    // Stream records: the blob limit is a per-event limit, and these bodies never reach an
+    // event. The server bounds the batch by message count (MaxMessagesPerBatch) instead, which
+    // is not a payload size the SDK can mirror.
+    "temporal.api.stream.v1.StreamRecord.body",
+    "temporal.api.stream.v1.StreamRecord.metadata",
     // Dedicated, non-fetchable limits (not blob/memo, not in DescribeNamespace): UserMetadata
     // (nexus-start only); Nexus EndpointSpec.description (maxDescriptionSize; cloud variant cloud-only).
     "temporal.api.sdk.v1.UserMetadata.details",
