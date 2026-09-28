@@ -2104,6 +2104,7 @@ pub mod temporal {
                                 SubscribeStreamCommandAttributes {
                                     stream_name_or_id: s.stream_name_or_id,
                                     start_offset: s.start_offset,
+                                    start_position: s.start_position,
                                 },
                             )
                         }
