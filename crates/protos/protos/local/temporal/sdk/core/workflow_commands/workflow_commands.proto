@@ -93,11 +93,13 @@ message SubscribeStream {
     // neither exists the workflow gets a stream of its own by that name, which
     // is how a reader subscribes before the first record is written.
     string stream_name_or_id = 1;
-    // Where to start, as an absolute offset. Any negative value means the head
-    // of the stream as of registration, and they all mean the same thing. The
-    // server resolves it and records the result, so replay does not resolve it
-    // again.
+    // Where to start, as an absolute offset. Read only when start_position is
+    // unset. The server refuses a negative value.
     int64 start_offset = 2;
+    // Where to start: an offset, the earliest record held, the tail, or the
+    // last N records. The server resolves it and records the resulting offset,
+    // so replay does not resolve it again and Core does not keep it.
+    temporal.api.stream.v1.StreamStartPosition start_position = 3;
 }
 
 message StartTimer {
