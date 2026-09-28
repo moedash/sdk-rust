@@ -33,7 +33,10 @@ use temporalio_common::protos::{
         enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
         history::v1::{History, HistoryEvent},
         query::v1::WorkflowQuery,
-        stream::v1::{StreamRange, StreamRecord, StreamSlice},
+        stream::v1::{
+            StreamRange, StreamRecord, StreamSlice, StreamStartPosition,
+            stream_start_position::Position,
+        },
         workflowservice::v1::{
             GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
         },
@@ -318,7 +321,8 @@ async fn subscribe_command_round_trips_through_replay() {
         vec![
             SubscribeStream {
                 stream_name_or_id: "s1".to_string(),
-                start_offset: -1,
+                start_offset: 0,
+                start_position: start(Position::Tail(true)),
             }
             .into(),
         ],
@@ -413,26 +417,38 @@ async fn publish_command_round_trips_through_replay() {
 }
 
 /// The subscribe command has to reach the server, which only a task that is
-/// not being replayed will send.
+/// not being replayed will send. The start position goes out as lang gave it:
+/// the server resolves it and records the offset, so Core never holds one.
 #[tokio::test]
-async fn subscribe_command_reaches_the_server() {
+async fn subscribe_command_reaches_the_server_with_each_start_position() {
+    for position in [
+        Position::Offset(7),
+        Position::LastN(3),
+        Position::Earliest(true),
+        Position::Tail(true),
+    ] {
+        subscribe_reaches_the_server(start(position)).await;
+    }
+}
+
+async fn subscribe_reaches_the_server(start_position: Option<StreamStartPosition>) {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
 
+    let expected = start_position;
     let mut mock_client = mock_worker_client();
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(|resp, _| {
+        .returning(move |resp, _| {
             let cmd = resp.commands.first().expect("a command was sent");
             assert_eq!(cmd.command_type(), CommandType::SubscribeStream);
             match cmd.attributes.as_ref().unwrap() {
                 command::Attributes::SubscribeStreamCommandAttributes(a) => {
                     assert_eq!(a.stream_name_or_id, "s1");
-                    // Passed through unresolved: the server turns it into a
-                    // real offset and records that.
-                    assert_eq!(a.start_offset, -1);
+                    assert_eq!(a.start_offset, 0);
+                    assert_eq!(a.start_position, expected);
                 }
                 other => panic!("wrong attributes: {other:?}"),
             }
@@ -448,7 +464,8 @@ async fn subscribe_command_reaches_the_server() {
         vec![
             SubscribeStream {
                 stream_name_or_id: "s1".to_string(),
-                start_offset: -1,
+                start_offset: 0,
+                start_position,
             }
             .into(),
         ],
@@ -456,6 +473,12 @@ async fn subscribe_command_reaches_the_server() {
     .await
     .unwrap();
     core.shutdown().await;
+}
+
+fn start(position: Position) -> Option<StreamStartPosition> {
+    Some(StreamStartPosition {
+        position: Some(position),
+    })
 }
 
 fn publish_two(stream_name: &str) -> AppendStreamRecords {
@@ -594,6 +617,7 @@ async fn read_then_publish_replays_after_a_task_that_consumed_nothing() {
             SubscribeStream {
                 stream_name_or_id: "in".to_string(),
                 start_offset: 0,
+                start_position: start(Position::Earliest(true)),
             }
             .into(),
         ],
@@ -710,6 +734,7 @@ async fn read_then_publish_replays_across_a_page_boundary(
             SubscribeStream {
                 stream_name_or_id: "in".to_string(),
                 start_offset: 0,
+                start_position: start(Position::Earliest(true)),
             }
             .into(),
         ],
@@ -865,7 +890,8 @@ async fn a_subscribe_reissued_to_a_different_stream_fails_the_task() {
         vec![
             SubscribeStream {
                 stream_name_or_id: "s2".to_string(),
-                start_offset: -1,
+                start_offset: 0,
+                start_position: start(Position::Tail(true)),
             }
             .into(),
         ],
@@ -877,8 +903,8 @@ async fn a_subscribe_reissued_to_a_different_stream_fails_the_task() {
     core.shutdown().await;
 }
 
-/// The start offset is deliberately not compared, even when the command names
-/// one itself. The comparison would only be sound for the run's first subscribe
+/// The start is deliberately not compared, even when the command names an
+/// absolute offset. The comparison would only be sound for the run's first subscribe
 /// to a stream, and a subscription made through the stream service leaves no
 /// event, so which one is first cannot be told from history. Failing a run that
 /// did nothing wrong costs more than the drift the check would catch.
@@ -899,6 +925,7 @@ async fn a_subscribe_reissued_with_a_different_offset_is_accepted() {
             SubscribeStream {
                 stream_name_or_id: "s1".to_string(),
                 start_offset: 0,
+                start_position: start(Position::Earliest(true)),
             }
             .into(),
         ],
@@ -925,7 +952,8 @@ async fn a_repeat_subscribe_is_accepted() {
 
     let subscribe = SubscribeStream {
         stream_name_or_id: "s1".to_string(),
-        start_offset: 100,
+        start_offset: 0,
+        start_position: start(Position::Offset(100)),
     };
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
@@ -1281,6 +1309,7 @@ async fn a_legacy_query_owed_records_it_was_not_sent_goes_unanswered() {
             SubscribeStream {
                 stream_name_or_id: "in".to_string(),
                 start_offset: 0,
+                start_position: start(Position::Earliest(true)),
             }
             .into(),
         ],
