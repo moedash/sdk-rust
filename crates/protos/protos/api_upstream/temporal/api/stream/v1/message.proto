@@ -89,6 +89,25 @@ message StreamRange {
     int64 to_offset = 3;
 }
 
+// Where a new subscription or read begins. The server resolves it against the
+// stream as it stands in the same transaction that registers the reader, so
+// the result does not race with appends or truncation, and records the
+// resolved absolute offset.
+message StreamStartPosition {
+    oneof position {
+        // Absolute and inclusive. Refused when below the stream's floor.
+        int64 offset = 1;
+        // The last N records the stream holds, or all of them when it holds
+        // fewer. Counts records of every kind. Must be positive.
+        int64 last_n = 2;
+        // The oldest record the stream still holds. Must be true.
+        bool earliest = 3;
+        // Only records appended after registration: the stream's head offset.
+        // Must be true.
+        bool tail = 4;
+    }
+}
+
 // What a record means to a reader. Kept on the record itself so every store
 // and every language reads it the same way without a private envelope.
 enum StreamRecordKind {

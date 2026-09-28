@@ -359,13 +359,13 @@ message SubscribeStreamCommandAttributes {
     // neither exists the Workflow gets a stream of its own by that name, which
     // is how a reader subscribes before the first record is written.
     string stream_name_or_id = 1;
-    // Where to start, as an absolute offset. Any negative value means the head
-    // of the stream as of registration, and they all mean the same thing. The
-    // server resolves it and records the result, so replay does not resolve it
-    // again.
-    //
-    // There is no way to ask for the earliest readable offset of a stream that
-    // has been truncated. Reading it from DescribeStream and passing it here
-    // races with further truncation.
+    // Where to start, as an absolute offset. Read only when `start_position`
+    // is unset. A negative value is refused: the head of the stream is asked
+    // for with `start_position.tail`.
     int64 start_offset = 2;
+    // Where to start. The server resolves it once, when it registers the
+    // subscription, and records the resolved absolute offset on the subscribed
+    // event, so replay does not resolve it again. Setting it together with a
+    // non-zero `start_offset` fails the command.
+    temporal.api.stream.v1.StreamStartPosition start_position = 3;
 }
