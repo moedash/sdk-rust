@@ -97,6 +97,7 @@ use temporalio_common::{
             sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
             stream::v1::StreamSlice,
             taskqueue::v1::StickyExecutionAttributes,
+            workflow::v1::Wake,
             workflowservice::v1::{PollActivityTaskQueueResponse, get_system_info_response},
         },
     },
@@ -1171,6 +1172,7 @@ struct PreparedWFT {
     update: HistoryUpdate,
     messages: Vec<IncomingProtocolMessage>,
     stream_slices: Vec<StreamSlice>,
+    wakes: Vec<Wake>,
 }
 
 impl PreparedWFT {

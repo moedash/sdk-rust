@@ -389,6 +389,12 @@ message PollWorkflowTaskQueueResponse {
     // Stream data attached to this task. Delivered out of band so the payloads
     // never enter History; only the offset ranges are recorded there.
     repeated temporal.api.stream.v1.StreamSlice stream_slices = 20;
+
+    // Wakes pending for this execution when the task started, folded by
+    // source. Not recorded in History and never re-supplied on replay: the
+    // Workflow treats one as a reason to read its source now and records what
+    // it read itself.
+    repeated temporal.api.workflow.v1.Wake wakes = 21;
 }
 
 message RespondWorkflowTaskCompletedRequest {
@@ -883,6 +889,28 @@ message SignalWorkflowExecutionResponse {
     // Added on the response to propagate the backlink.
     // Available from Temporal server 1.31 and up.
     temporal.api.common.v1.Link link = 1;
+}
+
+message WakeWorkflowExecutionRequest {
+    string namespace = 1;
+    // The Workflow to wake. `run_id` is optional. When set, the wake goes to
+    // the current run of the chain that run belongs to, so a sender that
+    // learned a run id before a continue-as-new still reaches the consumer,
+    // and it is refused with NotFound once that chain has ended. When unset,
+    // the wake goes to the current run under the Workflow Id, whichever chain.
+    temporal.api.common.v1.WorkflowExecution workflow_execution = 2;
+    temporal.api.workflow.v1.Wake wake = 3;
+    // The identity of the sender, for metrics and logs.
+    string identity = 4;
+}
+
+message WakeWorkflowExecutionResponse {
+    // The run the wake was stored on.
+    string run_id = 1;
+    // True when a wake for the source was already pending and no task had
+    // received it yet, so this one changed nothing but possibly the position
+    // and no new task results from it.
+    bool folded = 2;
 }
 
 message SignalWithStartWorkflowExecutionRequest {

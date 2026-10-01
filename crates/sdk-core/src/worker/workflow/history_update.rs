@@ -163,6 +163,7 @@ impl HistoryPaginator {
             update,
             messages: wft.messages,
             stream_slices: wft.stream_slices,
+            wakes: wft.wakes,
         };
         Ok((paginator, prepared))
     }

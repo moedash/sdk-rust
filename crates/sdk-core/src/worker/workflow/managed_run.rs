@@ -53,6 +53,7 @@ use temporalio_common::protos::{
     temporal::api::{
         enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
+        workflow::v1::Wake,
     },
 };
 use tokio::sync::oneshot;
@@ -115,6 +116,10 @@ pub(super) struct ManagedRun {
     paginator: Option<HistoryPaginator>,
     completion_waiting_on_page_fetch: Option<RunActivationCompletion>,
     config: Arc<WorkerConfig>,
+    /// Wakes from the poll response of the current task, held until the machines have replayed up
+    /// to that task. They describe the live task, so applying one mid-replay would resume waits
+    /// the replayed History never resumed.
+    pending_poll_wakes: Vec<Wake>,
 }
 impl ManagedRun {
     pub(super) fn new(
@@ -141,6 +146,7 @@ impl ManagedRun {
             paginator: None,
             completion_waiting_on_page_fetch: None,
             config,
+            pending_poll_wakes: vec![],
         };
         let rua = me.incoming_wft(wft);
         (me, rua)
@@ -254,6 +260,10 @@ impl ManagedRun {
         }
 
         self.paginator = Some(pwft.paginator);
+        // Wakes held for an earlier task that never caught up belong to that task. The server
+        // hands any still pending to this one, so they are replaced rather than accumulated. A
+        // legacy query task runs no Workflow code and so cannot act on a wake.
+        self.pending_poll_wakes = if was_legacy_query { vec![] } else { work.wakes };
         // A Workflow Task is open from here until it is reported. The unwritten-annotation
         // invariant is stated against *that*, not against quiescence -- a task can accumulate a
         // delta and complete without ever asking to be retained.
@@ -2153,16 +2163,34 @@ impl ManagedRun {
         (outcome.into(), act)
     }
 
-    /// Classifies the wake Signals the machines decoded out of this task's history.
+    /// Classifies the wake Signals the machines decoded out of this task's history, together with
+    /// the wakes the poll response carried for it.
     ///
-    /// Returns `true` if any of them should wake the Run. Every one is suppressed from user
+    /// Returns `true` if any of them should wake the Run. Every Signal is suppressed from user
     /// handlers regardless -- that already happened in the machines -- so what is decided here is
     /// only whether the Run resumes.
     fn apply_external_stream_wakes(&mut self) -> bool {
         let wakes = self.wfm.machines.take_external_stream_wakes();
-        if wakes.is_empty() {
+        let poll_wakes = if self.wfm.machines.replaying {
+            vec![]
+        } else {
+            mem::take(&mut self.pending_poll_wakes)
+        };
+        if wakes.is_empty() && poll_wakes.is_empty() {
             return false;
         }
+
+        // A poll wake counts as an unparked wake (generation 0), which is never rejected. The
+        // server resolved the chain when it stored the wake on this run, so there is no chain
+        // identity left to compare.
+        for wake in &poll_wakes {
+            debug!(
+                source = %wake.source,
+                counter = wake.counter,
+                "Resuming external stream waits for a poll response wake"
+            );
+        }
+        let mut resume = !poll_wakes.is_empty();
         let chain = self
             .wfm
             .machines
@@ -2170,7 +2198,6 @@ impl ManagedRun {
             .map(|info| info.first_execution_run_id.clone())
             .unwrap_or_default();
 
-        let mut resume = false;
         for wake in wakes {
             // Chain identity, not Run identity. The Signal is addressed to the Workflow ID
             // without a Run ID, so it always lands on the current Run of the chain -- and a

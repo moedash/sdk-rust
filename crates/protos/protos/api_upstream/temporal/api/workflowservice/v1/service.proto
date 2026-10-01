@@ -483,6 +483,22 @@ service WorkflowService {
         };
     }
 
+    // WakeWorkflowExecution asks a running Workflow Execution to run a Workflow
+    // Task because a source it consumes has moved. Unlike a Signal it records
+    // no event, carries no payload, and folds with other wakes for the same
+    // source, so a burst of writes costs one task. The Workflow learns the
+    // source and its position from the task and reads the source itself.
+    rpc WakeWorkflowExecution (WakeWorkflowExecutionRequest) returns (WakeWorkflowExecutionResponse) {
+        option (google.api.http) = {
+            post: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/wake"
+            body: "*"
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/wake"
+                body: "*"
+            }
+        };
+    }
+
     // SignalWithStartWorkflowExecution is used to ensure a signal is sent to a workflow, even if
     // it isn't yet started.
     //
