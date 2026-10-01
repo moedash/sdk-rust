@@ -956,15 +956,6 @@ proxier! {
         }
     );
     (
-        wake_workflow_execution,
-        WakeWorkflowExecutionRequest,
-        WakeWorkflowExecutionResponse,
-        |r| {
-            let labels = namespaced_request!(r);
-            r.extensions_mut().insert(labels);
-        }
-    );
-    (
         signal_with_start_workflow_execution,
         SignalWithStartWorkflowExecutionRequest,
         SignalWithStartWorkflowExecutionResponse,
