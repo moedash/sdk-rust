@@ -4695,47 +4695,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
-  /api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/wake:
-    post:
-      tags:
-        - WorkflowService
-      description: |-
-        WakeWorkflowExecution asks a running Workflow Execution to run a Workflow
-         Task because a source it consumes has moved. Unlike a Signal it records
-         no event, carries no payload, and folds with other wakes for the same
-         source, so a burst of writes costs one task. The Workflow learns the
-         source and its position from the task and reads the source itself.
-      operationId: WakeWorkflowExecution
-      parameters:
-        - name: namespace
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: workflow_execution.workflow_id
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/WakeWorkflowExecutionRequest'
-        required: true
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WakeWorkflowExecutionResponse'
-        default:
-          description: Default error response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Status'
   /api/v1/nexus/endpoints:
     get:
       tags:
@@ -9770,47 +9729,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UpdateWorkflowExecutionResponse'
-        default:
-          description: Default error response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Status'
-  /namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/wake:
-    post:
-      tags:
-        - WorkflowService
-      description: |-
-        WakeWorkflowExecution asks a running Workflow Execution to run a Workflow
-         Task because a source it consumes has moved. Unlike a Signal it records
-         no event, carries no payload, and folds with other wakes for the same
-         source, so a burst of writes costs one task. The Workflow learns the
-         source and its position from the task and reads the source itself.
-      operationId: WakeWorkflowExecution
-      parameters:
-        - name: namespace
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: workflow_execution.workflow_id
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/WakeWorkflowExecutionRequest'
-        required: true
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WakeWorkflowExecutionResponse'
         default:
           description: Default error response
           content:
@@ -14879,15 +14797,6 @@ components:
                2. Try to assign the next poll to a group without any pending polls,
                3. If every group has some pending polls, assign the next poll to a group randomly
                  according to the weights.
-        wakes:
-          type: array
-          items:
-            $ref: '#/components/schemas/Wake'
-          description: |-
-            Wakes pending for this execution when the task started, folded by
-             source. Not recorded in History and never re-supplied on replay: the
-             Workflow treats one as a reason to read its source now and records what
-             it read itself.
     PollerGroupInfo:
       type: object
       properties:
@@ -19125,67 +19034,6 @@ components:
              user specified timeout, API call returns even if specified stage is not reached.
           format: enum
       description: Specifies client's intent to wait for Update results.
-    Wake:
-      type: object
-      properties:
-        source:
-          type: string
-          description: |-
-            What moved, as the sender names it. The server folds wakes by this value
-             and never interprets it. For a stream, the provider formats the stream's
-             identity, owner and topic, into it.
-        position:
-          type: string
-          description: |-
-            Where the source stands after the write that caused this wake, in the
-             store's own terms. Opaque to the server and handed to the Workflow as
-             received. A later wake's position replaces an earlier one's.
-          format: bytes
-        counter:
-          type: string
-          description: |-
-            Orders wakes from one source. Only the source's store can order its
-             positions, so the sender derives this from the position and the server
-             compares nothing else. A wake whose counter is not above the one the
-             server already holds is folded.
-      description: |-
-        A wake tells a running Workflow Execution that something it consumes has
-         moved, so it should run a Workflow Task and read from its own cursor. It is
-         a reason to run, not data: nothing is recorded in History and no record
-         travels with it. A store Temporal does not host sends one after the store
-         has acknowledged a write. Wakes with the same source fold: the server keeps
-         the highest counter it has seen per execution and source, so a repeated,
-         reordered or late wake changes nothing, and a burst of writes costs one task.
-    WakeWorkflowExecutionRequest:
-      type: object
-      properties:
-        namespace:
-          type: string
-        workflowExecution:
-          allOf:
-            - $ref: '#/components/schemas/WorkflowExecution'
-          description: |-
-            The Workflow to wake. `run_id` is optional. When set, the wake goes to
-             the current run of the chain that run belongs to, so a sender that
-             learned a run id before a continue-as-new still reaches the consumer,
-             and it is refused with NotFound once that chain has ended. When unset,
-             the wake goes to the current run under the Workflow Id, whichever chain.
-        wake:
-          $ref: '#/components/schemas/Wake'
-        identity:
-          type: string
-          description: The identity of the sender, for metrics and logs.
-    WakeWorkflowExecutionResponse:
-      type: object
-      properties:
-        runId:
-          type: string
-          description: The run the wake was stored on.
-        folded:
-          type: boolean
-          description: |-
-            True when the server already held this counter or a higher one for the
-             source, so the wake changed nothing.
     WorkerConfig:
       type: object
       properties:

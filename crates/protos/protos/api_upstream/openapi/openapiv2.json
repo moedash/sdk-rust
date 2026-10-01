@@ -4575,51 +4575,6 @@
         ]
       }
     },
-    "/api/v1/namespaces/{namespace}/workflows/{workflowExecution.workflowId}/wake": {
-      "post": {
-        "summary": "WakeWorkflowExecution asks a running Workflow Execution to run a Workflow\nTask because a source it consumes has moved. Unlike a Signal it records\nno event, carries no payload, and folds with other wakes for the same\nsource, so a burst of writes costs one task. The Workflow learns the\nsource and its position from the task and reads the source itself.",
-        "operationId": "WakeWorkflowExecution2",
-        "responses": {
-          "200": {
-            "description": "A successful response.",
-            "schema": {
-              "$ref": "#/definitions/v1WakeWorkflowExecutionResponse"
-            }
-          },
-          "default": {
-            "description": "An unexpected error response.",
-            "schema": {
-              "$ref": "#/definitions/rpcStatus"
-            }
-          }
-        },
-        "parameters": [
-          {
-            "name": "namespace",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "workflowExecution.workflowId",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "body",
-            "in": "body",
-            "required": true,
-            "schema": {
-              "$ref": "#/definitions/WorkflowServiceWakeWorkflowExecutionBody"
-            }
-          }
-        ],
-        "tags": [
-          "WorkflowService"
-        ]
-      }
-    },
     "/api/v1/namespaces/{namespace}/workflows/{workflowId}": {
       "post": {
         "summary": "StartWorkflowExecution starts a new workflow execution.",
@@ -10203,51 +10158,6 @@
         ]
       }
     },
-    "/namespaces/{namespace}/workflows/{workflowExecution.workflowId}/wake": {
-      "post": {
-        "summary": "WakeWorkflowExecution asks a running Workflow Execution to run a Workflow\nTask because a source it consumes has moved. Unlike a Signal it records\nno event, carries no payload, and folds with other wakes for the same\nsource, so a burst of writes costs one task. The Workflow learns the\nsource and its position from the task and reads the source itself.",
-        "operationId": "WakeWorkflowExecution",
-        "responses": {
-          "200": {
-            "description": "A successful response.",
-            "schema": {
-              "$ref": "#/definitions/v1WakeWorkflowExecutionResponse"
-            }
-          },
-          "default": {
-            "description": "An unexpected error response.",
-            "schema": {
-              "$ref": "#/definitions/rpcStatus"
-            }
-          }
-        },
-        "parameters": [
-          {
-            "name": "namespace",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "workflowExecution.workflowId",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "body",
-            "in": "body",
-            "required": true,
-            "schema": {
-              "$ref": "#/definitions/WorkflowServiceWakeWorkflowExecutionBody"
-            }
-          }
-        ],
-        "tags": [
-          "WorkflowService"
-        ]
-      }
-    },
     "/namespaces/{namespace}/workflows/{workflowId}": {
       "post": {
         "summary": "StartWorkflowExecution starts a new workflow execution.",
@@ -13518,27 +13428,6 @@
         }
       },
       "description": "Used to validate the compute config without attaching it to a Worker Deployment Version."
-    },
-    "WorkflowServiceWakeWorkflowExecutionBody": {
-      "type": "object",
-      "properties": {
-        "workflowExecution": {
-          "type": "object",
-          "properties": {
-            "runId": {
-              "type": "string"
-            }
-          },
-          "description": "The Workflow to wake. `run_id` is optional. When set, the wake goes to\nthe current run of the chain that run belongs to, so a sender that\nlearned a run id before a continue-as-new still reaches the consumer,\nand it is refused with NotFound once that chain has ended. When unset,\nthe wake goes to the current run under the Workflow Id, whichever chain."
-        },
-        "wake": {
-          "$ref": "#/definitions/v1Wake"
-        },
-        "identity": {
-          "type": "string",
-          "description": "The identity of the sender, for metrics and logs."
-        }
-      }
     },
     "apiActivityV1CallbackInfo": {
       "type": "object",
@@ -18509,14 +18398,6 @@
         "pollerGroupsInfo": {
           "$ref": "#/definitions/v1PollerGroupsInfo",
           "description": "The weighted, versioned list of poller groups IDs that client should use for future polls to\nthis task queue. Client should ignore this if it has already applied a snapshot with a\nversion greater than or equal to `poller_groups_info.version`. Client is expected to:\n  1. Maintain minimum number of pollers no less than the number of groups.\n  2. Try to assign the next poll to a group without any pending polls,\n  3. If every group has some pending polls, assign the next poll to a group randomly\n    according to the weights."
-        },
-        "wakes": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "$ref": "#/definitions/v1Wake"
-          },
-          "description": "Wakes pending for this execution when the task started, folded by\nsource. Not recorded in History and never re-supplied on replay: the\nWorkflow treats one as a reason to read its source now and records what\nit read itself."
         }
       }
     },
@@ -20901,39 +20782,6 @@
         }
       },
       "description": "Specifies client's intent to wait for Update results."
-    },
-    "v1Wake": {
-      "type": "object",
-      "properties": {
-        "source": {
-          "type": "string",
-          "description": "What moved, as the sender names it. The server folds wakes by this value\nand never interprets it. For a stream, the provider formats the stream's\nidentity, owner and topic, into it."
-        },
-        "position": {
-          "type": "string",
-          "format": "byte",
-          "description": "Where the source stands after the write that caused this wake, in the\nstore's own terms. Opaque to the server and handed to the Workflow as\nreceived. A later wake's position replaces an earlier one's."
-        },
-        "counter": {
-          "type": "string",
-          "format": "int64",
-          "description": "Orders wakes from one source. Only the source's store can order its\npositions, so the sender derives this from the position and the server\ncompares nothing else. A wake whose counter is not above the one the\nserver already holds is folded."
-        }
-      },
-      "description": "A wake tells a running Workflow Execution that something it consumes has\nmoved, so it should run a Workflow Task and read from its own cursor. It is\na reason to run, not data: nothing is recorded in History and no record\ntravels with it. A store Temporal does not host sends one after the store\nhas acknowledged a write. Wakes with the same source fold: the server keeps\nthe highest counter it has seen per execution and source, so a repeated,\nreordered or late wake changes nothing, and a burst of writes costs one task."
-    },
-    "v1WakeWorkflowExecutionResponse": {
-      "type": "object",
-      "properties": {
-        "runId": {
-          "type": "string",
-          "description": "The run the wake was stored on."
-        },
-        "folded": {
-          "type": "boolean",
-          "description": "True when the server already held this counter or a higher one for the\nsource, so the wake changed nothing."
-        }
-      }
     },
     "v1WorkerConfig": {
       "type": "object",
