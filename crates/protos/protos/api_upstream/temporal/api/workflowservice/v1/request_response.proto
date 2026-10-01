@@ -907,8 +907,9 @@ message WakeWorkflowExecutionRequest {
 message WakeWorkflowExecutionResponse {
     // The run the wake was stored on.
     string run_id = 1;
-    // True when the server already held this counter or a higher one for the
-    // source, so the wake changed nothing.
+    // True when a wake for the source was already pending and no task had
+    // received it yet, so this one changed nothing but possibly the position
+    // and no new task results from it.
     bool folded = 2;
 }
 
