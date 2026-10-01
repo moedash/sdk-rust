@@ -1107,6 +1107,9 @@ async fn call_workflow_service(
                 validate_worker_deployment_version_compute_config
             )
         }
+        "WakeWorkflowExecution" => {
+            rpc_call_on_trait!(client, call, WorkflowService, wake_workflow_execution)
+        }
         rpc => Err(anyhow::anyhow!("Unknown RPC call {rpc}")),
     }
 }
