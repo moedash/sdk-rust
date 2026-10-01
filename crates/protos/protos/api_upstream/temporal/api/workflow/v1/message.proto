@@ -765,9 +765,10 @@ message WorkflowExecutionPauseInfo {
 // moved, so it should run a Workflow Task and read from its own cursor. It is
 // a reason to run, not data: nothing is recorded in History and no record
 // travels with it. A store Temporal does not host sends one after the store
-// has acknowledged a write. Wakes with the same source fold: the server keeps
-// the highest counter it has seen per execution and source, so a repeated,
-// reordered or late wake changes nothing, and a burst of writes costs one task.
+// has acknowledged a write. Wakes for the same source fold while one is
+// pending and no task has received it yet, so a burst of writes costs one
+// task. Once a task has been handed the wake, a new wake for the source is
+// accepted again, because only the receiver knows what it read.
 message Wake {
     // What moved, as the sender names it. The server folds wakes by this value
     // and never interprets it. For a stream, the provider formats the stream's
@@ -775,11 +776,12 @@ message Wake {
     string source = 1;
     // Where the source stands after the write that caused this wake, in the
     // store's own terms. Opaque to the server and handed to the Workflow as
-    // received. A later wake's position replaces an earlier one's.
+    // received. Among wakes folded together, the position with the highest
+    // counter is the one delivered.
     bytes position = 2;
-    // Orders wakes from one source. Only the source's store can order its
-    // positions, so the sender derives this from the position and the server
-    // compares nothing else. A wake whose counter is not above the one the
-    // server already holds is folded.
+    // Orders wakes from one source, so that folding keeps the latest position.
+    // Only the source's store can order its positions, so the sender derives
+    // this from the position. It is not a durable identity: a wake sent after
+    // a task received an equal counter is accepted again.
     int64 counter = 3;
 }
