@@ -39,6 +39,7 @@ use temporalio_common::protos::{
         history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes, history_event},
         query::v1::WorkflowQuery,
         sdk::v1::{EventGroupMarker, UserMetadata},
+        workflow::v1::Wake,
         workflowservice::v1::PollWorkflowTaskQueueResponse,
     },
     utilities::TryIntoOrNone,
@@ -64,6 +65,9 @@ pub(crate) struct ValidPollWFTQResponse {
     pub(crate) query_requests: Vec<QueryWorkflow>,
     /// Protocol messages
     pub(crate) messages: Vec<IncomingProtocolMessage>,
+    /// Wakes pending for the execution when this task started. Live only: the server never
+    /// supplies them on replay and never records them in History.
+    pub(crate) wakes: Vec<Wake>,
 
     /// Zero-size field to prevent explicit construction
     _cant_construct_me: (),
@@ -75,7 +79,8 @@ impl Debug for ValidPollWFTQResponse {
             f,
             "ValidWFT {{ task_token: {}, task_queue: {}, workflow_execution: {:?}, \
              workflow_type: {}, attempt: {}, previous_started_event_id: {}, started_event_id {}, \
-             history_length: {}, first_evt_in_hist_id: {:?}, legacy_query: {:?}, queries: {:?} }}",
+             history_length: {}, first_evt_in_hist_id: {:?}, legacy_query: {:?}, queries: {:?}, \
+             wakes: {:?} }}",
             self.task_token,
             self.task_queue,
             self.workflow_execution,
@@ -86,7 +91,8 @@ impl Debug for ValidPollWFTQResponse {
             self.history.events.len(),
             self.history.events.first().map(|e| e.event_id),
             self.legacy_query,
-            self.query_requests
+            self.query_requests,
+            self.wakes
         )
     }
 }
@@ -109,6 +115,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                 query,
                 queries,
                 messages,
+                wakes,
                 ..
             } => {
                 if task_token.is_empty() {
@@ -133,6 +140,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                     legacy_query: query,
                     query_requests,
                     messages,
+                    wakes,
                     _cant_construct_me: (),
                 })
             }
