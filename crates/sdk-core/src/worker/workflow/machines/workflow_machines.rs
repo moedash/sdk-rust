@@ -74,6 +74,7 @@ use temporalio_common::{
             common::v1::SearchAttributes,
             enums::v1::EventType,
             history::v1::{HistoryEvent, history_event},
+            notification::v1::Notification,
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
             stream::v1::{StreamRange, StreamSlice},
@@ -116,6 +117,11 @@ pub(crate) struct WorkflowMachines {
     /// not say so: it is true for a cache hit as well, because the history
     /// begins after an earlier task.
     stream_slices_delivered_through: i64,
+    /// Channel notifications from the scheduled events of the task being applied, folded per
+    /// channel. The server clears what it put on a scheduled event, so a retry's event carries
+    /// only later arrivals, and a failed task's notifications reach lang only here, together
+    /// with the retry's.
+    pending_notifications: Vec<Notification>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
@@ -314,6 +320,7 @@ impl WorkflowMachines {
             current_stream_slices: Default::default(),
             stream_slices_delivered_through: 0,
             stream_slices_lookahead_through: 0,
+            pending_notifications: vec![],
             replaying,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -824,6 +831,13 @@ impl WorkflowMachines {
             }
             self.last_processed_event = eid;
         }
+        // One job for every scheduled event in the batch, so a failed task and its retry
+        // reach lang the way the server folds them.
+        if !self.pending_notifications.is_empty() {
+            let notifications = std::mem::take(&mut self.pending_notifications);
+            self.drive_me
+                .send_job(workflow_activation::NotificationsReceived { notifications }.into());
+        }
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
         #[allow(clippy::large_enum_variant)]
@@ -1186,21 +1200,17 @@ impl WorkflowMachines {
             Ok(EventType::WorkflowTaskScheduled) => {
                 // The notifications ride on the event itself, so the same job
                 // comes out of it live and on replay with nothing to re-supply.
-                let notifications = match &event_dat.event.attributes {
-                    Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) => {
-                        a.notifications.clone()
+                if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) =
+                    &event_dat.event.attributes
+                {
+                    for n in &a.notifications {
+                        fold_notification(&mut self.pending_notifications, n.clone());
                     }
-                    _ => vec![],
-                };
+                }
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
                 self.submachine_handle_event(key, event_dat)?;
                 self.machines_by_event_id.insert(event_id, key);
-                if !notifications.is_empty() {
-                    self.drive_me.send_job(
-                        workflow_activation::NotificationsReceived { notifications }.into(),
-                    );
-                }
             }
             Ok(EventType::WorkflowExecutionSignaled) => {
                 if let Some(history_event::Attributes::WorkflowExecutionSignaledEventAttributes(
@@ -2023,6 +2033,20 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+/// Keep one notification per channel, in order of first appearance. A later one replaces
+/// the held one when its counter is at least as high, the same rule the server folds by,
+/// so a tie goes to the newer metadata.
+fn fold_notification(folded: &mut Vec<Notification>, n: Notification) {
+    match folded.iter_mut().find(|held| held.channel == n.channel) {
+        Some(held) => {
+            if n.counter >= held.counter {
+                *held = n;
+            }
+        }
+        None => folded.push(n),
+    }
 }
 
 /// Turn a slice the server supplied into the job lang sees.

@@ -20,6 +20,7 @@ use temporalio_common::protos::{
     temporal::api::{
         command::v1::command,
         enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
+        failure::v1::Failure,
         notification::v1::Notification,
         workflowservice::v1::RespondWorkflowTaskCompletedResponse,
     },
@@ -308,4 +309,107 @@ async fn a_scheduled_event_without_notifications_yields_no_job() {
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
         .await
         .unwrap();
+}
+
+/// The first activation a replay worker makes of a history that ends with the run
+/// completing, and that worker, so the test can finish the run on it.
+async fn replayed_first_activation(
+    mut t: TestHistoryBuilder,
+) -> (crate::Worker, HistoryFeeder, WorkflowActivation) {
+    t.add_workflow_task_completed();
+    t.add_workflow_execution_completed();
+    let (feeder, stream) = HistoryFeeder::new(1);
+    feeder
+        .feed(HistoryForReplay::new(
+            t.get_full_history_info().unwrap(),
+            "wfid",
+        ))
+        .await
+        .unwrap();
+    let core = init_replay_worker(ReplayWorkerInput::new(
+        test_worker_cfg().build().unwrap(),
+        stream,
+    ))
+    .unwrap();
+    let task = core.poll_workflow_activation().await.unwrap();
+    (core, feeder, task)
+}
+
+/// The first activation of a history served live, as one poll response.
+async fn live_first_activation(t: TestHistoryBuilder) -> WorkflowActivation {
+    let mock =
+        MockPollCfg::from_resp_batches("wfid", t, [ResponseType::AllHistory], mock_worker_client());
+    let core = mock_worker(build_mock_pollers(mock));
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id.clone()))
+        .await
+        .unwrap();
+    task
+}
+
+/// A first task that failed, scheduled with one notification on channel A, and its
+/// retry, scheduled with a newer one on A and one on B.
+fn failed_task_then_retry() -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_with_notifications(vec![notification("a", 1)]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_failed_with_failure(
+        WorkflowTaskFailedCause::Unspecified,
+        Failure::default(),
+    );
+    t.add_workflow_task_scheduled_with_notifications(vec![
+        notification("a", 5),
+        notification("b", 2),
+    ]);
+    t.add_workflow_task_started();
+    t
+}
+
+/// The server clears what it put on a scheduled event, so the failed task's
+/// notification is only in History. The retry's activation gets it folded with
+/// the retry's own, one per channel, live and on replay alike.
+#[tokio::test]
+async fn a_failed_task_and_its_retry_yield_one_job_folded_per_channel() {
+    let expected = vec![vec![notification("a", 5), notification("b", 2)]];
+
+    let task = live_first_activation(failed_task_then_retry()).await;
+    assert!(!task.is_replaying);
+    assert_eq!(job_kinds(&task), vec!["init", "notifications"]);
+    assert_eq!(received(&task), expected);
+
+    let (core, feeder, task) = replayed_first_activation(failed_task_then_retry()).await;
+    assert!(task.is_replaying);
+    assert_eq!(job_kinds(&task), vec!["init", "notifications"]);
+    assert_eq!(received(&task), expected);
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![CompleteWorkflowExecution { result: None }.into()],
+    ))
+    .await
+    .unwrap();
+    drop(feeder);
+    core.shutdown().await;
+}
+
+/// A notification with a lower counter than the one already held for its channel
+/// does not replace it, and channels keep the order they first appeared in.
+#[tokio::test]
+async fn a_lower_counter_does_not_replace_the_held_notification() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_with_notifications(vec![notification("a", 5)]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_timed_out();
+    t.add_workflow_task_scheduled_with_notifications(vec![
+        notification("b", 1),
+        notification("a", 3),
+    ]);
+    t.add_workflow_task_started();
+
+    let task = live_first_activation(t).await;
+    assert_eq!(
+        received(&task),
+        vec![vec![notification("a", 5), notification("b", 1)]]
+    );
 }
