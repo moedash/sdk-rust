@@ -346,10 +346,10 @@ impl WorkflowFuture {
                     );
                 }
                 Variant::NotificationsReceived(_) => {
-                    // No channel API in this SDK, so nothing here could have
-                    // subscribed. Bailing rather than ignoring keeps a run that
-                    // depends on them from going on as if none arrived.
-                    bail!("received channel notifications, which this SDK cannot deliver");
+                    // No channel API in this SDK, so nothing here subscribed, and a
+                    // notification carries no data a workflow could lose by this.
+                    debug!("Channel notifications received and ignored");
+                    push_polled_context!(ActivationJobContext::Passive);
                 }
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
