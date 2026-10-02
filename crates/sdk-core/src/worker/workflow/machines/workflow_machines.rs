@@ -127,10 +127,10 @@ pub(crate) struct WorkflowMachines {
     /// Reserved external stream wake Signals seen in history, decoded and suppressed from user
     /// dispatch, waiting to be classified against the run's wait set.
     pending_external_stream_wakes: Vec<external_stream::WakeSignal>,
-    /// Channel notifications read from the scheduled events of the task being applied, in History
-    /// order. The server clears what it put on a scheduled event, so a retry's event carries only
-    /// what arrived since. The failed task's notifications stay in History and are only ever
-    /// handed over here, together with the retry's, as one job.
+    /// Channel notifications read from the scheduled events of the task being applied, folded
+    /// per channel. The server clears what it put on a scheduled event, so a retry's event
+    /// carries only what arrived since. The failed task's notifications stay in History and
+    /// reach lang here, folded with the retry's into one job.
     pending_notifications: Vec<Notification>,
     /// Set when notifications were handed to lang and the run's wait set has not seen them yet.
     pending_notification_wake: bool,
@@ -1418,8 +1418,7 @@ impl WorkflowMachines {
                     ref attrs,
                 )) = event_dat.event.attributes
                 {
-                    self.pending_notifications
-                        .extend(attrs.notifications.iter().cloned());
+                    fold_notifications(&mut self.pending_notifications, &attrs.notifications);
                 }
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
@@ -2391,4 +2390,19 @@ fn resupplied_deliveries(
         )));
     }
     Ok(jobs)
+}
+
+/// Adds a scheduled event's notifications to the ones already read for this task.
+///
+/// Uses the server's own fold rule, one per channel with the highest counter kept, so a channel
+/// seen on two scheduled events of one task reaches lang once. Channels keep the order they were
+/// first seen in, which History fixes, so a replay builds the same job.
+fn fold_notifications(pending: &mut Vec<Notification>, incoming: &[Notification]) {
+    for n in incoming {
+        match pending.iter_mut().find(|p| p.channel == n.channel) {
+            Some(p) if n.counter > p.counter => *p = n.clone(),
+            Some(_) => {}
+            None => pending.push(n.clone()),
+        }
+    }
 }
