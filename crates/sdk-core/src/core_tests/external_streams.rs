@@ -41,16 +41,16 @@ use temporalio_common::{
                 ContinueAsNewWorkflowExecution, ExternalStreamFinalized, ExternalStreamParkResult,
                 ExternalStreamWait, FailWorkflowExecution, ParkSetConfirmed, ScheduleActivity,
                 StreamSetBecameReady, UpdateResponse, WorkflowOutputStreamBuffered,
-                WorkflowOutputStreamCommit, WorkflowStreamProgress, WorkflowStreamQuiescent,
-                external_stream_park_result, update_response::Response as UpdateOutcome,
-                workflow_command,
+                WorkflowOutputStreamCommit, WorkflowStreamChannels, WorkflowStreamProgress,
+                WorkflowStreamQuiescent, external_stream_park_result,
+                update_response::Response as UpdateOutcome, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            command::v1::command,
+            command::v1::{Command, command},
             common::v1::Payload,
-            enums::v1::{CommandType, EventType},
+            enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
             history::v1::History,
             notification::v1::Notification,
             query::v1::WorkflowQuery,
@@ -3715,6 +3715,555 @@ async fn replayed_notifications_resume_the_reconstructed_waits() {
         .await
         .unwrap();
     worker.drain_pollers_and_shutdown().await;
+}
+
+// --- channel subscriptions ride the completion that ends the task ------------
+
+/// Lang's report of the complete set of channels the run listens on.
+fn channels_command(channels: &[&str]) -> workflow_command::Variant {
+    workflow_command::Variant::WorkflowStreamChannels(WorkflowStreamChannels {
+        channels: channels.iter().map(|c| c.to_string()).collect(),
+    })
+}
+
+/// The commands of every completion a worker reported, one entry per completion.
+type ReportedCompletions = Arc<Mutex<Vec<Vec<Command>>>>;
+
+/// A workflow-only worker recording the commands of every completion it reports.
+fn worker_recording_commands(
+    reported: ReportedCompletions,
+    history: TestHistoryBuilder,
+    batches: Vec<usize>,
+) -> crate::Worker {
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, batches, mock_worker_client());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        for _ in 0..4 {
+            let reported = reported.clone();
+            asserts.then(move |wft| reported.lock().push(wft.commands.clone()));
+        }
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+fn command_types(commands: &[Command]) -> Vec<CommandType> {
+    commands.iter().map(|c| c.command_type()).collect()
+}
+
+/// The channels the subscribe commands in a completion named, in order.
+fn subscribed_channels(commands: &[Command]) -> Vec<String> {
+    commands
+        .iter()
+        .filter_map(|c| match &c.attributes {
+            Some(command::Attributes::SubscribeNotificationChannelCommandAttributes(a)) => {
+                Some(a.channel.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn fires_a_timer(activation: &WorkflowActivation) -> bool {
+    activation.jobs.iter().any(|j| {
+        matches!(
+            j.variant,
+            Some(workflow_activation_job::Variant::FireTimer(_))
+        )
+    })
+}
+
+/// A history whose first task recorded a marker with `terminal` and a subscription, and whose
+/// second carries a Signal, which is there to give the replacement task an activation.
+fn marker_subscribed_then_signal_history(
+    terminal: ParkReason,
+    channel: &str,
+) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
+    t.add_full_wf_task();
+    t.add_external_stream_marker(1, terminal, b"recorded");
+    t.add_notification_channel_subscribed(channel);
+    t.add_we_signaled("keep-the-run-cached", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// A history whose first task subscribed a channel and started a timer, and whose second task is
+/// that timer firing.
+fn subscribed_then_timer_history(channel: &str) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_notification_channel_subscribed(channel);
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// Opens a reader on `channel` and leaves the task retained on wait 1.
+async fn retain_a_task_listening_on(
+    worker: &crate::Worker,
+    channel: &str,
+    idle_timeout: Duration,
+) -> String {
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                progress_command(b"observed", false),
+                channels_command(&[channel]),
+                quiescent_command(1, &[1], idle_timeout),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "the activation that opened the reader must leave its task retained"
+    );
+    run_id
+}
+
+#[tokio::test]
+async fn a_retained_task_subscribes_when_the_park_ends_it() {
+    // The subscribe command is server-bound, so issued from the activation that opened the first
+    // reader it would end the very task that was meant to stay retained. Held back to the
+    // completion that ends the task, the task stays retained and parks as before, and the command
+    // rides the park confirmation behind the marker.
+    let reported: ReportedCompletions = Default::default();
+    let worker = worker_recording_commands(
+        reported.clone(),
+        marker_subscribed_then_signal_history(ParkReason::Idle, "inputs"),
+        vec![1, 2],
+    );
+
+    let run_id = retain_a_task_listening_on(&worker, "inputs", Duration::from_millis(30)).await;
+    assert!(
+        reported.lock().is_empty(),
+        "nothing may be reported while the task is retained, got {:?}",
+        reported.lock()
+    );
+
+    let park = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        park_jobs(&park),
+        vec![(1, ParkReason::Idle, vec![1])],
+        "the idle timer must still park the task, got {:?}",
+        park.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            park_confirmed_command(1, b"-parked"),
+        ))
+        .await
+        .unwrap();
+
+    let completions = reported.lock().clone();
+    assert_eq!(completions.len(), 1, "the park must report the task once");
+    assert_eq!(
+        command_types(&completions[0]),
+        vec![
+            CommandType::RecordMarker,
+            CommandType::SubscribeNotificationChannel
+        ],
+        "the subscribe command rides the park confirmation, after the marker"
+    );
+    assert_eq!(subscribed_channels(&completions[0]), vec!["inputs"]);
+
+    // The replacement task matches the marker and the subscribed event against the two commands.
+    let replacement = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replacement.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_retained_task_subscribes_when_a_finalization_ends_it() {
+    // The boundary Core decided: the rollover deadline asks lang for a terminal, and the
+    // completion that answers is the one that writes the marker and reports the task. The
+    // subscribe command rides that one, not the finalization request.
+    let reported: ReportedCompletions = Default::default();
+    let worker = worker_recording_commands(
+        reported.clone(),
+        marker_subscribed_then_signal_history(ParkReason::Rollover, "inputs"),
+        vec![1, 2],
+    );
+
+    let run_id = retain_a_task_listening_on(&worker, "inputs", Duration::from_secs(30)).await;
+    worker
+        .start_wft_rollover_timer(&run_id, Duration::from_millis(50))
+        .await;
+
+    let finalize = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&finalize),
+        vec![(1, ParkReason::Rollover, vec![1])],
+        "the deadline must ask lang to finalize, got {:?}",
+        finalize.jobs
+    );
+    assert!(
+        reported.lock().is_empty(),
+        "nothing may be reported before the terminal exists, got {:?}",
+        reported.lock()
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            finalized_command(1, b"-terminal"),
+        ))
+        .await
+        .unwrap();
+
+    let completions = reported.lock().clone();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        command_types(&completions[0]),
+        vec![
+            CommandType::RecordMarker,
+            CommandType::SubscribeNotificationChannel
+        ],
+        "the subscribe command rides the finalization answer, after the marker"
+    );
+    assert_eq!(subscribed_channels(&completions[0]), vec!["inputs"]);
+
+    // The wait set survived onto the replacement task, so the same channel is due nothing more.
+    let replacement = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replacement.run_id,
+            vec![
+                channels_command(&["inputs"]),
+                CompleteWorkflowExecution::default().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_command_carrying_completion_subscribes_after_its_marker() {
+    // The other way a task ends while the run goes on. The subscribe command sits between the
+    // marker and lang's own command: on replay the lookahead claims the marker, the subscribed
+    // event is matched next and the timer last, so the order is fixed here.
+    let reported: ReportedCompletions = Default::default();
+    let worker = worker_recording_commands(
+        reported.clone(),
+        canned_histories::single_timer("1"),
+        vec![1],
+    );
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id,
+            vec![
+                progress_command(b"consumed", false),
+                channels_command(&["inputs"]),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    let completions = reported.lock().clone();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        command_types(&completions[0]),
+        vec![
+            CommandType::RecordMarker,
+            CommandType::SubscribeNotificationChannel,
+            CommandType::StartTimer
+        ]
+    );
+    assert_eq!(subscribed_channels(&completions[0]), vec!["inputs"]);
+}
+
+#[tokio::test]
+async fn a_run_ending_completion_subscribes_to_nothing() {
+    // A subscription ends with the run, so one made on the completion that ends the run would
+    // only add an event. Continue-as-new ends the run too: the successor subscribes for itself.
+    let reported: ReportedCompletions = Default::default();
+    let worker = worker_recording_commands(
+        reported.clone(),
+        canned_histories::single_timer("1"),
+        vec![1],
+    );
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id,
+            vec![
+                progress_command(b"consumed", false),
+                channels_command(&["inputs"]),
+                CompleteWorkflowExecution::default().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    let completions = reported.lock().clone();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        command_types(&completions[0]),
+        vec![
+            CommandType::RecordMarker,
+            CommandType::CompleteWorkflowExecution
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_later_task_naming_the_same_channel_subscribes_again_to_nothing() {
+    // The subscription belongs to the run, not to the task. Every completion reports the
+    // complete set, and a channel already subscribed is not subscribed twice.
+    let reported: ReportedCompletions = Default::default();
+    let worker = worker_recording_commands(
+        reported.clone(),
+        subscribed_then_timer_history("inputs"),
+        vec![1, 2],
+    );
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![
+                channels_command(&["inputs"]),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        fires_a_timer(&fired),
+        "the timer must match its event behind the subscribed one, got {:?}",
+        fired.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            fired.run_id,
+            vec![
+                channels_command(&["inputs"]),
+                start_timer_cmd(2, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    let completions = reported.lock().clone();
+    assert_eq!(completions.len(), 2);
+    assert_eq!(subscribed_channels(&completions[0]), vec!["inputs"]);
+    assert_eq!(
+        command_types(&completions[1]),
+        vec![CommandType::StartTimer],
+        "the second task adds nothing for a channel the run already listens on"
+    );
+}
+
+/// The History a leaving task writes: the marker, the subscription, then lang's own command.
+fn replayable_subscribed_history(channel: &str) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_external_stream_marker_covering(
+        1,
+        ParkReason::CommandsProduced,
+        b"header.segment.terminal",
+        &[(1, 0)],
+    );
+    t.add_notification_channel_subscribed(channel);
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+    t
+}
+
+#[tokio::test]
+async fn replay_reissues_the_subscription_from_the_same_report() {
+    // The replayed completion reports the channel set the live one did, so Core issues the same
+    // subscribe command in the same place and the recorded event matches it. The lookahead has
+    // already claimed the marker, so the subscribed event is the first the command queue sees.
+    let worker = crate::init_replay_worker(crate::replay::ReplayWorkerInput::new(
+        crate::test_help::test_worker_cfg().build().unwrap(),
+        futures_util::stream::iter([crate::replay::HistoryForReplay::from(
+            replayable_subscribed_history("inputs"),
+        )]),
+    ))
+    .unwrap();
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(
+        replay_jobs(&replayed).len(),
+        1,
+        "the recorded boundary must reach lang, got {:?}",
+        replayed.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id,
+            vec![
+                channels_command(&["inputs"]),
+                start_timer_cmd(1, Duration::from_secs(3)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        fires_a_timer(&fired),
+        "the timer behind the subscribed event must still match, got {:?}",
+        fired.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            fired.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            worker.poll_workflow_activation().await,
+            Err(PollError::ShutDown)
+        ),
+        "replay must run the history to its end"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_report_naming_a_different_channel_is_nondeterminism() {
+    // The machine holds the recorded event against the channel the command was issued for, as it
+    // does for a lang-issued command. One batch, so the first task is replayed rather than run.
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        subscribed_then_timer_history("inputs"),
+        [2],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_fails = 1;
+    let saw_the_right_failure = Arc::new(AtomicBool::new(false));
+    let recorder = saw_the_right_failure.clone();
+    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
+        let message = failure
+            .as_ref()
+            .map(|f| f.message.clone())
+            .unwrap_or_default();
+        recorder.store(
+            message.contains("does not match the reissued subscription")
+                && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError),
+            Ordering::Relaxed,
+        );
+        true
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying, "got {replayed:?}");
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id,
+            vec![
+                channels_command(&["other"]),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let next = tokio::time::timeout(
+        Duration::from_millis(500),
+        worker.poll_workflow_activation(),
+    )
+    .await;
+    if let Ok(Ok(act)) = next {
+        assert!(
+            act.is_only_eviction(),
+            "the mismatch must fail the task rather than activate lang, got {:?}",
+            act.jobs
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+            .await
+            .unwrap();
+    }
+    assert!(
+        saw_the_right_failure.load(Ordering::Relaxed),
+        "the mismatch must fail the task as nondeterminism naming both channels"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[rstest::rstest]
+#[case::an_empty_name(vec![""])]
+#[case::a_channel_named_twice(vec!["inputs", "inputs"])]
+#[tokio::test]
+async fn a_malformed_channel_report_fails_the_task(#[case] channels: Vec<&str>) {
+    // Rejected rather than repaired, as a malformed snapshot is: the set is what the subscribe
+    // commands are derived from. The mock's `num_expected_fails` is what asserts the failure
+    // reached the server.
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    mock_cfg.num_expected_fails = 1;
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                channels_command(&channels),
+                quiescent_command(1, &[1], Duration::from_secs(30)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        worker.external_stream_run_status(&run_id).await,
+        ExternalStreamRunStatus::WftOpen,
+        "a malformed channel report must not retain the Workflow Task"
+    );
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
 }
 
 // --- marker emission (C9, C14b) ----------------------------------------------

@@ -1811,6 +1811,16 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for WorkflowStreamChannels {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "WorkflowStreamChannels({} channel(s))",
+                        self.channels.len()
+                    )
+                }
+            }
+
             impl Display for WorkflowOutputStreamBuffered {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(

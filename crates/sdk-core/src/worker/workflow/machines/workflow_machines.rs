@@ -67,7 +67,9 @@ use temporalio_common::{
                 self, NotificationsReceived, NotifyHasPatch, ReplayExternalStreams,
                 UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
-            workflow_commands::{ContinueAsNewWorkflowExecution, ExternalStreamWait},
+            workflow_commands::{
+                ContinueAsNewWorkflowExecution, ExternalStreamWait, SubscribeNotificationChannel,
+            },
         },
         temporal::api::{
             command::v1::{
@@ -548,6 +550,21 @@ impl WorkflowMachines {
         // Core generates this command *after* lang's own iteration has already prepared its
         // commands, so it has to prepare its own. Without this the marker sits in the current
         // task's queue and never reaches the server -- silently, since nothing else looks there.
+        self.prepare_commands()
+    }
+
+    /// Subscribes the run to a notification channel on Core's own initiative.
+    ///
+    /// The same machine the lang-issued command gets, so the recorded event is matched the same
+    /// way on replay. Unlike the marker this is issued while replaying too: the event is matched
+    /// against a command in the queue rather than claimed by a lookahead, and the replayed
+    /// completion reports the same channel set the live one did.
+    pub(crate) fn emit_notification_channel_subscription(&mut self, channel: String) -> Result<()> {
+        self.add_cmd_to_wf_task(
+            subscribe_notification_channel(SubscribeNotificationChannel { channel }),
+            None,
+            CommandIdKind::CoreInternal,
+        );
         self.prepare_commands()
     }
 
@@ -1804,7 +1821,8 @@ impl WorkflowMachines {
                 | WFCommandVariant::ExternalStreamParkResult(_)
                 | WFCommandVariant::ExternalStreamFinalized(_)
                 | WFCommandVariant::ExternalOutputStreamCommit(_)
-                | WFCommandVariant::ExternalOutputStreamBuffered(_) => {
+                | WFCommandVariant::ExternalOutputStreamBuffered(_)
+                | WFCommandVariant::ExternalStreamChannels(_) => {
                     return Err(fatal!(
                         "External stream command {} reached the state machines; it should have \
                          been consumed by the run's external wait set",
