@@ -488,6 +488,9 @@ service WorkflowService {
     // no event, carries no payload, and folds with other wakes for the same
     // source, so a burst of writes costs one task. The Workflow learns the
     // source and its position from the task and reads the source itself.
+    //
+    // Superseded by the notification channel (`NotifyChannel` and the
+    // `SubscribeNotificationChannel` command). Kept for one round and slated for removal.
     rpc WakeWorkflowExecution (WakeWorkflowExecutionRequest) returns (WakeWorkflowExecutionResponse) {
         option (google.api.http) = {
             post: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/wake"
@@ -495,6 +498,72 @@ service WorkflowService {
             additional_bindings {
                 post: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/wake"
                 body: "*"
+            }
+        };
+    }
+
+    // NotifyChannel tells every listener of a channel that a source they consume
+    // has moved. The writer names no addressee and never learns who listens. The
+    // server wakes each listener: a Workflow with a Workflow Task, a callback by
+    // invoking it. Nothing goes to History except the notifications a woken
+    // Workflow Task carries on its scheduled event.
+    rpc NotifyChannel (NotifyChannelRequest) returns (NotifyChannelResponse) {
+        option (google.api.http) = {
+            post: "/namespaces/{namespace}/channels/{notification.channel}/notify"
+            body: "*"
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/channels/{notification.channel}/notify"
+                body: "*"
+            }
+        };
+    }
+
+    // RegisterChannelListener registers a callback as a listener of a channel. A
+    // Workflow registers itself with the `SubscribeNotificationChannel` command
+    // instead.
+    rpc RegisterChannelListener (RegisterChannelListenerRequest) returns (RegisterChannelListenerResponse) {
+        option (google.api.http) = {
+            post: "/namespaces/{namespace}/channels/{channel}/listeners"
+            body: "*"
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/channels/{channel}/listeners"
+                body: "*"
+            }
+        };
+    }
+
+    // UnregisterChannelListener removes a listener from a channel.
+    //
+    // (-- api-linter: core::0136::http-method=disabled
+    //     aip.dev/not-precedent: Removing a listener is a delete of that listener. --)
+    rpc UnregisterChannelListener (UnregisterChannelListenerRequest) returns (UnregisterChannelListenerResponse) {
+        option (google.api.http) = {
+            delete: "/namespaces/{namespace}/channels/{channel}/listeners/{listener_id}"
+            additional_bindings {
+                delete: "/api/v1/namespaces/{namespace}/channels/{channel}/listeners/{listener_id}"
+            }
+        };
+    }
+
+    // PollChannel is a long poll for clients. It returns the retained
+    // notifications of a channel with a counter above `after_counter`, waiting
+    // up to `wait` for one when none is retained yet.
+    rpc PollChannel (PollChannelRequest) returns (PollChannelResponse) {
+        option (google.api.http) = {
+            get: "/namespaces/{namespace}/channels/{channel}/notifications"
+            additional_bindings {
+                get: "/api/v1/namespaces/{namespace}/channels/{channel}/notifications"
+            }
+        };
+    }
+
+    // DescribeChannel returns the listeners of a channel and its latest
+    // notification.
+    rpc DescribeChannel (DescribeChannelRequest) returns (DescribeChannelResponse) {
+        option (google.api.http) = {
+            get: "/namespaces/{namespace}/channels/{channel}"
+            additional_bindings {
+                get: "/api/v1/namespaces/{namespace}/channels/{channel}"
             }
         };
     }
