@@ -32,6 +32,12 @@ message Notification {
     // Details for the listener, such as which topic moved. Bounded in size and
     // carried as payloads, so a codec applies as to any payload.
     map<string, temporal.api.common.v1.Payload> metadata = 4;
+    // Set for a channel linked to a workflow: the owner and the run that
+    // received the notification. Empty for an independent channel. A listener
+    // that holds both kinds routes the notification by it.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" names the owner the channel is linked to. --)
+    temporal.api.common.v1.WorkflowExecution linked_to = 5;
 }
 
 // A listener of a channel: a Workflow Execution woken with a Workflow Task, or
@@ -52,4 +58,15 @@ message WorkflowListener {
     // The run that subscribed. The server follows a continue-as-new to the
     // chain's current run when it delivers.
     string run_id = 2;
+}
+
+// Where a channel lives, which decides how a call addresses it.
+enum ChannelKind {
+    CHANNEL_KIND_UNSPECIFIED = 0;
+    // Its own execution, keyed by namespace and channel name. Any number of
+    // workflows and callbacks listen to it.
+    CHANNEL_KIND_INDEPENDENT = 1;
+    // Kept in one workflow's state, keyed by namespace, workflow id and
+    // channel name. The owning workflow is its listener by construction.
+    CHANNEL_KIND_LINKED = 2;
 }
