@@ -327,7 +327,8 @@ message Command {
         RequestCancelNexusOperationCommandAttributes request_cancel_nexus_operation_command_attributes = 19;
         AppendStreamRecordsCommandAttributes append_stream_records_command_attributes = 20;
         SubscribeStreamCommandAttributes subscribe_stream_command_attributes = 21;
-        SubscribeNotificationChannelCommandAttributes subscribe_notification_channel_command_attributes = 22;
+        SubscribeNotificationChannelCommandAttributes
+            subscribe_notification_channel_command_attributes = 22;
     }
 }
 

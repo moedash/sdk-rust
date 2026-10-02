@@ -521,7 +521,8 @@ service WorkflowService {
     // RegisterChannelListener registers a callback as a listener of a channel. A
     // Workflow registers itself with the `SubscribeNotificationChannel` command
     // instead.
-    rpc RegisterChannelListener (RegisterChannelListenerRequest) returns (RegisterChannelListenerResponse) {
+    rpc RegisterChannelListener (RegisterChannelListenerRequest)
+        returns (RegisterChannelListenerResponse) {
         option (google.api.http) = {
             post: "/namespaces/{namespace}/channels/{channel}/listeners"
             body: "*"
@@ -536,7 +537,8 @@ service WorkflowService {
     //
     // (-- api-linter: core::0136::http-method=disabled
     //     aip.dev/not-precedent: Removing a listener is a delete of that listener. --)
-    rpc UnregisterChannelListener (UnregisterChannelListenerRequest) returns (UnregisterChannelListenerResponse) {
+    rpc UnregisterChannelListener (UnregisterChannelListenerRequest)
+        returns (UnregisterChannelListenerResponse) {
         option (google.api.http) = {
             delete: "/namespaces/{namespace}/channels/{channel}/listeners/{listener_id}"
             additional_bindings {
