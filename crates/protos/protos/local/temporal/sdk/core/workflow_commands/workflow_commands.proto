@@ -66,7 +66,16 @@ message WorkflowCommand {
         // leaves 23 to 28 to the commands above, and must not be reused.
         SubscribeStream subscribe_stream = 29;
         AppendStreamRecords append_stream_records = 30;
+        SubscribeNotificationChannel subscribe_notification_channel = 31;
     }
+}
+
+// Makes this run a listener of a notification channel. Nothing resolves back to lang: the
+// notifications arrive later on the scheduled event of a Workflow Task, as a
+// `NotificationsReceived` job.
+message SubscribeNotificationChannel {
+    // The channel to listen on, as the writers name it.
+    string channel = 1;
 }
 
 // Commits an observation delta for external streams.

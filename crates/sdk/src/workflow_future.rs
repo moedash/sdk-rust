@@ -348,6 +348,11 @@ impl WorkflowFuture {
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
                 }
+                // Nothing to wake: this SDK cannot subscribe to a channel, and a notification
+                // is a hint without data, so the guest runtime drops it.
+                Variant::NotificationsReceived(_) => {
+                    push_context!(ActivationJobContext::Passive);
+                }
                 // External Workflow Streams are a Python-SDK feature. This SDK never emits
                 // `WorkflowStreamQuiescent`, so Core has nothing to retain a Workflow Task for
                 // and cannot produce any of these jobs for it.
