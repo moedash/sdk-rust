@@ -1639,6 +1639,11 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::SubscribeNotificationChannel(_) => {
                 return Err(EmptyWorkflowCommandErr);
             }
+            // Same reason, reversed: the workflow would go on as if unsubscribed
+            // while the server keeps delivering.
+            workflow_command::Variant::UnsubscribeNotificationChannel(_) => {
+                return Err(EmptyWorkflowCommandErr);
+            }
         };
         Ok(Self {
             variant,

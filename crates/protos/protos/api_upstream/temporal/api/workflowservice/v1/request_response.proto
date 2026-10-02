@@ -1320,6 +1320,9 @@ message DescribeWorkflowExecutionResponse {
     repeated temporal.api.workflow.v1.CallbackInfo callbacks = 6;
     repeated temporal.api.workflow.v1.PendingNexusOperationInfo pending_nexus_operations = 7;
     temporal.api.workflow.v1.WorkflowExecutionExtendedInfo workflow_extended_info = 8;
+    // The notification channels this run stands on: the independent channels it subscribed to and
+    // the channels linked to it that hold any state. Empty when there are none.
+    repeated temporal.api.workflow.v1.ChannelSubscriptionInfo channel_subscriptions = 9;
 }
 
 // (-- api-linter: core::0203::optional=disabled

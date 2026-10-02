@@ -101,6 +101,8 @@ enum WorkflowTaskFailedCause {
     // A SubscribeNotificationChannel command named an empty or too-long channel, or hit a
     // subscription or listener limit.
     WORKFLOW_TASK_FAILED_CAUSE_BAD_SUBSCRIBE_NOTIFICATION_CHANNEL_ATTRIBUTES = 44;
+    // An UnsubscribeNotificationChannel command named an empty or too-long channel.
+    WORKFLOW_TASK_FAILED_CAUSE_BAD_UNSUBSCRIBE_NOTIFICATION_CHANNEL_ATTRIBUTES = 45;
 }
 
 // Activity tasks can fail for various reasons. Note that some of these reasons can only originate
