@@ -327,6 +327,7 @@ message Command {
         RequestCancelNexusOperationCommandAttributes request_cancel_nexus_operation_command_attributes = 19;
         AppendStreamRecordsCommandAttributes append_stream_records_command_attributes = 20;
         SubscribeStreamCommandAttributes subscribe_stream_command_attributes = 21;
+        SubscribeNotificationChannelCommandAttributes subscribe_notification_channel_command_attributes = 22;
     }
 }
 
@@ -359,4 +360,12 @@ message SubscribeStreamCommandAttributes {
     // subscription is registered, which the server resolves and records so
     // replay does not resolve it again.
     int64 start_offset = 2;
+}
+
+// Makes the Workflow a listener of a notification channel for this run. The
+// next notifications on the channel arrive on the scheduled event of a Workflow
+// Task. The subscription ends with the run, and a successor subscribes again.
+message SubscribeNotificationChannelCommandAttributes {
+    // The channel to listen on, as the writers name it.
+    string channel = 1;
 }
