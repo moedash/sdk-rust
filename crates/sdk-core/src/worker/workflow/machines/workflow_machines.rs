@@ -8,6 +8,7 @@ use super::{
     continue_as_new_workflow_state_machine::continue_as_new,
     fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
+    subscribe_notification_channel_state_machine::subscribe_notification_channel,
     timer_state_machine::new_timer, upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
@@ -63,8 +64,8 @@ use temporalio_common::{
             external_data::{ExternalStreamMarkerData, ParkReason},
             external_stream,
             workflow_activation::{
-                self, NotifyHasPatch, ReplayExternalStreams, UpdateRandomSeed, WorkflowActivation,
-                workflow_activation_job,
+                self, NotificationsReceived, NotifyHasPatch, ReplayExternalStreams,
+                UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
             workflow_commands::{ContinueAsNewWorkflowExecution, ExternalStreamWait},
         },
@@ -73,6 +74,7 @@ use temporalio_common::{
             common::v1::SearchAttributes,
             enums::v1::EventType,
             history::v1::{HistoryEvent, history_event},
+            notification::v1::Notification,
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
         },
@@ -96,6 +98,12 @@ pub(crate) struct WorkflowMachines {
     /// Reserved external stream wake Signals seen in history, decoded and suppressed from user
     /// dispatch, waiting to be classified against the run's wait set.
     pending_external_stream_wakes: Vec<external_stream::WakeSignal>,
+    /// Channel notifications read from the scheduled events of the task being applied, folded
+    /// per channel. A task that failed and was scheduled again carries more than one scheduled
+    /// event, and lang still gets one job for the activation.
+    pending_notifications: Vec<Notification>,
+    /// Set when notifications were handed to lang and the run's wait set has not seen them yet.
+    pending_notification_wake: bool,
     /// External stream marker machines whose `MarkerRecorded` event has not been reached yet, in
     /// the order the markers appear in History.
     ///
@@ -309,6 +317,8 @@ impl WorkflowMachines {
             current_wf_time: None,
             observed_internal_flags: Rc::new(RefCell::new(observed_internal_flags)),
             pending_external_stream_wakes: vec![],
+            pending_notifications: vec![],
+            pending_notification_wake: false,
             external_stream_marker_machines: Default::default(),
             history_size_bytes: 0,
             continue_as_new_suggested: false,
@@ -583,6 +593,30 @@ impl WorkflowMachines {
     /// split: decode and suppress here, classify there.
     pub(crate) fn take_external_stream_wakes(&mut self) -> Vec<external_stream::WakeSignal> {
         std::mem::take(&mut self.pending_external_stream_wakes)
+    }
+
+    /// Whether notifications reached lang since the last call. They come from History, so a
+    /// replay reports the same as the live run did.
+    pub(crate) fn take_notification_wake(&mut self) -> bool {
+        std::mem::take(&mut self.pending_notification_wake)
+    }
+
+    /// Hands lang the notifications folded from this task's scheduled events as one job.
+    ///
+    /// Sent while the task's history is applied, so the job sits ahead of any external stream
+    /// resolve Core queues for the same activation once the history is in.
+    fn flush_pending_notifications(&mut self) {
+        if self.pending_notifications.is_empty() {
+            return;
+        }
+        let notifications = std::mem::take(&mut self.pending_notifications);
+        self.drive_me.send_job(
+            workflow_activation_job::Variant::NotificationsReceived(NotificationsReceived {
+                notifications,
+            })
+            .into(),
+        );
+        self.pending_notification_wake = true;
     }
 
     /// Queue a Core-generated job for lang.
@@ -896,6 +930,7 @@ impl WorkflowMachines {
             }
             self.last_processed_event = eid;
         }
+        self.flush_pending_notifications();
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
         #[allow(clippy::large_enum_variant)]
@@ -1214,6 +1249,12 @@ impl WorkflowMachines {
                 }
             }
             Ok(EventType::WorkflowTaskScheduled) => {
+                if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(
+                    ref attrs,
+                )) = event_dat.event.attributes
+                {
+                    fold_notifications(&mut self.pending_notifications, &attrs.notifications);
+                }
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
                 self.submachine_handle_event(key, event_dat)?;
@@ -1735,6 +1776,15 @@ impl WorkflowMachines {
                         CommandIdKind::NeverResolves,
                     );
                 }
+                WFCommandVariant::SubscribeNotificationChannel(attrs) => {
+                    // Never resolves: the event it produces records the subscription and hands
+                    // nothing back. The notifications arrive later on a scheduled event.
+                    self.add_cmd_to_wf_task(
+                        subscribe_notification_channel(attrs),
+                        annotations,
+                        CommandIdKind::NeverResolves,
+                    );
+                }
                 WFCommandVariant::UpdateResponse(ur) => {
                     let m_key = self.get_machine_by_msg(&ur.protocol_instance_id)?;
                     let m = if let Machines::UpdateMachine(m) = self.machine_mut(m_key) {
@@ -2065,4 +2115,19 @@ fn decode_wake_signal(
         return None;
     }
     Some(wake)
+}
+
+/// Adds a scheduled event's notifications to the ones already read for this task.
+///
+/// Uses the server's own fold rule, one per channel with the highest counter kept, so a channel
+/// seen on two scheduled events of one task reaches lang once. Channels keep the order they were
+/// first seen in, which History fixes, so a replay builds the same job.
+fn fold_notifications(pending: &mut Vec<Notification>, incoming: &[Notification]) {
+    for n in incoming {
+        match pending.iter_mut().find(|p| p.channel == n.channel) {
+            Some(p) if n.counter > p.counter => *p = n.clone(),
+            Some(_) => {}
+            None => pending.push(n.clone()),
+        }
+    }
 }

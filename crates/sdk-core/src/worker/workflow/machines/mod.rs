@@ -16,6 +16,7 @@ mod modify_workflow_properties_state_machine;
 mod nexus_operation_state_machine;
 mod patch_state_machine;
 mod signal_external_state_machine;
+mod subscribe_notification_channel_state_machine;
 mod timer_state_machine;
 mod update_state_machine;
 mod upsert_search_attributes_state_machine;
@@ -48,6 +49,7 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt::{Debug, Display},
 };
+use subscribe_notification_channel_state_machine::SubscribeNotificationChannelMachine;
 use temporalio_common::{
     fsm_trait::{StateMachine, TransitionResult},
     protos::temporal::api::{
@@ -85,6 +87,7 @@ enum Machines {
     ModifyWorkflowPropertiesMachine,
     UpdateMachine,
     NexusOperationMachine,
+    SubscribeNotificationChannelMachine,
 }
 
 /// Extends [rustfsm::StateMachine] with some functionality specific to the temporal SDK.

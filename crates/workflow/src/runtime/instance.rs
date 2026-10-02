@@ -1119,6 +1119,9 @@ where
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
+                // This runtime has no way to subscribe to a channel. A notification carries no
+                // data, only a hint to go read a source, so dropping one loses nothing.
+                Some(ActivationVariant::NotificationsReceived(_)) => ActivationJobResult::None,
                 // External Workflow Streams are a Python-SDK feature; this runtime never asks
                 // Core to retain a Workflow Task for a stream wait, so it can only ever see one
                 // of these by mistake. Failing loudly beats a wildcard that would silently drop
