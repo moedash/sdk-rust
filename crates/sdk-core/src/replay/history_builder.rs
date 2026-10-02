@@ -137,6 +137,21 @@ impl TestHistoryBuilder {
         self.add(attrs)
     }
 
+    /// Add the event an unsubscribe-notification-channel command produces. A zero
+    /// `subscribed_event_id` is what the server records when the run held no subscription.
+    pub fn add_notification_channel_unsubscribed(
+        &mut self,
+        channel: &str,
+        subscribed_event_id: i64,
+    ) -> i64 {
+        let attrs = WorkflowNotificationChannelUnsubscribedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            channel: channel.to_string(),
+            subscribed_event_id,
+        };
+        self.add(attrs)
+    }
+
     /// Add a workflow task started event.
     pub fn add_workflow_task_started(&mut self) {
         self.final_workflow_task_started_event_id = self.add(WorkflowTaskStartedEventAttributes {

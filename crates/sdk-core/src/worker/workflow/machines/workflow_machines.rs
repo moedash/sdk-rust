@@ -14,6 +14,7 @@ use super::{
     subscribe_notification_channel_state_machine::subscribe_notification_channel,
     subscribe_stream_state_machine::subscribe_stream,
     timer_state_machine::new_timer,
+    unsubscribe_notification_channel_state_machine::unsubscribe_notification_channel,
     upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
@@ -72,7 +73,10 @@ use temporalio_common::{
                 self, NotificationsReceived, NotifyHasPatch, ReplayExternalStreams,
                 UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
-            workflow_commands::{ContinueAsNewWorkflowExecution, ExternalStreamWait},
+            workflow_commands::{
+                ContinueAsNewWorkflowExecution, ExternalStreamWait, SubscribeNotificationChannel,
+                UnsubscribeNotificationChannel,
+            },
         },
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
@@ -608,6 +612,35 @@ impl WorkflowMachines {
         // Core generates this command *after* lang's own iteration has already prepared its
         // commands, so it has to prepare its own. Without this the marker sits in the current
         // task's queue and never reaches the server -- silently, since nothing else looks there.
+        self.prepare_commands()
+    }
+
+    /// Subscribes the run to a notification channel on Core's own initiative.
+    ///
+    /// The same machine the lang-issued command gets, so the recorded event is matched the same
+    /// way on replay. Unlike the marker this is issued while replaying too: the event is matched
+    /// against a command in the queue rather than claimed by a lookahead, and the replayed
+    /// completion reports the same channel set the live one did.
+    pub(crate) fn emit_notification_channel_subscription(&mut self, channel: String) -> Result<()> {
+        self.add_cmd_to_wf_task(
+            subscribe_notification_channel(SubscribeNotificationChannel { channel }),
+            Default::default(),
+            CommandIdKind::CoreInternal,
+        );
+        self.prepare_commands()
+    }
+
+    /// Ends the run's subscription to a notification channel on Core's own initiative, the way
+    /// [`Self::emit_notification_channel_subscription`] begins one.
+    pub(crate) fn emit_notification_channel_unsubscription(
+        &mut self,
+        channel: String,
+    ) -> Result<()> {
+        self.add_cmd_to_wf_task(
+            unsubscribe_notification_channel(UnsubscribeNotificationChannel { channel }),
+            Default::default(),
+            CommandIdKind::CoreInternal,
+        );
         self.prepare_commands()
     }
 
@@ -1970,6 +2003,13 @@ impl WorkflowMachines {
                         CommandIdKind::NeverResolves,
                     );
                 }
+                WFCommandVariant::UnsubscribeNotificationChannel(attrs) => {
+                    self.add_cmd_to_wf_task(
+                        unsubscribe_notification_channel(attrs),
+                        annotations,
+                        CommandIdKind::NeverResolves,
+                    );
+                }
                 WFCommandVariant::UpdateResponse(ur) => {
                     let m_key = self.get_machine_by_msg(&ur.protocol_instance_id)?;
                     let m = if let Machines::UpdateMachine(m) = self.machine_mut(m_key) {
@@ -2011,8 +2051,9 @@ impl WorkflowMachines {
                 | WFCommandVariant::ExternalStreamParkResult(_)
                 | WFCommandVariant::ExternalStreamFinalized(_)
                 | WFCommandVariant::ExternalOutputStreamCommit(_)
-                | WFCommandVariant::ExternalOutputStreamBuffered(_)) => {
-                    // Named, because this is the only diagnostic for a wait-set bug and six
+                | WFCommandVariant::ExternalOutputStreamBuffered(_)
+                | WFCommandVariant::ExternalStreamChannels(_)) => {
+                    // Named, because this is the only diagnostic for a wait-set bug and seven
                     // commands share the branch.
                     return Err(fatal!(
                         "External stream command {leaked} reached the state machines; it should \

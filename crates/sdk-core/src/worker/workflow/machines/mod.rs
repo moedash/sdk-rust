@@ -20,6 +20,7 @@ mod signal_external_state_machine;
 mod subscribe_notification_channel_state_machine;
 mod subscribe_stream_state_machine;
 mod timer_state_machine;
+mod unsubscribe_notification_channel_state_machine;
 mod update_state_machine;
 mod upsert_search_attributes_state_machine;
 mod workflow_task_state_machine;
@@ -63,6 +64,7 @@ use temporalio_common::{
 };
 use temporalio_macros::fsm;
 use timer_state_machine::TimerMachine;
+use unsubscribe_notification_channel_state_machine::UnsubscribeNotificationChannelMachine;
 use update_state_machine::UpdateMachine;
 use upsert_search_attributes_state_machine::UpsertSearchAttributesMachine;
 use workflow_machines::MachineResponse;
@@ -94,6 +96,7 @@ enum Machines {
     UpdateMachine,
     NexusOperationMachine,
     SubscribeNotificationChannelMachine,
+    UnsubscribeNotificationChannelMachine,
 }
 
 /// Extends [rustfsm::StateMachine] with some functionality specific to the temporal SDK.
