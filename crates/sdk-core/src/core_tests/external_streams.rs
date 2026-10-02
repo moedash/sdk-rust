@@ -3414,6 +3414,7 @@ fn channel_notification(channel: &str, counter: i64) -> Notification {
         position: format!("{counter}-0").into_bytes(),
         counter,
         metadata: HashMap::new(),
+        ..Default::default()
     }
 }
 
