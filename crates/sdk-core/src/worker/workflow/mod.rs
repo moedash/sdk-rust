@@ -1644,6 +1644,12 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            // This layer has no machine for the unsubscribe. Dropping the command
+            // would let the workflow go on as if unsubscribed while the server
+            // keeps delivering.
+            workflow_command::Variant::UnsubscribeNotificationChannel(_) => {
+                return Err(EmptyWorkflowCommandErr);
+            }
         };
         Ok(Self {
             variant,

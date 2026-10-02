@@ -61,6 +61,7 @@ message WorkflowCommand {
         SubscribeStream subscribe_stream = 29;
         AppendStreamRecords append_stream_records = 30;
         SubscribeNotificationChannel subscribe_notification_channel = 31;
+        UnsubscribeNotificationChannel unsubscribe_notification_channel = 32;
     }
 }
 
@@ -109,6 +110,16 @@ message SubscribeStream {
 // The notifications live in History rather than arriving by a side channel, so
 // a replay reads the same ones the live run saw.
 message SubscribeNotificationChannel {
+    // Name of the channel, scoped to the namespace.
+    string channel = 1;
+}
+
+// End this workflow's subscription to a notification channel. Notifications
+// already recorded on a scheduled event still reach that Workflow Task.
+//
+// The server records an event for every unsubscribe, also one naming a channel
+// the run is not subscribed to, so replay can hold each command to its event.
+message UnsubscribeNotificationChannel {
     // Name of the channel, scoped to the namespace.
     string channel = 1;
 }
