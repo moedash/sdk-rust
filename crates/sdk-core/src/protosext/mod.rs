@@ -40,7 +40,6 @@ use temporalio_common::protos::{
         query::v1::WorkflowQuery,
         sdk::v1::{EventGroupMarker, UserMetadata},
         stream::v1::StreamSlice,
-        workflow::v1::Wake,
         workflowservice::v1::PollWorkflowTaskQueueResponse,
     },
     utilities::TryIntoOrNone,
@@ -70,9 +69,6 @@ pub(crate) struct ValidPollWFTQResponse {
     /// completed-event id is re-supplying what an earlier task consumed; an
     /// untagged one belongs to the task about to run.
     pub(crate) stream_slices: Vec<StreamSlice>,
-    /// Wakes pending for the execution when this task started. Live only: the server never
-    /// supplies them on replay and never records them in History.
-    pub(crate) wakes: Vec<Wake>,
 
     /// Zero-size field to prevent explicit construction
     _cant_construct_me: (),
@@ -84,8 +80,7 @@ impl Debug for ValidPollWFTQResponse {
             f,
             "ValidWFT {{ task_token: {}, task_queue: {}, workflow_execution: {:?}, \
              workflow_type: {}, attempt: {}, previous_started_event_id: {}, started_event_id {}, \
-             history_length: {}, first_evt_in_hist_id: {:?}, legacy_query: {:?}, queries: {:?}, \
-             wakes: {:?} }}",
+             history_length: {}, first_evt_in_hist_id: {:?}, legacy_query: {:?}, queries: {:?} }}",
             self.task_token,
             self.task_queue,
             self.workflow_execution,
@@ -96,8 +91,7 @@ impl Debug for ValidPollWFTQResponse {
             self.history.events.len(),
             self.history.events.first().map(|e| e.event_id),
             self.legacy_query,
-            self.query_requests,
-            self.wakes
+            self.query_requests
         )
     }
 }
@@ -121,7 +115,6 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                 queries,
                 messages,
                 stream_slices,
-                wakes,
                 ..
             } => {
                 if task_token.is_empty() {
@@ -147,7 +140,6 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                     query_requests,
                     messages,
                     stream_slices,
-                    wakes,
                     _cant_construct_me: (),
                 })
             }
