@@ -98,6 +98,9 @@ enum WorkflowTaskFailedCause {
     // History can no longer be served, for example after truncation or because it exceeds the
     // replay bound. Check the workflow task failure message for more information.
     WORKFLOW_TASK_FAILED_CAUSE_STREAM_RANGE_UNAVAILABLE = 43;
+    // A SubscribeNotificationChannel command named an empty or too-long channel, or hit a
+    // subscription or listener limit.
+    WORKFLOW_TASK_FAILED_CAUSE_BAD_SUBSCRIBE_NOTIFICATION_CHANNEL_ATTRIBUTES = 44;
 }
 
 enum StartChildWorkflowExecutionFailedCause {
