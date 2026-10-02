@@ -62,7 +62,32 @@ message WorkflowCommand {
         WorkflowOutputStreamCommit workflow_output_stream_commit = 27;
         WorkflowOutputStreamBuffered workflow_output_stream_buffered = 28;
         SubscribeNotificationChannel subscribe_notification_channel = 31;
+        UnsubscribeNotificationChannel unsubscribe_notification_channel = 32;
+        WorkflowStreamChannels workflow_stream_channels = 33;
     }
+}
+
+// End this workflow's subscription to a notification channel. Notifications
+// already recorded on a scheduled event still reach that Workflow Task.
+//
+// The server records the event whether or not the run held a subscription, so
+// every command has an event to match on replay.
+message UnsubscribeNotificationChannel {
+    // Name of the channel, scoped to the namespace.
+    string channel = 1;
+}
+
+// The complete set of notification channels the run listens on, one per open external stream
+// reader, in a stable order replay reproduces.
+//
+// Core subscribes the run to a channel it has not yet subscribed on the completion that ends the
+// Workflow Task, after the progress marker and never on a run-ending completion. Issued from the
+// activation that opened the reader, the server-bound subscribe command would end a task that
+// was meant to stay retained. Reported on every completion once a reader has been opened, the
+// empty set included: an absent command leaves Core's view unchanged, which is what the park and
+// finalization answers rely on. Carries no retention request of its own.
+message WorkflowStreamChannels {
+    repeated string channels = 1;
 }
 
 // Subscribe this workflow to a notification channel, so the scheduled event of
