@@ -987,6 +987,18 @@ message WorkflowNotificationChannelSubscribedEventAttributes {
     string channel = 2;
 }
 
+message WorkflowNotificationChannelUnsubscribedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command ended this
+    // subscription.
+    int64 workflow_task_completed_event_id = 1;
+    // The channel the Workflow stopped listening on.
+    string channel = 2;
+    // The WorkflowNotificationChannelSubscribed event that recorded the
+    // subscription this command ended. Zero when the run held no subscription
+    // for the channel.
+    int64 subscribed_event_id = 3;
+}
+
 message WorkflowStreamRecordsAppendedEventAttributes {
     // The WorkflowTaskCompleted event of the task whose command appended this
     // batch.
@@ -1328,6 +1340,8 @@ message HistoryEvent {
         WorkflowStreamRecordsAppendedEventAttributes workflow_stream_records_appended_event_attributes = 67;
         WorkflowNotificationChannelSubscribedEventAttributes
             workflow_notification_channel_subscribed_event_attributes = 68;
+        WorkflowNotificationChannelUnsubscribedEventAttributes
+            workflow_notification_channel_unsubscribed_event_attributes = 69;
     }
 }
 
