@@ -890,6 +890,10 @@ message NotifyChannelRequest {
     string identity = 3;
     // Used to de-dupe a retried notification.
     string request_id = 4;
+    // When set, the call addresses the channel linked to this workflow; `run_id`
+    // is optional and resolves to the chain's current run, as a Signal does.
+    // When unset, the call addresses the independent channel of that name.
+    temporal.api.common.v1.WorkflowExecution workflow_execution = 5;
 }
 
 message NotifyChannelResponse {
@@ -907,6 +911,10 @@ message RegisterChannelListenerRequest {
     string request_id = 4;
     // The identity of the caller, for metrics and logs.
     string identity = 5;
+    // When set, the call addresses the channel linked to this workflow; `run_id`
+    // is optional and resolves to the chain's current run, as a Signal does.
+    // When unset, the call addresses the independent channel of that name.
+    temporal.api.common.v1.WorkflowExecution workflow_execution = 6;
 }
 
 message RegisterChannelListenerResponse {
@@ -919,6 +927,10 @@ message UnregisterChannelListenerRequest {
     string listener_id = 3;
     // The identity of the caller, for metrics and logs.
     string identity = 4;
+    // When set, the call addresses the channel linked to this workflow; `run_id`
+    // is optional and resolves to the chain's current run, as a Signal does.
+    // When unset, the call addresses the independent channel of that name.
+    temporal.api.common.v1.WorkflowExecution workflow_execution = 5;
 }
 
 message UnregisterChannelListenerResponse {
@@ -937,6 +949,10 @@ message PollChannelRequest {
     // At most this many notifications are returned. Zero means the server's
     // default.
     int32 max_notifications = 5;
+    // When set, the call addresses the channel linked to this workflow; `run_id`
+    // is optional and resolves to the chain's current run, as a Signal does.
+    // When unset, the call addresses the independent channel of that name.
+    temporal.api.common.v1.WorkflowExecution workflow_execution = 6;
 }
 
 message PollChannelResponse {
@@ -946,6 +962,10 @@ message PollChannelResponse {
 message DescribeChannelRequest {
     string namespace = 1;
     string channel = 2;
+    // When set, the call addresses the channel linked to this workflow; `run_id`
+    // is optional and resolves to the chain's current run, as a Signal does.
+    // When unset, the call addresses the independent channel of that name.
+    temporal.api.common.v1.WorkflowExecution workflow_execution = 3;
 }
 
 message DescribeChannelResponse {
@@ -954,6 +974,12 @@ message DescribeChannelResponse {
     temporal.api.notification.v1.Notification latest = 2;
     // How many notifications the channel retains for pollers.
     int32 retained_count = 3;
+    temporal.api.notification.v1.ChannelKind kind = 4;
+    // The owner of a linked channel and the run that holds it. Empty for an
+    // independent channel.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" names the owner the channel is linked to. --)
+    temporal.api.common.v1.WorkflowExecution linked_to = 5;
 }
 
 message SignalWithStartWorkflowExecutionRequest {
