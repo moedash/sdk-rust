@@ -1855,6 +1855,9 @@ pub mod temporal {
                             Attributes::AppendStreamRecordsCommandAttributes(_) => {
                                 CommandType::AppendStreamRecords
                             }
+                            Attributes::SubscribeNotificationChannelCommandAttributes(_) => {
+                                CommandType::SubscribeNotificationChannel
+                            }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
                             }
@@ -2392,6 +2395,7 @@ pub mod temporal {
                                 | EventType::WorkflowPropertiesModified
                                 | EventType::WorkflowStreamSubscribed
                                 | EventType::WorkflowStreamRecordsAppended
+                                | EventType::WorkflowNotificationChannelSubscribed
                                 | EventType::NexusOperationScheduled
                                 | EventType::NexusOperationCancelRequested
                                 | EventType::WorkflowExecutionCanceled
@@ -2495,6 +2499,9 @@ pub mod temporal {
                                     Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => {
                                         false
                                     }
+                                    Attributes::WorkflowNotificationChannelSubscribedEventAttributes(_) => {
+                                        false
+                                    }
                                     Attributes::WorkflowExecutionStartedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionCompletedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionFailedEventAttributes(_) => false,
@@ -2584,6 +2591,7 @@ pub mod temporal {
                             match self {
                             Attributes::WorkflowStreamSubscribedEventAttributes(_) => { EventType::WorkflowStreamSubscribed }
                             Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => { EventType::WorkflowStreamRecordsAppended }
+                            Attributes::WorkflowNotificationChannelSubscribedEventAttributes(_) => { EventType::WorkflowNotificationChannelSubscribed }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
                             Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
                             Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }
@@ -2653,6 +2661,11 @@ pub mod temporal {
         pub mod namespace {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.namespace.v1");
+            }
+        }
+        pub mod notification {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.notification.v1");
             }
         }
         pub mod operatorservice {

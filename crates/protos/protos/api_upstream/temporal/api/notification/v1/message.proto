@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package temporal.api.notification.v1;
+
+option go_package = "go.temporal.io/api/notification/v1;notification";
+option java_package = "io.temporal.api.notification.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::Notification::V1";
+option csharp_namespace = "Temporalio.Api.Notification.V1";
+
+import "google/protobuf/timestamp.proto";
+
+import "temporal/api/common/v1/message.proto";
+
+// A notification tells the listeners of a channel that a source they consume
+// has moved. It is not data: the listener reads the source itself. A channel
+// is named by the writer and its listeners; for a stream, the provider formats
+// the stream's identity into the name. Writers never learn who listens. The
+// server folds notifications per listener while one is pending and no task has
+// been scheduled for it, keeping the one with the highest counter.
+message Notification {
+    // The channel the writer notified. Listeners register on the same name.
+    string channel = 1;
+    // Where the source stands after the write that caused this notification,
+    // in the writer's terms. Opaque to the server.
+    bytes position = 2;
+    // Orders notifications from one channel's writers. The writer derives it
+    // from the position, since only the source can order its positions. Among
+    // notifications folded together, the one with the highest counter is kept.
+    int64 counter = 3;
+    // Details for the listener, such as which topic moved. Bounded in size and
+    // carried as payloads, so a codec applies as to any payload.
+    map<string, temporal.api.common.v1.Payload> metadata = 4;
+}
+
+// A listener of a channel: a Workflow Execution woken with a Workflow Task, or
+// a callback the server invokes with each notification.
+message ChannelListener {
+    // Assigned by the server when the listener registers.
+    string listener_id = 1;
+    oneof listener {
+        WorkflowListener workflow = 2;
+        temporal.api.common.v1.Callback callback = 3;
+    }
+    google.protobuf.Timestamp registered_time = 4;
+}
+
+// A Workflow Execution listening on a channel.
+message WorkflowListener {
+    string workflow_id = 1;
+    // The run that subscribed. The server follows a continue-as-new to the
+    // chain's current run when it delivers.
+    string run_id = 2;
+}

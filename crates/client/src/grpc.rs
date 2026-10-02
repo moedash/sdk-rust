@@ -965,6 +965,51 @@ proxier! {
         }
     );
     (
+        notify_channel,
+        NotifyChannelRequest,
+        NotifyChannelResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        register_channel_listener,
+        RegisterChannelListenerRequest,
+        RegisterChannelListenerResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        unregister_channel_listener,
+        UnregisterChannelListenerRequest,
+        UnregisterChannelListenerResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        poll_channel,
+        PollChannelRequest,
+        PollChannelResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        describe_channel,
+        DescribeChannelRequest,
+        DescribeChannelResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
         signal_with_start_workflow_execution,
         SignalWithStartWorkflowExecutionRequest,
         SignalWithStartWorkflowExecutionResponse,

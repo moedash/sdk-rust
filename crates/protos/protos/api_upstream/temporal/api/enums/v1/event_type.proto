@@ -183,4 +183,7 @@ enum EventType {
     // batch, and carrying only the offset range it landed at: the bodies go to
     // the stream's own log, never into History.
     EVENT_TYPE_WORKFLOW_STREAM_RECORDS_APPENDED = 62;
+    // A Workflow became a listener of a notification channel for its run.
+    // The notifications themselves ride the WorkflowTaskScheduled event.
+    EVENT_TYPE_WORKFLOW_NOTIFICATION_CHANNEL_SUBSCRIBED = 63;
 }
