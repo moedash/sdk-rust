@@ -345,6 +345,12 @@ impl WorkflowFuture {
                         slice.stream_id
                     );
                 }
+                Variant::NotificationsReceived(_) => {
+                    // No channel API in this SDK, so nothing here could have
+                    // subscribed. Bailing rather than ignoring keeps a run that
+                    // depends on them from going on as if none arrived.
+                    bail!("received channel notifications, which this SDK cannot deliver");
+                }
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
                 }

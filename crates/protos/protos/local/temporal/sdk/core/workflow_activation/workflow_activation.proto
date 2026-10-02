@@ -16,6 +16,7 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/stream/v1/message.proto";
 import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
+import "temporal/api/notification/v1/message.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/common/common.proto";
@@ -147,6 +148,8 @@ message WorkflowActivationJob {
         //
         // A range of a stream the workflow subscribed to.
         DeliverStreamRecords deliver_stream_records = 21;
+        // Notifications from the channels the workflow subscribed to.
+        NotificationsReceived notifications_received = 22;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -171,6 +174,15 @@ message DeliverStreamRecords {
     // Exclusive. Equal to from_offset when the subscription saw nothing.
     int64 to_offset = 3;
     repeated temporal.api.stream.v1.StreamRecord records = 4;
+}
+
+// Hand a workflow the notifications the server folded for its channels.
+//
+// They come from the scheduled event of the Workflow Task this activation
+// belongs to. History is the record, so a replay yields the same job with the
+// same notifications at the same point.
+message NotificationsReceived {
+    repeated temporal.api.notification.v1.Notification notifications = 1;
 }
 
 // Initialize a new workflow

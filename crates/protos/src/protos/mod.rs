@@ -1284,6 +1284,9 @@ pub mod coresdk {
                                 d.stream_id, d.from_offset, d.to_offset
                             )
                         }
+                        workflow_activation_job::Variant::NotificationsReceived(n) => {
+                            write!(f, "NotificationsReceived({})", n.notifications.len())
+                        }
                     }
                 }
             }
@@ -1483,6 +1486,12 @@ pub mod coresdk {
             use super::*;
             use crate::protos::temporal::api::{common::v1::Payloads, enums::v1::QueryResultType};
             use std::fmt::{Display, Formatter};
+
+            impl Display for SubscribeNotificationChannel {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "SubscribeNotificationChannel({})", self.channel)
+                }
+            }
 
             impl Display for WorkflowCommand {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {

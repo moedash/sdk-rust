@@ -1339,7 +1339,8 @@ message HistoryEvent {
         WorkflowExecutionTimeSkippingTransitionedEventAttributes workflow_execution_time_skipping_transitioned_event_attributes = 65;
         WorkflowStreamSubscribedEventAttributes workflow_stream_subscribed_event_attributes = 66;
         WorkflowStreamRecordsAppendedEventAttributes workflow_stream_records_appended_event_attributes = 67;
-        WorkflowNotificationChannelSubscribedEventAttributes workflow_notification_channel_subscribed_event_attributes = 68;
+        WorkflowNotificationChannelSubscribedEventAttributes
+            workflow_notification_channel_subscribed_event_attributes = 68;
     }
 }
 
