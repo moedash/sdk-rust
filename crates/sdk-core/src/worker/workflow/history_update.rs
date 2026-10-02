@@ -715,6 +715,16 @@ impl NextWFTSeqEndIndex {
     }
 }
 
+/// A task scheduled with notifications was handed them as an activation of its own, so it
+/// cannot be folded into the heartbeat chain before it the way an empty task is.
+fn scheduled_with_notifications(e: &HistoryEvent) -> bool {
+    matches!(
+        e.attributes,
+        Some(Attributes::WorkflowTaskScheduledEventAttributes(ref attrs))
+            if !attrs.notifications.is_empty()
+    )
+}
+
 /// Discovers the index of the last event in next WFT sequence within the passed-in slice
 /// For more on workflow task chunking, see arch_docs/workflow_task_chunking.md
 fn find_end_index_of_next_wft_seq(
@@ -786,6 +796,7 @@ fn find_end_index_of_next_wft_seq(
                         if !saw_command
                             && !completion_consumed_a_range
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
+                            && !scheduled_with_notifications(next_next_event)
                         {
                             // If we've never seen an interesting event and the next two events are
                             // a completion followed immediately again by scheduled, then this is a

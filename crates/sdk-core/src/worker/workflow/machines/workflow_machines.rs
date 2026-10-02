@@ -1184,10 +1184,23 @@ impl WorkflowMachines {
                 }
             }
             Ok(EventType::WorkflowTaskScheduled) => {
+                // The notifications ride on the event itself, so the same job
+                // comes out of it live and on replay with nothing to re-supply.
+                let notifications = match &event_dat.event.attributes {
+                    Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) => {
+                        a.notifications.clone()
+                    }
+                    _ => vec![],
+                };
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
                 self.submachine_handle_event(key, event_dat)?;
                 self.machines_by_event_id.insert(event_id, key);
+                if !notifications.is_empty() {
+                    self.drive_me.send_job(
+                        workflow_activation::NotificationsReceived { notifications }.into(),
+                    );
+                }
             }
             Ok(EventType::WorkflowExecutionSignaled) => {
                 if let Some(history_event::Attributes::WorkflowExecutionSignaledEventAttributes(

@@ -23,6 +23,7 @@ use temporalio_common::protos::{
         enums::v1::{EventType, TaskQueueKind, WorkflowTaskFailedCause},
         failure::v1::{CanceledFailureInfo, Failure, failure},
         history::v1::{history_event::Attributes, *},
+        notification::v1::Notification,
         stream::v1::StreamRange,
         taskqueue::v1::TaskQueue,
         update,
@@ -110,6 +111,18 @@ impl TestHistoryBuilder {
     /// Add a workflow task scheduled event.
     pub fn add_workflow_task_scheduled(&mut self) {
         self.workflow_task_scheduled_event_id = self.add_by_type(EventType::WorkflowTaskScheduled);
+    }
+
+    /// Add a workflow task scheduled event carrying the notifications the server
+    /// folded for the task.
+    pub fn add_workflow_task_scheduled_with_notifications(
+        &mut self,
+        notifications: Vec<Notification>,
+    ) {
+        self.workflow_task_scheduled_event_id = self.add(WorkflowTaskScheduledEventAttributes {
+            notifications,
+            ..Default::default()
+        });
     }
 
     /// Add a workflow task started event.
