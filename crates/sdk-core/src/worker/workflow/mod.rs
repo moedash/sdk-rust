@@ -1352,7 +1352,7 @@ fn validate_completion(
                 .collect::<Result<Vec<_>, EmptyWorkflowCommandErr>>()
                 .map_err(|_| CompleteWfError::MalformedWorkflowCompletion {
                     reason: "At least one workflow command in the completion contained \
-                             an empty variant"
+                             an empty or unsupported variant"
                         .to_owned(),
                     run_id: completion.run_id.clone(),
                 })?;
@@ -1434,7 +1434,7 @@ impl LocalResolution {
 }
 
 #[derive(thiserror::Error, Debug, derive_more::From)]
-#[error("Lang provided workflow command with empty variant")]
+#[error("Lang provided workflow command with an empty or unsupported variant")]
 struct EmptyWorkflowCommandErr;
 
 /// [DrivenWorkflow]s respond with these when called, to indicate what they want to do next.
@@ -1587,6 +1587,11 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
+            }
+            // This layer carries the protos only. Dropping the command would let the
+            // workflow go on as if subscribed while the server never heard of it.
+            workflow_command::Variant::SubscribeNotificationChannel(_) => {
+                return Err(EmptyWorkflowCommandErr);
             }
         };
         Ok(Self {
