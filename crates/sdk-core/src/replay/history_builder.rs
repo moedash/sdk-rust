@@ -139,6 +139,15 @@ impl TestHistoryBuilder {
         self.add(attrs)
     }
 
+    /// Add the event a subscribe-notification-channel command produces.
+    pub fn add_notification_channel_subscribed(&mut self, channel: &str) -> i64 {
+        let attrs = WorkflowNotificationChannelSubscribedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            channel: channel.to_string(),
+        };
+        self.add(attrs)
+    }
+
     /// Add the event an append-stream-records command produces. The range is
     /// half-open, as it is on the event.
     pub fn add_stream_records_appended(

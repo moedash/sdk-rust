@@ -11,6 +11,7 @@ use super::{
     local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change,
     signal_external_state_machine::new_external_signal,
+    subscribe_notification_channel_state_machine::subscribe_notification_channel,
     subscribe_stream_state_machine::subscribe_stream,
     timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
@@ -1552,6 +1553,15 @@ impl WorkflowMachines {
                     // ranges arrive later as their own activation jobs.
                     self.add_cmd_to_wf_task(
                         subscribe_stream(attrs),
+                        annotations,
+                        CommandIdKind::NeverResolves,
+                    );
+                }
+                WFCommandVariant::SubscribeNotificationChannel(attrs) => {
+                    // Never resolves: the notifications arrive on the scheduled
+                    // event of later tasks, not as a reply to this command.
+                    self.add_cmd_to_wf_task(
+                        subscribe_notification_channel(attrs),
                         annotations,
                         CommandIdKind::NeverResolves,
                     );

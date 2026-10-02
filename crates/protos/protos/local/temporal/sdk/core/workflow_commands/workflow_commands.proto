@@ -60,6 +60,7 @@ message WorkflowCommand {
         // with that family and must not be reused.
         SubscribeStream subscribe_stream = 29;
         AppendStreamRecords append_stream_records = 30;
+        SubscribeNotificationChannel subscribe_notification_channel = 31;
     }
 }
 
@@ -100,6 +101,16 @@ message SubscribeStream {
     // last N records. The server resolves it and records the resulting offset,
     // so replay does not resolve it again and Core does not keep it.
     temporal.api.stream.v1.StreamStartPosition start_position = 3;
+}
+
+// Subscribe this workflow to a notification channel, so the scheduled event of
+// each later Workflow Task carries the notifications folded for it.
+//
+// The notifications live in History rather than arriving by a side channel, so
+// a replay reads the same ones the live run saw.
+message SubscribeNotificationChannel {
+    // Name of the channel, scoped to the namespace.
+    string channel = 1;
 }
 
 message StartTimer {

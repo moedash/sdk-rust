@@ -1575,6 +1575,7 @@ enum WFCommandVariant {
     RequestCancelNexusOperation(RequestCancelNexusOperation),
     SubscribeStream(SubscribeStream),
     AppendStreamRecords(AppendStreamRecords),
+    SubscribeNotificationChannel(SubscribeNotificationChannel),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1586,6 +1587,9 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::SubscribeStream(s) => WFCommandVariant::SubscribeStream(s),
             workflow_command::Variant::AppendStreamRecords(s) => {
                 WFCommandVariant::AppendStreamRecords(s)
+            }
+            workflow_command::Variant::SubscribeNotificationChannel(s) => {
+                WFCommandVariant::SubscribeNotificationChannel(s)
             }
             workflow_command::Variant::CancelTimer(s) => WFCommandVariant::CancelTimer(s),
             workflow_command::Variant::ScheduleActivity(s) => WFCommandVariant::AddActivity(s),
