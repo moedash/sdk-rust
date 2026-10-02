@@ -496,6 +496,14 @@ service WorkflowService {
                 post: "/api/v1/namespaces/{namespace}/channels/{notification.channel}/notify"
                 body: "*"
             }
+            additional_bindings {
+                post: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{notification.channel}/notify"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{notification.channel}/notify"
+                body: "*"
+            }
         };
     }
 
@@ -509,6 +517,14 @@ service WorkflowService {
             body: "*"
             additional_bindings {
                 post: "/api/v1/namespaces/{namespace}/channels/{channel}/listeners"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/listeners"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/listeners"
                 body: "*"
             }
         };
@@ -525,6 +541,12 @@ service WorkflowService {
             additional_bindings {
                 delete: "/api/v1/namespaces/{namespace}/channels/{channel}/listeners/{listener_id}"
             }
+            additional_bindings {
+                delete: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/listeners/{listener_id}"
+            }
+            additional_bindings {
+                delete: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/listeners/{listener_id}"
+            }
         };
     }
 
@@ -537,6 +559,12 @@ service WorkflowService {
             additional_bindings {
                 get: "/api/v1/namespaces/{namespace}/channels/{channel}/notifications"
             }
+            additional_bindings {
+                get: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/notifications"
+            }
+            additional_bindings {
+                get: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/notifications"
+            }
         };
     }
 
@@ -547,6 +575,12 @@ service WorkflowService {
             get: "/namespaces/{namespace}/channels/{channel}"
             additional_bindings {
                 get: "/api/v1/namespaces/{namespace}/channels/{channel}"
+            }
+            additional_bindings {
+                get: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}"
+            }
+            additional_bindings {
+                get: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}"
             }
         };
     }
