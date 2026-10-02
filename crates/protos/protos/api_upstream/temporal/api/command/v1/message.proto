@@ -329,6 +329,8 @@ message Command {
         SubscribeStreamCommandAttributes subscribe_stream_command_attributes = 21;
         SubscribeNotificationChannelCommandAttributes
             subscribe_notification_channel_command_attributes = 22;
+        UnsubscribeNotificationChannelCommandAttributes
+            unsubscribe_notification_channel_command_attributes = 23;
     }
 }
 
@@ -377,5 +379,14 @@ message SubscribeStreamCommandAttributes {
 // Task. The subscription ends with the run, and a successor subscribes again.
 message SubscribeNotificationChannelCommandAttributes {
     // The channel to listen on, as the writers name it.
+    string channel = 1;
+}
+
+// Ends the run's subscription to a notification channel. Notifications already
+// recorded on a scheduled event still reach that Workflow Task; later ones do
+// not. A command naming a channel the run is not subscribed to records its
+// event and changes nothing, so replay matches every command to an event.
+message UnsubscribeNotificationChannelCommandAttributes {
+    // The channel to stop listening on, as the writers name it.
     string channel = 1;
 }
