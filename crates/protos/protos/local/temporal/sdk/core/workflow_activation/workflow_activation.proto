@@ -156,8 +156,7 @@ message WorkflowActivationJob {
         // Runtime-internal: encode the terminal boundary for a marker Core is about to write.
         // Runs no user code.
         FinalizeExternalStreams finalize_external_streams = 20;
-        // Notifications for channels this run listens to, read from the Workflow Task's
-        // scheduled event.
+        // Notifications from the channels the workflow subscribed to.
         NotificationsReceived notifications_received = 22;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
@@ -166,10 +165,11 @@ message WorkflowActivationJob {
     }
 }
 
-// The notifications the server folded onto this Workflow Task's scheduled event, one per channel.
+// Hand a workflow the notifications the server folded for its channels.
 //
-// Read from History, so a replay hands lang the same job in the same activation. A notification
-// carries no data: lang reads the source the channel names.
+// They come from the scheduled event of the Workflow Task this activation
+// belongs to. History is the record, so a replay yields the same job with the
+// same notifications at the same point.
 message NotificationsReceived {
     repeated temporal.api.notification.v1.Notification notifications = 1;
 }

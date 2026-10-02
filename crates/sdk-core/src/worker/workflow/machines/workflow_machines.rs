@@ -98,9 +98,10 @@ pub(crate) struct WorkflowMachines {
     /// Reserved external stream wake Signals seen in history, decoded and suppressed from user
     /// dispatch, waiting to be classified against the run's wait set.
     pending_external_stream_wakes: Vec<external_stream::WakeSignal>,
-    /// Channel notifications read from the scheduled events of the task being applied, folded
-    /// per channel. A task that failed and was scheduled again carries more than one scheduled
-    /// event, and lang still gets one job for the activation.
+    /// Channel notifications read from the scheduled events of the task being applied, in History
+    /// order. The server clears what it put on a scheduled event, so a retry's event carries only
+    /// what arrived since. The failed task's notifications stay in History and are only ever
+    /// handed over here, together with the retry's, as one job.
     pending_notifications: Vec<Notification>,
     /// Set when notifications were handed to lang and the run's wait set has not seen them yet.
     pending_notification_wake: bool,
@@ -601,7 +602,7 @@ impl WorkflowMachines {
         std::mem::take(&mut self.pending_notification_wake)
     }
 
-    /// Hands lang the notifications folded from this task's scheduled events as one job.
+    /// Hands lang the notifications from this task's scheduled events as one job.
     ///
     /// Sent while the task's history is applied, so the job sits ahead of any external stream
     /// resolve Core queues for the same activation once the history is in.
@@ -1253,7 +1254,8 @@ impl WorkflowMachines {
                     ref attrs,
                 )) = event_dat.event.attributes
                 {
-                    fold_notifications(&mut self.pending_notifications, &attrs.notifications);
+                    self.pending_notifications
+                        .extend(attrs.notifications.iter().cloned());
                 }
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
@@ -2115,19 +2117,4 @@ fn decode_wake_signal(
         return None;
     }
     Some(wake)
-}
-
-/// Adds a scheduled event's notifications to the ones already read for this task.
-///
-/// Uses the server's own fold rule, one per channel with the highest counter kept, so a channel
-/// seen on two scheduled events of one task reaches lang once. Channels keep the order they were
-/// first seen in, which History fixes, so a replay builds the same job.
-fn fold_notifications(pending: &mut Vec<Notification>, incoming: &[Notification]) {
-    for n in incoming {
-        match pending.iter_mut().find(|p| p.channel == n.channel) {
-            Some(p) if n.counter > p.counter => *p = n.clone(),
-            Some(_) => {}
-            None => pending.push(n.clone()),
-        }
-    }
 }

@@ -65,11 +65,13 @@ message WorkflowCommand {
     }
 }
 
-// Makes this run a listener of a notification channel. Nothing resolves back to lang: the
-// notifications arrive later on the scheduled event of a Workflow Task, as a
-// `NotificationsReceived` job.
+// Subscribe this workflow to a notification channel, so the scheduled event of
+// each later Workflow Task carries the notifications folded for it.
+//
+// The notifications live in History rather than arriving by a side channel, so
+// a replay reads the same ones the live run saw.
 message SubscribeNotificationChannel {
-    // The channel to listen on, as the writers name it.
+    // Name of the channel, scoped to the namespace.
     string channel = 1;
 }
 
