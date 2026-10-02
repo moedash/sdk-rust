@@ -2036,12 +2036,12 @@ enum CommandIdKind {
 }
 
 /// Keep one notification per channel, in order of first appearance. A later one replaces
-/// the held one when its counter is at least as high, the same rule the server folds by,
-/// so a tie goes to the newer metadata.
+/// the held one only when its counter is strictly higher, so on a tie the held one stays,
+/// which is the rule the external lineage folds by.
 fn fold_notification(folded: &mut Vec<Notification>, n: Notification) {
     match folded.iter_mut().find(|held| held.channel == n.channel) {
         Some(held) => {
-            if n.counter >= held.counter {
+            if n.counter > held.counter {
                 *held = n;
             }
         }

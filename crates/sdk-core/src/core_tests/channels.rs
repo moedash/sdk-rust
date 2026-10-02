@@ -413,3 +413,26 @@ async fn a_lower_counter_does_not_replace_the_held_notification() {
         vec![vec![notification("a", 5), notification("b", 1)]]
     );
 }
+
+/// On a counter tie the notification already held for the channel stays.
+#[tokio::test]
+async fn a_counter_tie_keeps_the_held_notification() {
+    let held = Notification {
+        position: b"held".to_vec(),
+        ..notification("a", 4)
+    };
+    let tied = Notification {
+        position: b"tied".to_vec(),
+        ..notification("a", 4)
+    };
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_with_notifications(vec![held.clone()]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_timed_out();
+    t.add_workflow_task_scheduled_with_notifications(vec![tied]);
+    t.add_workflow_task_started();
+
+    let task = live_first_activation(t).await;
+    assert_eq!(received(&task), vec![vec![held]]);
+}
