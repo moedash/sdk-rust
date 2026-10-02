@@ -18,6 +18,7 @@ import "temporal/api/enums/v1/update.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/stream/v1/message.proto";
+import "temporal/api/notification/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
@@ -303,6 +304,10 @@ message WorkflowTaskScheduledEventAttributes {
     google.protobuf.Duration start_to_close_timeout = 2;
     // Starting at 1, how many attempts there have been to complete this task
     int32 attempt = 3;
+    // Notifications for channels this Workflow listens to, folded per channel
+    // since the last task was scheduled. In History so a Workflow may act on
+    // them deterministically and replay sees the same.
+    repeated temporal.api.notification.v1.Notification notifications = 4;
 }
 
 message WorkflowTaskStartedEventAttributes {
@@ -979,6 +984,14 @@ message WorkflowStreamSubscribedEventAttributes {
     int64 start_offset = 3;
 }
 
+message WorkflowNotificationChannelSubscribedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command created this
+    // subscription.
+    int64 workflow_task_completed_event_id = 1;
+    // The channel the Workflow listens on for the rest of this run.
+    string channel = 2;
+}
+
 message WorkflowStreamRecordsAppendedEventAttributes {
     // The WorkflowTaskCompleted event of the task whose command appended this
     // batch.
@@ -1324,6 +1337,7 @@ message HistoryEvent {
         WorkflowExecutionTimeSkippingTransitionedEventAttributes workflow_execution_time_skipping_transitioned_event_attributes = 65;
         WorkflowStreamSubscribedEventAttributes workflow_stream_subscribed_event_attributes = 66;
         WorkflowStreamRecordsAppendedEventAttributes workflow_stream_records_appended_event_attributes = 67;
+        WorkflowNotificationChannelSubscribedEventAttributes workflow_notification_channel_subscribed_event_attributes = 68;
     }
 }
 

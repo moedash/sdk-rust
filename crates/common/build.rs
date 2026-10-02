@@ -825,6 +825,9 @@ const NOT_VALIDATED_FIELDS: &[&str] = &[
     // is not a payload size the SDK can mirror.
     "temporal.api.stream.v1.StreamRecord.body",
     "temporal.api.stream.v1.StreamRecord.metadata",
+    // Notification metadata: the server bounds it with its own notification size limit, not
+    // the blob limit, so the SDK has nothing to mirror.
+    "temporal.api.notification.v1.Notification.metadata",
     // Dedicated, non-fetchable limits (not blob/memo, not in DescribeNamespace): UserMetadata
     // (nexus-start only); Nexus EndpointSpec.description (maxDescriptionSize; cloud variant cloud-only).
     "temporal.api.sdk.v1.UserMetadata.details",
