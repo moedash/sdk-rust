@@ -9,7 +9,9 @@ use super::{
     fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
     subscribe_notification_channel_state_machine::subscribe_notification_channel,
-    timer_state_machine::new_timer, upsert_search_attributes_state_machine::upsert_search_attrs,
+    timer_state_machine::new_timer,
+    unsubscribe_notification_channel_state_machine::unsubscribe_notification_channel,
+    upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
 };
@@ -69,6 +71,7 @@ use temporalio_common::{
             },
             workflow_commands::{
                 ContinueAsNewWorkflowExecution, ExternalStreamWait, SubscribeNotificationChannel,
+                UnsubscribeNotificationChannel,
             },
         },
         temporal::api::{
@@ -562,6 +565,20 @@ impl WorkflowMachines {
     pub(crate) fn emit_notification_channel_subscription(&mut self, channel: String) -> Result<()> {
         self.add_cmd_to_wf_task(
             subscribe_notification_channel(SubscribeNotificationChannel { channel }),
+            None,
+            CommandIdKind::CoreInternal,
+        );
+        self.prepare_commands()
+    }
+
+    /// Ends the run's subscription to a notification channel on Core's own initiative, the way
+    /// [`Self::emit_notification_channel_subscription`] begins one.
+    pub(crate) fn emit_notification_channel_unsubscription(
+        &mut self,
+        channel: String,
+    ) -> Result<()> {
+        self.add_cmd_to_wf_task(
+            unsubscribe_notification_channel(UnsubscribeNotificationChannel { channel }),
             None,
             CommandIdKind::CoreInternal,
         );
@@ -1777,6 +1794,13 @@ impl WorkflowMachines {
                     // nothing back. The notifications arrive later on a scheduled event.
                     self.add_cmd_to_wf_task(
                         subscribe_notification_channel(attrs),
+                        cmd.metadata,
+                        CommandIdKind::NeverResolves,
+                    );
+                }
+                WFCommandVariant::UnsubscribeNotificationChannel(attrs) => {
+                    self.add_cmd_to_wf_task(
+                        unsubscribe_notification_channel(attrs),
                         cmd.metadata,
                         CommandIdKind::NeverResolves,
                     );

@@ -1446,26 +1446,29 @@ impl ManagedRun {
         // that ends the task instead: a terminal here is exactly that completion, the park
         // confirmation and the finalization answer included, and a run-ending one subscribes to
         // nothing because the subscription would end with the run anyway. The marker is already
-        // queued, so the subscribed events follow it in History, and lang's own commands follow
-        // them.
+        // queued, so the channel events follow it in History, and lang's own commands follow
+        // them. A channel the run stopped listening on is unsubscribed first, so a run rotating
+        // channels frees the slot before the new subscription takes one.
         if let Some(terminal) = terminal
             && terminal != ParkReason::WorkflowCompleted
         {
-            let due = self
-                .waiting_on_local_work
-                .channel_subscriptions
-                .take_due_subscriptions();
-            for channel in due {
-                if let Err(source) = self
-                    .wfm
-                    .machines
-                    .emit_notification_channel_subscription(channel)
-                {
-                    return Err(RunUpdateErr {
-                        source,
-                        complete_resp_chan: completion.resp_chan,
-                    });
-                }
+            let subscriptions = &mut self.waiting_on_local_work.channel_subscriptions;
+            let leaving = subscriptions.take_due_unsubscriptions();
+            let joining = subscriptions.take_due_subscriptions();
+            let machines = &mut self.wfm.machines;
+            let issued = leaving
+                .into_iter()
+                .try_for_each(|channel| machines.emit_notification_channel_unsubscription(channel))
+                .and_then(|()| {
+                    joining.into_iter().try_for_each(|channel| {
+                        machines.emit_notification_channel_subscription(channel)
+                    })
+                });
+            if let Err(source) = issued {
+                return Err(RunUpdateErr {
+                    source,
+                    complete_resp_chan: completion.resp_chan,
+                });
             }
         }
 

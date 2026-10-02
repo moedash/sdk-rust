@@ -1731,6 +1731,7 @@ enum WFCommandVariant {
     /// The complete set of notification channels the run listens on. Never implies retention.
     ExternalStreamChannels(WorkflowStreamChannels),
     SubscribeNotificationChannel(SubscribeNotificationChannel),
+    UnsubscribeNotificationChannel(UnsubscribeNotificationChannel),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1815,6 +1816,9 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::SubscribeNotificationChannel(s) => {
                 WFCommandVariant::SubscribeNotificationChannel(s)
+            }
+            workflow_command::Variant::UnsubscribeNotificationChannel(u) => {
+                WFCommandVariant::UnsubscribeNotificationChannel(u)
             }
         };
         Ok(Self {

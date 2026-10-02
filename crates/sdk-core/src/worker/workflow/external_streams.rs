@@ -618,6 +618,16 @@ impl ChannelSubscriptions {
         self.subscribed.extend(due.iter().cloned());
         due
     }
+
+    /// The channels subscribed but no longer listened on, in subscription order, now counted as
+    /// unsubscribed. A channel listened on again later is due a new subscription.
+    pub(crate) fn take_due_unsubscriptions(&mut self) -> Vec<String> {
+        let (leaving, staying): (Vec<String>, Vec<String>) = std::mem::take(&mut self.subscribed)
+            .into_iter()
+            .partition(|channel| !self.listened.contains(channel));
+        self.subscribed = staying;
+        leaving
+    }
 }
 
 #[cfg(test)]
@@ -668,6 +678,51 @@ mod tests {
     fn nothing_reported_means_nothing_due() {
         let mut subscriptions = ChannelSubscriptions::default();
         assert_eq!(subscriptions.take_due_subscriptions(), Vec::<String>::new());
+        assert_eq!(
+            subscriptions.take_due_unsubscriptions(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_channel_that_left_the_set_is_due_an_unsubscription_once() {
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs", "control"]));
+        subscriptions.take_due_subscriptions();
+
+        subscriptions.report(names(&["control"]));
+        assert_eq!(subscriptions.take_due_unsubscriptions(), names(&["inputs"]));
+        assert_eq!(
+            subscriptions.take_due_unsubscriptions(),
+            Vec::<String>::new()
+        );
+        assert_eq!(subscriptions.take_due_subscriptions(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_channel_never_subscribed_is_not_unsubscribed_when_it_leaves() {
+        // Two reports inside one retained task again: the channel came and went before the task
+        // ended, so no subscribe went out and no unsubscribe is owed.
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs"]));
+        subscriptions.report(names(&[]));
+
+        assert_eq!(
+            subscriptions.take_due_unsubscriptions(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_channel_listened_on_again_is_due_a_new_subscription() {
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs"]));
+        subscriptions.take_due_subscriptions();
+        subscriptions.report(names(&[]));
+        subscriptions.take_due_unsubscriptions();
+
+        subscriptions.report(names(&["inputs"]));
+        assert_eq!(subscriptions.take_due_subscriptions(), names(&["inputs"]));
     }
 
     fn quiescent_set(wait_ids: &[u32]) -> ExternalWaitSet {

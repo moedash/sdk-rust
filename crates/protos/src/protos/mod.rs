@@ -1811,6 +1811,12 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for UnsubscribeNotificationChannel {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "UnsubscribeNotificationChannel({})", self.channel)
+                }
+            }
+
             impl Display for WorkflowStreamChannels {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(
@@ -2022,6 +2028,9 @@ pub mod temporal {
                             Attributes::SubscribeNotificationChannelCommandAttributes(_) => {
                                 CommandType::SubscribeNotificationChannel
                             }
+                            Attributes::UnsubscribeNotificationChannelCommandAttributes(_) => {
+                                CommandType::UnsubscribeNotificationChannel
+                            }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
                             }
@@ -2080,6 +2089,16 @@ pub mod temporal {
                             Self::SubscribeNotificationChannelCommandAttributes(
                                 SubscribeNotificationChannelCommandAttributes {
                                     channel: s.channel,
+                                },
+                            )
+                        }
+                    }
+
+                    impl From<workflow_commands::UnsubscribeNotificationChannel> for Attributes {
+                        fn from(u: workflow_commands::UnsubscribeNotificationChannel) -> Self {
+                            Self::UnsubscribeNotificationChannelCommandAttributes(
+                                UnsubscribeNotificationChannelCommandAttributes {
+                                    channel: u.channel,
                                 },
                             )
                         }
@@ -2547,6 +2566,7 @@ pub mod temporal {
                                 | EventType::WorkflowStreamSubscribed
                                 | EventType::WorkflowStreamRecordsAppended
                                 | EventType::WorkflowNotificationChannelSubscribed
+                                | EventType::WorkflowNotificationChannelUnsubscribed
                                 | EventType::NexusOperationScheduled
                                 | EventType::NexusOperationCancelRequested
                                 | EventType::WorkflowExecutionCanceled
@@ -2653,6 +2673,9 @@ pub mod temporal {
                                     Attributes::WorkflowNotificationChannelSubscribedEventAttributes(_) => {
                                         false
                                     }
+                                    Attributes::WorkflowNotificationChannelUnsubscribedEventAttributes(_) => {
+                                        false
+                                    }
                                     Attributes::WorkflowExecutionStartedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionCompletedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionFailedEventAttributes(_) => false,
@@ -2743,6 +2766,9 @@ pub mod temporal {
                             Attributes::WorkflowStreamSubscribedEventAttributes(_) => { EventType::WorkflowStreamSubscribed }
                             Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => { EventType::WorkflowStreamRecordsAppended }
                             Attributes::WorkflowNotificationChannelSubscribedEventAttributes(_) => { EventType::WorkflowNotificationChannelSubscribed }
+                            Attributes::WorkflowNotificationChannelUnsubscribedEventAttributes(_) => {
+                                EventType::WorkflowNotificationChannelUnsubscribed
+                            }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
                             Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
                             Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }
