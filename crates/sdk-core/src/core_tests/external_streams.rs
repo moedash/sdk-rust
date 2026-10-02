@@ -3714,14 +3714,14 @@ fn failed_then_retried_history(n1: Vec<Notification>, n2: Vec<Notification>) -> 
 async fn a_failed_task_hands_its_notifications_to_the_retry(#[case] cold: bool) {
     // The server clears a listener's pending notifications when it puts them on a scheduled
     // event, so a retry's event carries only what arrived after the failed attempt. The failed
-    // attempt's event stays in History, and its notifications reach lang on the retry, ahead of
-    // the retry's own and in one job.
-    let n1 = vec![
-        channel_notification("tokens", 41),
+    // attempt's event stays in History, and its notifications reach lang on the retry, folded
+    // with the retry's own into one job: one per channel, the highest counter kept.
+    let n1 = vec![channel_notification("tokens", 41)];
+    let n2 = vec![
+        channel_notification("tokens", 42),
         channel_notification("events", 3),
     ];
-    let n2 = vec![channel_notification("tokens", 42)];
-    let t = failed_then_retried_history(n1.clone(), n2.clone());
+    let t = failed_then_retried_history(n1, n2.clone());
     let batches = if cold {
         let resp = hist_to_poll_resp(&t, "fakeid".to_owned(), ResponseType::AllHistory);
         vec![ResponseType::Raw(resp.resp)]
@@ -3754,10 +3754,7 @@ async fn a_failed_task_hands_its_notifications_to_the_retry(#[case] cold: bool) 
 
     let retried = worker.poll_workflow_activation().await.unwrap();
     assert!(!retried.is_replaying, "got jobs {:?}", retried.jobs);
-    assert_eq!(
-        notification_jobs(&retried),
-        vec![n1.into_iter().chain(n2).collect::<Vec<_>>()]
-    );
+    assert_eq!(notification_jobs(&retried), vec![n2]);
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             retried.run_id,
