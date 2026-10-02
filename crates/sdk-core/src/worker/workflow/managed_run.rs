@@ -2163,12 +2163,13 @@ impl ManagedRun {
     /// only whether the Run resumes.
     fn apply_external_stream_wakes(&mut self) -> bool {
         let wakes = self.wfm.machines.take_external_stream_wakes();
+        let notified = self.wfm.machines.take_notification_wake();
         let poll_wakes = if self.wfm.machines.replaying {
             vec![]
         } else {
             mem::take(&mut self.pending_poll_wakes)
         };
-        if wakes.is_empty() && poll_wakes.is_empty() {
+        if wakes.is_empty() && poll_wakes.is_empty() && !notified {
             return false;
         }
 
@@ -2182,7 +2183,12 @@ impl ManagedRun {
                 "Resuming external stream waits for a poll response wake"
             );
         }
-        let mut resume = !poll_wakes.is_empty();
+        // Notifications on the scheduled event are the same unparked wake, read from History
+        // rather than the poll response, so they apply in replay as well.
+        if notified {
+            debug!("Resuming external stream waits for channel notifications");
+        }
+        let mut resume = notified || !poll_wakes.is_empty();
         let chain = self
             .wfm
             .machines

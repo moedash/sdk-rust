@@ -1368,6 +1368,9 @@ pub mod coresdk {
                                 fin.reason()
                             )
                         }
+                        workflow_activation_job::Variant::NotificationsReceived(n) => {
+                            write!(f, "NotificationsReceived({})", n.notifications.len())
+                        }
                     }
                 }
             }
@@ -1802,6 +1805,12 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for SubscribeNotificationChannel {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "SubscribeNotificationChannel({})", self.channel)
+                }
+            }
+
             impl Display for WorkflowOutputStreamBuffered {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(
@@ -2053,6 +2062,16 @@ pub mod temporal {
                     impl Display for command::Attributes {
                         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                             write!(f, "{:?}", self.as_type())
+                        }
+                    }
+
+                    impl From<workflow_commands::SubscribeNotificationChannel> for Attributes {
+                        fn from(s: workflow_commands::SubscribeNotificationChannel) -> Self {
+                            Self::SubscribeNotificationChannelCommandAttributes(
+                                SubscribeNotificationChannelCommandAttributes {
+                                    channel: s.channel,
+                                },
+                            )
                         }
                     }
 

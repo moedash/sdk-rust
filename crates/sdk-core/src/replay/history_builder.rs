@@ -114,6 +114,28 @@ impl TestHistoryBuilder {
         self.workflow_task_scheduled_event_id = self.add_by_type(EventType::WorkflowTaskScheduled);
     }
 
+    /// Add a workflow task scheduled event carrying channel notifications.
+    pub fn add_workflow_task_scheduled_with_notifications(
+        &mut self,
+        notifications: Vec<
+            temporalio_common::protos::temporal::api::notification::v1::Notification,
+        >,
+    ) {
+        self.workflow_task_scheduled_event_id = self.add(WorkflowTaskScheduledEventAttributes {
+            notifications,
+            ..Default::default()
+        });
+    }
+
+    /// Add the event a subscribe-notification-channel command produces.
+    pub fn add_notification_channel_subscribed(&mut self, channel: &str) -> i64 {
+        let attrs = WorkflowNotificationChannelSubscribedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            channel: channel.to_string(),
+        };
+        self.add(attrs)
+    }
+
     /// Add a workflow task started event.
     pub fn add_workflow_task_started(&mut self) {
         self.final_workflow_task_started_event_id = self.add(WorkflowTaskStartedEventAttributes {
