@@ -3691,29 +3691,47 @@ async fn a_notified_scheduled_event_yields_the_job_and_resumes_a_parked_wait() {
     worker.drain_pollers_and_shutdown().await;
 }
 
-#[tokio::test]
-async fn a_task_scheduled_twice_hands_lang_one_folded_job() {
-    // A task that failed is scheduled again, and the second scheduled event may carry the same
-    // channel at a later counter. Lang gets one job per activation, folded the way the server
-    // folds: one notification per channel, the highest counter kept.
+/// A history whose second task fails after being scheduled with `n1` and is retried with `n2`.
+fn failed_then_retried_history(n1: Vec<Notification>, n2: Vec<Notification>) -> TestHistoryBuilder {
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
     t.add_full_wf_task();
-    t.add_workflow_task_scheduled_with_notifications(vec![
+    t.add_workflow_task_scheduled_with_notifications(n1);
+    t.add_workflow_task_started();
+    t.add_workflow_task_failed_with_failure(
+        temporalio_common::protos::temporal::api::enums::v1::WorkflowTaskFailedCause::Unspecified,
+        Default::default(),
+    );
+    t.add_workflow_task_scheduled_with_notifications(n2);
+    t.add_workflow_task_started();
+    t
+}
+
+#[rstest::rstest]
+#[case::live(false)]
+#[case::replay(true)]
+#[tokio::test]
+async fn a_failed_task_hands_its_notifications_to_the_retry(#[case] cold: bool) {
+    // The server clears a listener's pending notifications when it puts them on a scheduled
+    // event, so a retry's event carries only what arrived after the failed attempt. The failed
+    // attempt's event stays in History, and its notifications reach lang on the retry, ahead of
+    // the retry's own and in one job.
+    let n1 = vec![
         channel_notification("tokens", 41),
         channel_notification("events", 3),
-    ]);
-    t.add_workflow_task_started();
-    t.add_workflow_task_timed_out();
-    t.add_workflow_task_scheduled_with_notifications(vec![channel_notification("tokens", 42)]);
-    t.add_workflow_task_started();
-    t.add_workflow_task_completed();
-    t.add_workflow_execution_completed();
-
+    ];
+    let n2 = vec![channel_notification("tokens", 42)];
+    let t = failed_then_retried_history(n1.clone(), n2.clone());
+    let batches = if cold {
+        let resp = hist_to_poll_resp(&t, "fakeid".to_owned(), ResponseType::AllHistory);
+        vec![ResponseType::Raw(resp.resp)]
+    } else {
+        vec![ResponseType::ToTaskNum(1), ResponseType::ToTaskNum(2)]
+    };
     let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
         "fakeid",
         t,
-        [1, 2],
+        batches,
         mock_worker_client(),
     ));
     mock.worker_cfg(|w| {
@@ -3722,22 +3740,27 @@ async fn a_task_scheduled_twice_hands_lang_one_folded_job() {
     });
     let worker = mock_worker(mock);
     let first = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(first.is_replaying, cold);
+    assert_eq!(
+        notification_jobs(&first),
+        Vec::<Vec<Notification>>::new(),
+        "the notifications belong to the retried task, got {:?}",
+        first.jobs
+    );
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::empty(first.run_id))
         .await
         .unwrap();
 
-    let second = worker.poll_workflow_activation().await.unwrap();
+    let retried = worker.poll_workflow_activation().await.unwrap();
+    assert!(!retried.is_replaying, "got jobs {:?}", retried.jobs);
     assert_eq!(
-        notification_jobs(&second),
-        vec![vec![
-            channel_notification("tokens", 42),
-            channel_notification("events", 3),
-        ]]
+        notification_jobs(&retried),
+        vec![n1.into_iter().chain(n2).collect::<Vec<_>>()]
     );
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            second.run_id,
+            retried.run_id,
             vec![CompleteWorkflowExecution::default().into()],
         ))
         .await
