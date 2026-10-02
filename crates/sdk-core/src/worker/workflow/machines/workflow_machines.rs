@@ -14,6 +14,7 @@ use super::{
     subscribe_notification_channel_state_machine::subscribe_notification_channel,
     subscribe_stream_state_machine::subscribe_stream,
     timer_state_machine::new_timer,
+    unsubscribe_notification_channel_state_machine::unsubscribe_notification_channel,
     upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
@@ -1739,6 +1740,15 @@ impl WorkflowMachines {
                     // event of later tasks, not as a reply to this command.
                     self.add_cmd_to_wf_task(
                         subscribe_notification_channel(attrs),
+                        annotations,
+                        CommandIdKind::NeverResolves,
+                    );
+                }
+                WFCommandVariant::UnsubscribeNotificationChannel(attrs) => {
+                    // Never resolves: the event only records the end of the
+                    // subscription and hands nothing back to the workflow.
+                    self.add_cmd_to_wf_task(
+                        unsubscribe_notification_channel(attrs),
                         annotations,
                         CommandIdKind::NeverResolves,
                     );

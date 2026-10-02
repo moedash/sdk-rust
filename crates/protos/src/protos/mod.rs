@@ -1962,6 +1962,16 @@ pub mod temporal {
                         }
                     }
 
+                    impl From<workflow_commands::UnsubscribeNotificationChannel> for Attributes {
+                        fn from(s: workflow_commands::UnsubscribeNotificationChannel) -> Self {
+                            Self::UnsubscribeNotificationChannelCommandAttributes(
+                                UnsubscribeNotificationChannelCommandAttributes {
+                                    channel: s.channel,
+                                },
+                            )
+                        }
+                    }
+
                     impl From<workflow_commands::StartTimer> for command::Attributes {
                         fn from(s: workflow_commands::StartTimer) -> Self {
                             Self::StartTimerCommandAttributes(StartTimerCommandAttributes {

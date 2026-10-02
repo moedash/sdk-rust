@@ -1578,6 +1578,7 @@ enum WFCommandVariant {
     SubscribeStream(SubscribeStream),
     AppendStreamRecords(AppendStreamRecords),
     SubscribeNotificationChannel(SubscribeNotificationChannel),
+    UnsubscribeNotificationChannel(UnsubscribeNotificationChannel),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1592,6 +1593,9 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::SubscribeNotificationChannel(s) => {
                 WFCommandVariant::SubscribeNotificationChannel(s)
+            }
+            workflow_command::Variant::UnsubscribeNotificationChannel(s) => {
+                WFCommandVariant::UnsubscribeNotificationChannel(s)
             }
             workflow_command::Variant::CancelTimer(s) => WFCommandVariant::CancelTimer(s),
             workflow_command::Variant::ScheduleActivity(s) => WFCommandVariant::AddActivity(s),
@@ -1645,12 +1649,6 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
-            }
-            // This layer has no machine for the unsubscribe. Dropping the command
-            // would let the workflow go on as if unsubscribed while the server
-            // keeps delivering.
-            workflow_command::Variant::UnsubscribeNotificationChannel(_) => {
-                return Err(EmptyWorkflowCommandErr);
             }
         };
         Ok(Self {
