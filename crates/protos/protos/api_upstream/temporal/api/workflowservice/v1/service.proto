@@ -483,25 +483,6 @@ service WorkflowService {
         };
     }
 
-    // WakeWorkflowExecution asks a running Workflow Execution to run a Workflow
-    // Task because a source it consumes has moved. Unlike a Signal it records
-    // no event, carries no payload, and folds with other wakes for the same
-    // source, so a burst of writes costs one task. The Workflow learns the
-    // source and its position from the task and reads the source itself.
-    //
-    // Superseded by the notification channel (`NotifyChannel` and the
-    // `SubscribeNotificationChannel` command). Kept for one round and slated for removal.
-    rpc WakeWorkflowExecution (WakeWorkflowExecutionRequest) returns (WakeWorkflowExecutionResponse) {
-        option (google.api.http) = {
-            post: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/wake"
-            body: "*"
-            additional_bindings {
-                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/wake"
-                body: "*"
-            }
-        };
-    }
-
     // NotifyChannel tells every listener of a channel that a source they consume
     // has moved. The writer names no addressee and never learns who listens. The
     // server wakes each listener: a Workflow with a Workflow Task, a callback by
