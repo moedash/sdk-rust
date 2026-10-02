@@ -96,7 +96,6 @@ use temporalio_common::{
             query::v1::WorkflowQuery,
             sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
             taskqueue::v1::StickyExecutionAttributes,
-            workflow::v1::Wake,
             workflowservice::v1::{PollActivityTaskQueueResponse, get_system_info_response},
         },
     },
@@ -1170,7 +1169,6 @@ struct PreparedWFT {
     query_requests: Vec<QueryWorkflow>,
     update: HistoryUpdate,
     messages: Vec<IncomingProtocolMessage>,
-    wakes: Vec<Wake>,
 }
 
 impl PreparedWFT {

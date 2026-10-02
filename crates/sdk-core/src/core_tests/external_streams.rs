@@ -54,7 +54,6 @@ use temporalio_common::{
             history::v1::History,
             notification::v1::Notification,
             query::v1::WorkflowQuery,
-            workflow::v1::Wake,
             workflowservice::v1::{
                 GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
             },
@@ -3407,177 +3406,6 @@ async fn an_ordinary_signal_still_reaches_its_handler() {
     worker.drain_pollers_and_shutdown().await;
 }
 
-// --- wakes carried on the poll response --------------------------------------
-
-fn poll_wake() -> Wake {
-    Wake {
-        source: "tokens".to_string(),
-        position: b"42-0".to_vec(),
-        counter: 42,
-    }
-}
-
-/// A worker whose second Workflow Task arrives with `wakes` on its poll response.
-///
-/// The wake-driven task records nothing of its own beyond its scheduled and started events,
-/// which is the shape the server produces when only a wake is pending. `user_signal` adds an
-/// ordinary Signal ahead of that task for the tests that need a job to look at.
-fn worker_with_a_poll_wake(wakes: Vec<Wake>, user_signal: bool) -> crate::Worker {
-    let mut t = TestHistoryBuilder::default();
-    t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
-    t.add_full_wf_task();
-    if user_signal {
-        t.add_we_signaled("a-user-signal", vec![]);
-    }
-    t.add_full_wf_task();
-    t.add_workflow_execution_completed();
-
-    let mut second = hist_to_poll_resp(&t, "fakeid".to_owned(), ResponseType::ToTaskNum(2));
-    second.wakes = wakes;
-    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
-        "fakeid",
-        t,
-        [ResponseType::ToTaskNum(1), ResponseType::Raw(second.resp)],
-        mock_worker_client(),
-    ));
-    mock.worker_cfg(|w| {
-        w.task_types = WorkerTaskTypes::workflow_only();
-        w.max_cached_workflows = 1;
-    });
-    mock_worker(mock)
-}
-
-#[tokio::test]
-async fn a_poll_wake_resumes_a_parked_wait() {
-    // The server stored the wake on this run, so Core treats it as an unparked wake: no chain to
-    // check and no generation to match, even against a set parked at a generation of its own.
-    let worker = worker_with_a_poll_wake(vec![poll_wake()], false);
-    advance_to_the_signal_task(&worker, vec![1, 2], Some(7)).await;
-
-    let second = worker.poll_workflow_activation().await.unwrap();
-
-    assert_eq!(
-        resolve_hints(&second),
-        vec![1, 2],
-        "a poll wake must mark every active wait, got {:?}",
-        second.jobs
-    );
-    assert!(
-        !second.is_replaying,
-        "the task a poll wake arrives on is live work, got jobs {:?}",
-        second.jobs
-    );
-
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            second.run_id,
-            vec![CompleteWorkflowExecution::default().into()],
-        ))
-        .await
-        .unwrap();
-    worker.drain_pollers_and_shutdown().await;
-}
-
-#[tokio::test]
-async fn a_poll_wake_with_no_waits_is_harmless() {
-    // Nothing is parked, so there is nothing to resume. The task still runs its ordinary work and
-    // the wake adds no job to it.
-    let worker = worker_with_a_poll_wake(vec![poll_wake()], true);
-    let first = worker.poll_workflow_activation().await.unwrap();
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::empty(first.run_id))
-        .await
-        .unwrap();
-
-    let second = worker.poll_workflow_activation().await.unwrap();
-    assert!(
-        second.jobs.iter().any(|j| matches!(
-            &j.variant,
-            Some(workflow_activation_job::Variant::SignalWorkflow(s))
-                if s.signal_name == "a-user-signal"
-        )),
-        "the ordinary Signal must still reach its handler, got {:?}",
-        second.jobs
-    );
-    assert_eq!(
-        resolve_hints(&second),
-        Vec::<u32>::new(),
-        "with no waits there is nothing for the wake to resolve"
-    );
-
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            second.run_id,
-            vec![CompleteWorkflowExecution::default().into()],
-        ))
-        .await
-        .unwrap();
-    worker.drain_pollers_and_shutdown().await;
-}
-
-#[tokio::test]
-async fn a_poll_wake_is_not_applied_while_replaying() {
-    // A cold worker receives the whole History with the live task's wakes. The wakes describe the
-    // live task, so the replayed activation must not carry them, and they must not be spent
-    // there either: the waits that exist once replay catches up are the ones they resume. The
-    // Signal keeps the two tasks apart; back to back, Core would treat them as one live task.
-    let mut t = TestHistoryBuilder::default();
-    t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
-    t.add_full_wf_task();
-    t.add_we_signaled("a-user-signal", vec![]);
-    t.add_full_wf_task();
-    t.add_workflow_execution_completed();
-
-    let mut cold = hist_to_poll_resp(&t, "fakeid".to_owned(), ResponseType::ToTaskNum(2));
-    cold.wakes = vec![poll_wake()];
-    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
-        "fakeid",
-        t,
-        [ResponseType::Raw(cold.resp)],
-        mock_worker_client(),
-    ));
-    mock.worker_cfg(|w| {
-        w.task_types = WorkerTaskTypes::workflow_only();
-        w.max_cached_workflows = 1;
-    });
-    let worker = mock_worker(mock);
-
-    let replayed = worker.poll_workflow_activation().await.unwrap();
-    assert!(replayed.is_replaying);
-    assert_eq!(
-        resolve_hints(&replayed),
-        Vec::<u32>::new(),
-        "a replayed activation must not carry a poll wake, got {:?}",
-        replayed.jobs
-    );
-    let run_id = replayed.run_id.clone();
-    worker
-        .seed_external_stream_waits(&run_id, vec![1], None, false)
-        .await;
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
-        .await
-        .unwrap();
-
-    let live = worker.poll_workflow_activation().await.unwrap();
-    assert!(!live.is_replaying, "got jobs {:?}", live.jobs);
-    assert_eq!(
-        resolve_hints(&live),
-        vec![1],
-        "the wake held through replay must resume the live task, got {:?}",
-        live.jobs
-    );
-
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            live.run_id,
-            vec![CompleteWorkflowExecution::default().into()],
-        ))
-        .await
-        .unwrap();
-    worker.drain_pollers_and_shutdown().await;
-}
-
 // --- notifications on the scheduled event ------------------------------------
 
 fn channel_notification(channel: &str, counter: i64) -> Notification {
@@ -3629,8 +3457,8 @@ fn notified_second_task_history(notifications: Vec<Notification>) -> TestHistory
 #[tokio::test]
 async fn a_notified_scheduled_event_yields_the_job_and_resumes_a_parked_wait() {
     // The server folds a channel's notifications onto the scheduled event of the task it wakes
-    // the run with. The job hands them to lang, and the same task resumes the parked waits the
-    // way a poll wake does: no chain to check and no generation to match.
+    // the run with. The job hands them to lang, and the same task resumes the parked waits as an
+    // unparked wake: no chain to check and no generation to match.
     let notifications = vec![channel_notification("tokens", 42)];
     let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
         "fakeid",
@@ -3830,7 +3658,7 @@ async fn replaying_a_notified_scheduled_event_yields_the_same_job() {
 
 #[tokio::test]
 async fn replayed_notifications_resume_the_reconstructed_waits() {
-    // The wake comes from History, so unlike a poll wake it is applied while replaying: the waits
+    // The notifications come from History, so they are applied while replaying too: the waits
     // lang reconstructs for the notified task are resumed by the same activation.
     let notifications = vec![channel_notification("tokens", 42)];
     let mut t = TestHistoryBuilder::default();

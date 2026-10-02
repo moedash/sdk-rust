@@ -162,7 +162,6 @@ impl HistoryPaginator {
             query_requests: wft.query_requests,
             update,
             messages: wft.messages,
-            wakes: wft.wakes,
         };
         Ok((paginator, prepared))
     }
