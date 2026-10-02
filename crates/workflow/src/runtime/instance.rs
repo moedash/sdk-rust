@@ -1132,6 +1132,17 @@ where
                         ..Default::default()
                     }));
                 }
+                Some(ActivationVariant::NotificationsReceived(_)) => {
+                    // This runtime has no command to subscribe to a channel, so
+                    // a run that gets notifications was driven by something it
+                    // cannot model. Failing beats handing back a workflow that
+                    // silently behaves as if none arrived.
+                    return Err(Box::new(Failure {
+                        message: "received channel notifications, which this SDK cannot deliver"
+                            .to_string(),
+                        ..Default::default()
+                    }));
+                }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
                 None => {
                     return Err(Box::new(Failure {

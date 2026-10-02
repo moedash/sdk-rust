@@ -25,6 +25,7 @@ import "temporal/api/enums/v1/nexus.proto";
 import "temporal/api/activity/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/stream/v1/message.proto";
+import "temporal/api/notification/v1/message.proto";
 import "temporal/api/history/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/api/command/v1/message.proto";
@@ -911,6 +912,79 @@ message WakeWorkflowExecutionResponse {
     // received it yet, so this one changed nothing but possibly the position
     // and no new task results from it.
     bool folded = 2;
+}
+
+message NotifyChannelRequest {
+    string namespace = 1;
+    temporal.api.notification.v1.Notification notification = 2;
+    // The identity of the writer, for metrics and logs.
+    string identity = 3;
+    // Used to de-dupe a retried notification.
+    string request_id = 4;
+}
+
+message NotifyChannelResponse {
+    // Listeners registered when the notification was accepted. Zero means the
+    // notification was retained for pollers and woke nobody.
+    int32 listener_count = 1;
+}
+
+message RegisterChannelListenerRequest {
+    string namespace = 1;
+    string channel = 2;
+    // Invoked with each notification on the channel.
+    temporal.api.common.v1.Callback callback = 3;
+    // Used to de-dupe a retried registration.
+    string request_id = 4;
+    // The identity of the caller, for metrics and logs.
+    string identity = 5;
+}
+
+message RegisterChannelListenerResponse {
+    string listener_id = 1;
+}
+
+message UnregisterChannelListenerRequest {
+    string namespace = 1;
+    string channel = 2;
+    string listener_id = 3;
+    // The identity of the caller, for metrics and logs.
+    string identity = 4;
+}
+
+message UnregisterChannelListenerResponse {
+}
+
+message PollChannelRequest {
+    string namespace = 1;
+    string channel = 2;
+    // Only notifications with a counter above this one are returned.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "after" names the exclusive lower bound. --)
+    int64 after_counter = 3;
+    // How long to wait for a notification when none is retained above
+    // `after_counter`.
+    google.protobuf.Duration wait = 4;
+    // At most this many notifications are returned. Zero means the server's
+    // default.
+    int32 max_notifications = 5;
+}
+
+message PollChannelResponse {
+    repeated temporal.api.notification.v1.Notification notifications = 1;
+}
+
+message DescribeChannelRequest {
+    string namespace = 1;
+    string channel = 2;
+}
+
+message DescribeChannelResponse {
+    repeated temporal.api.notification.v1.ChannelListener listeners = 1;
+    // The notification with the highest counter the channel retains.
+    temporal.api.notification.v1.Notification latest = 2;
+    // How many notifications the channel retains for pollers.
+    int32 retained_count = 3;
 }
 
 message SignalWithStartWorkflowExecutionRequest {
