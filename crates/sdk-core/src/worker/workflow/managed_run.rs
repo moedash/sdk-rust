@@ -2145,16 +2145,27 @@ impl ManagedRun {
         (outcome.into(), act)
     }
 
-    /// Classifies the wake Signals the machines decoded out of this task's history.
+    /// Classifies the wake Signals the machines decoded out of this task's history, together with
+    /// the channel notifications its scheduled event carried.
     ///
-    /// Returns `true` if any of them should wake the Run. Every one is suppressed from user
+    /// Returns `true` if any of them should wake the Run. Every Signal is suppressed from user
     /// handlers regardless -- that already happened in the machines -- so what is decided here is
     /// only whether the Run resumes.
     fn apply_external_stream_wakes(&mut self) -> bool {
         let wakes = self.wfm.machines.take_external_stream_wakes();
-        if wakes.is_empty() {
+        let notified = self.wfm.machines.take_notification_wake();
+        if wakes.is_empty() && !notified {
             return false;
         }
+
+        // Notifications on the scheduled event count as an unparked wake (generation 0), which is
+        // never rejected: the server resolved the chain when it folded them onto this run's task,
+        // so there is no chain identity left to compare. They come from History, so they apply in
+        // replay as well.
+        if notified {
+            debug!("Resuming external stream waits for channel notifications");
+        }
+        let mut resume = notified;
         let chain = self
             .wfm
             .machines
@@ -2162,7 +2173,6 @@ impl ManagedRun {
             .map(|info| info.first_execution_run_id.clone())
             .unwrap_or_default();
 
-        let mut resume = false;
         for wake in wakes {
             // Chain identity, not Run identity. The Signal is addressed to the Workflow ID
             // without a Run ID, so it always lands on the current Run of the chain -- and a

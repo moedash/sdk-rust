@@ -3432,6 +3432,94 @@ fn notification_jobs(activation: &WorkflowActivation) -> Vec<Vec<Notification>> 
         .collect()
 }
 
+fn job_index(
+    activation: &WorkflowActivation,
+    is: fn(&workflow_activation_job::Variant) -> bool,
+) -> usize {
+    activation
+        .jobs
+        .iter()
+        .position(|j| j.variant.as_ref().is_some_and(is))
+        .unwrap_or_else(|| panic!("job not found in {:?}", activation.jobs))
+}
+
+/// A history whose second Workflow Task is scheduled with `notifications` and nothing else.
+fn notified_second_task_history(notifications: Vec<Notification>) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_with_notifications(notifications);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    t.add_workflow_execution_completed();
+    t
+}
+
+#[tokio::test]
+async fn a_notified_scheduled_event_yields_the_job_and_resumes_a_parked_wait() {
+    // The server folds a channel's notifications onto the scheduled event of the task it wakes
+    // the run with. The job hands them to lang, and the same task resumes the parked waits as an
+    // unparked wake: no chain to check and no generation to match.
+    let notifications = vec![channel_notification("tokens", 42)];
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "fakeid",
+        notified_second_task_history(notifications.clone()),
+        [1, 2],
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(notification_jobs(&first), Vec::<Vec<Notification>>::new());
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
+        .await
+        .unwrap();
+    worker
+        .seed_external_stream_waits(&run_id, vec![1, 2], Some(7), false)
+        .await;
+
+    let second = worker.poll_workflow_activation().await.unwrap();
+    assert!(!second.is_replaying, "got jobs {:?}", second.jobs);
+    assert_eq!(notification_jobs(&second), vec![notifications]);
+    assert_eq!(
+        resolve_hints(&second),
+        vec![1, 2],
+        "the notifications must resume every parked wait, got {:?}",
+        second.jobs
+    );
+    let notified = job_index(&second, |v| {
+        matches!(
+            v,
+            workflow_activation_job::Variant::NotificationsReceived(_)
+        )
+    });
+    let resolved = job_index(&second, |v| {
+        matches!(
+            v,
+            workflow_activation_job::Variant::ResolveExternalStreamWaits(_)
+        )
+    });
+    assert!(
+        notified < resolved,
+        "the notifications must come before the resolve job, got {:?}",
+        second.jobs
+    );
+
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            second.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
 /// A history whose second task fails after being scheduled with `n1` and is retried with `n2`.
 fn failed_then_retried_history(n1: Vec<Notification>, n2: Vec<Notification>) -> TestHistoryBuilder {
     let mut t = TestHistoryBuilder::default();
@@ -3562,6 +3650,66 @@ async fn replaying_a_notified_scheduled_event_yields_the_same_job() {
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             live.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn replayed_notifications_resume_the_reconstructed_waits() {
+    // The notifications come from History, so they are applied while replaying too: the waits
+    // lang reconstructs for the notified task are resumed by the same activation.
+    let notifications = vec![channel_notification("tokens", 42)];
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(300));
+    t.add_full_wf_task();
+    t.add_we_signaled("a-user-signal", vec![]);
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_with_notifications(notifications.clone());
+    t.add_workflow_task_started();
+
+    let cold = hist_to_poll_resp(&t, "fakeid".to_owned(), ResponseType::AllHistory);
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "fakeid",
+        t,
+        [ResponseType::Raw(cold.resp)],
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(first.run_id))
+        .await
+        .unwrap();
+    let second = worker.poll_workflow_activation().await.unwrap();
+    assert!(second.is_replaying, "got jobs {:?}", second.jobs);
+    let run_id = second.run_id.clone();
+    worker
+        .seed_external_stream_waits(&run_id, vec![1], None, false)
+        .await;
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id.clone()))
+        .await
+        .unwrap();
+
+    let notified = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(notification_jobs(&notified), vec![notifications]);
+    assert_eq!(
+        resolve_hints(&notified),
+        vec![1],
+        "the notifications must resume the reconstructed wait, got {:?}",
+        notified.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            notified.run_id,
             vec![CompleteWorkflowExecution::default().into()],
         ))
         .await

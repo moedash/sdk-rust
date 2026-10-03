@@ -107,6 +107,8 @@ pub(crate) struct WorkflowMachines {
     /// carries only what arrived since. The failed task's notifications stay in History and
     /// reach lang here, folded with the retry's into one job.
     pending_notifications: Vec<Notification>,
+    /// Set when notifications were handed to lang and the run's wait set has not seen them yet.
+    pending_notification_wake: bool,
     /// External stream marker machines whose `MarkerRecorded` event has not been reached yet, in
     /// the order the markers appear in History.
     ///
@@ -317,6 +319,7 @@ impl WorkflowMachines {
             observed_internal_flags: Rc::new(RefCell::new(observed_internal_flags)),
             pending_external_stream_wakes: vec![],
             pending_notifications: vec![],
+            pending_notification_wake: false,
             external_stream_marker_machines: Default::default(),
             history_size_bytes: 0,
             continue_as_new_suggested: false,
@@ -593,6 +596,12 @@ impl WorkflowMachines {
         std::mem::take(&mut self.pending_external_stream_wakes)
     }
 
+    /// Whether notifications reached lang since the last call. They come from History, so a
+    /// replay reports the same as the live run did.
+    pub(crate) fn take_notification_wake(&mut self) -> bool {
+        std::mem::take(&mut self.pending_notification_wake)
+    }
+
     /// Hands lang the notifications from this task's scheduled events as one job.
     ///
     /// Sent while the task's history is applied, so the job sits ahead of any external stream
@@ -608,6 +617,7 @@ impl WorkflowMachines {
             })
             .into(),
         );
+        self.pending_notification_wake = true;
     }
 
     /// Queue a Core-generated job for lang.
