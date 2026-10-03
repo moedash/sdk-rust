@@ -892,16 +892,11 @@ message NotifyChannelRequest {
     string identity = 3;
     // Used to de-dupe a retried notification.
     string request_id = 4;
-
-    // Was temporal.api.common.v1.WorkflowExecution workflow_execution.
-    reserved 5;
-    reserved "workflow_execution";
-
     // When set, the call addresses the channel linked to this execution.
     // `run_id` is optional and resolves to the current run of a workflow chain,
     // as a Signal does. When unset, the call addresses the independent channel
     // of that name.
-    temporal.api.common.v1.Execution execution = 6;
+    temporal.api.common.v1.Execution execution = 5;
 }
 
 message NotifyChannelResponse {
@@ -919,16 +914,11 @@ message RegisterChannelListenerRequest {
     string request_id = 4;
     // The identity of the caller, for metrics and logs.
     string identity = 5;
-
-    // Was temporal.api.common.v1.WorkflowExecution workflow_execution.
-    reserved 6;
-    reserved "workflow_execution";
-
     // When set, the call addresses the channel linked to this execution.
     // `run_id` is optional and resolves to the current run of a workflow chain,
     // as a Signal does. When unset, the call addresses the independent channel
     // of that name.
-    temporal.api.common.v1.Execution execution = 7;
+    temporal.api.common.v1.Execution execution = 6;
 }
 
 message RegisterChannelListenerResponse {
@@ -941,16 +931,11 @@ message UnregisterChannelListenerRequest {
     string listener_id = 3;
     // The identity of the caller, for metrics and logs.
     string identity = 4;
-
-    // Was temporal.api.common.v1.WorkflowExecution workflow_execution.
-    reserved 5;
-    reserved "workflow_execution";
-
     // When set, the call addresses the channel linked to this execution.
     // `run_id` is optional and resolves to the current run of a workflow chain,
     // as a Signal does. When unset, the call addresses the independent channel
     // of that name.
-    temporal.api.common.v1.Execution execution = 6;
+    temporal.api.common.v1.Execution execution = 5;
 }
 
 message UnregisterChannelListenerResponse {
@@ -969,16 +954,11 @@ message PollChannelRequest {
     // At most this many notifications are returned. Zero means the server's
     // default.
     int32 max_notifications = 5;
-
-    // Was temporal.api.common.v1.WorkflowExecution workflow_execution.
-    reserved 6;
-    reserved "workflow_execution";
-
     // When set, the call addresses the channel linked to this execution.
     // `run_id` is optional and resolves to the current run of a workflow chain,
     // as a Signal does. When unset, the call addresses the independent channel
     // of that name.
-    temporal.api.common.v1.Execution execution = 7;
+    temporal.api.common.v1.Execution execution = 6;
 }
 
 message PollChannelResponse {
@@ -988,16 +968,11 @@ message PollChannelResponse {
 message DescribeChannelRequest {
     string namespace = 1;
     string channel = 2;
-
-    // Was temporal.api.common.v1.WorkflowExecution workflow_execution.
-    reserved 3;
-    reserved "workflow_execution";
-
     // When set, the call addresses the channel linked to this execution.
     // `run_id` is optional and resolves to the current run of a workflow chain,
     // as a Signal does. When unset, the call addresses the independent channel
     // of that name.
-    temporal.api.common.v1.Execution execution = 4;
+    temporal.api.common.v1.Execution execution = 3;
 }
 
 message DescribeChannelResponse {
@@ -1007,15 +982,11 @@ message DescribeChannelResponse {
     // How many notifications the channel retains for pollers.
     int32 retained_count = 3;
     temporal.api.notification.v1.ChannelKind kind = 4;
-
-    // Was temporal.api.common.v1.WorkflowExecution linked_to.
-    reserved 5;
-
     // The owner of a linked channel and the run that holds it. Empty for an
     // independent channel.
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "to" names the owner the channel is linked to. --)
-    temporal.api.common.v1.Execution linked_to = 6;
+    temporal.api.common.v1.Execution linked_to = 5;
 }
 
 message SignalWithStartWorkflowExecutionRequest {
