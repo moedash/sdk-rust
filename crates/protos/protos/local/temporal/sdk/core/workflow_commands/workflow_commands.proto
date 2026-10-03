@@ -55,7 +55,29 @@ message WorkflowCommand {
         ExternalStreamFinalized external_stream_finalized = 26;
         WorkflowOutputStreamCommit workflow_output_stream_commit = 27;
         WorkflowOutputStreamBuffered workflow_output_stream_buffered = 28;
+        SubscribeNotificationChannel subscribe_notification_channel = 29;
+        UnsubscribeNotificationChannel unsubscribe_notification_channel = 30;
     }
+}
+
+// End this workflow's subscription to a notification channel. Notifications
+// already recorded on a scheduled event still reach that Workflow Task.
+//
+// The server records the event whether or not the run held a subscription, so
+// every command has an event to match on replay.
+message UnsubscribeNotificationChannel {
+    // Name of the channel, scoped to the namespace.
+    string channel = 1;
+}
+
+// Subscribe this workflow to a notification channel, so the scheduled event of
+// each later Workflow Task carries the notifications folded for it.
+//
+// The notifications live in History rather than arriving by a side channel, so
+// a replay reads the same ones the live run saw.
+message SubscribeNotificationChannel {
+    // Name of the channel, scoped to the namespace.
+    string channel = 1;
 }
 
 // Commits an observation delta for external streams.
