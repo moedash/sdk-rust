@@ -71,6 +71,7 @@ mod machine_coverage_report {
         child_workflow_state_machine::ChildWorkflowMachine,
         complete_workflow_state_machine::CompleteWorkflowMachine,
         continue_as_new_workflow_state_machine::ContinueAsNewWorkflowMachine,
+        external_stream_state_machine::ExternalStreamMachine,
         fail_workflow_state_machine::FailWorkflowMachine,
         local_activity_state_machine::LocalActivityMachine,
         modify_workflow_properties_state_machine::ModifyWorkflowPropertiesMachine,
@@ -120,6 +121,7 @@ mod machine_coverage_report {
         let mut modify_wf_props = ModifyWorkflowPropertiesMachine::visualizer().to_owned();
         let mut update = UpdateMachine::visualizer().to_owned();
         let mut nexus = NexusOperationMachine::visualizer().to_owned();
+        let mut external_stream = ExternalStreamMachine::visualizer().to_owned();
         let mut subscribe_channel = SubscribeNotificationChannelMachine::visualizer().to_owned();
         let mut unsubscribe_channel =
             UnsubscribeNotificationChannelMachine::visualizer().to_owned();
@@ -150,6 +152,7 @@ mod machine_coverage_report {
                 }
                 m @ "UpdateMachine" => cover_transitions(m, &mut update, coverage),
                 m @ "NexusOperationMachine" => cover_transitions(m, &mut nexus, coverage),
+                m @ "ExternalStreamMachine" => cover_transitions(m, &mut external_stream, coverage),
                 m @ "SubscribeNotificationChannelMachine" => {
                     cover_transitions(m, &mut subscribe_channel, coverage)
                 }
