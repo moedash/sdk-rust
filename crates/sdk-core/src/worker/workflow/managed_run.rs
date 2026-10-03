@@ -15,8 +15,9 @@ use crate::{
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
             WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WorkflowTaskInfo,
             external_streams::{
-                ExternalStreamReadyResult, ExternalStreamRunStatus, ExternalWaitSet,
-                ExternalWaitState, ParkResolution, ParkStartOutcome, ParkTrigger, ReadinessOutcome,
+                ChannelSubscriptions, ExternalStreamReadyResult, ExternalStreamRunStatus,
+                ExternalWaitSet, ExternalWaitState, ParkResolution, ParkStartOutcome, ParkTrigger,
+                ReadinessOutcome,
             },
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
@@ -966,6 +967,11 @@ impl ManagedRun {
                 });
             }
         };
+        if let Some(channels) = stream_commands.channels.take() {
+            self.waiting_on_local_work
+                .channel_subscriptions
+                .report(channels);
+        }
         let output_was_buffered = self.waiting_on_local_work.output_buffered;
         if let Some(commit) = stream_commands.output_commit.take() {
             if self.waiting_on_local_work.pending_output_commit.is_some() {
@@ -1433,6 +1439,37 @@ impl ManagedRun {
 
         if awaiting_finalization {
             self.cancel_external_output_flush_timer();
+        }
+
+        // The subscribe command is server-bound, so issued from the activation that opened the
+        // reader it would end a task that was meant to stay retained. It waits for the completion
+        // that ends the task instead: a terminal here is exactly that completion, the park
+        // confirmation and the finalization answer included, and a run-ending one subscribes to
+        // nothing because the subscription would end with the run anyway. The marker is already
+        // queued, so the channel events follow it in History, and lang's own commands follow
+        // them. A channel the run stopped listening on is unsubscribed first, so a run rotating
+        // channels frees the slot before the new subscription takes one.
+        if let Some(terminal) = terminal
+            && terminal != ParkReason::WorkflowCompleted
+        {
+            let subscriptions = &mut self.waiting_on_local_work.channel_subscriptions;
+            let leaving = subscriptions.take_due_unsubscriptions();
+            let joining = subscriptions.take_due_subscriptions();
+            let machines = &mut self.wfm.machines;
+            let issued = leaving
+                .into_iter()
+                .try_for_each(|channel| machines.emit_notification_channel_unsubscription(channel))
+                .and_then(|()| {
+                    joining.into_iter().try_for_each(|channel| {
+                        machines.emit_notification_channel_subscription(channel)
+                    })
+                });
+            if let Err(source) = issued {
+                return Err(RunUpdateErr {
+                    source,
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
         }
 
         let outcome = (|| {
@@ -2145,16 +2182,27 @@ impl ManagedRun {
         (outcome.into(), act)
     }
 
-    /// Classifies the wake Signals the machines decoded out of this task's history.
+    /// Classifies the wake Signals the machines decoded out of this task's history, together with
+    /// the channel notifications its scheduled event carried.
     ///
-    /// Returns `true` if any of them should wake the Run. Every one is suppressed from user
+    /// Returns `true` if any of them should wake the Run. Every Signal is suppressed from user
     /// handlers regardless -- that already happened in the machines -- so what is decided here is
     /// only whether the Run resumes.
     fn apply_external_stream_wakes(&mut self) -> bool {
         let wakes = self.wfm.machines.take_external_stream_wakes();
-        if wakes.is_empty() {
+        let notified = self.wfm.machines.take_notification_wake();
+        if wakes.is_empty() && !notified {
             return false;
         }
+
+        // Notifications on the scheduled event count as an unparked wake (generation 0), which is
+        // never rejected: the server resolved the chain when it folded them onto this run's task,
+        // so there is no chain identity left to compare. They come from History, so they apply in
+        // replay as well.
+        if notified {
+            debug!("Resuming external stream waits for channel notifications");
+        }
+        let mut resume = notified;
         let chain = self
             .wfm
             .machines
@@ -2162,7 +2210,6 @@ impl ManagedRun {
             .map(|info| info.first_execution_run_id.clone())
             .unwrap_or_default();
 
-        let mut resume = false;
         for wake in wakes {
             // Chain identity, not Run identity. The Signal is addressed to the Workflow ID
             // without a Run ID, so it always lands on the current Run of the chain -- and a
@@ -2917,6 +2964,8 @@ struct ExternalStreamCommands {
     finalized: Option<ExternalStreamFinalized>,
     output_commit: Option<WorkflowOutputStreamCommit>,
     output_buffered_latency: Option<Duration>,
+    /// The complete set of notification channels the run listens on, when lang reported it.
+    channels: Option<Vec<String>>,
 }
 
 /// Splits lang's commands, leaving everything else in `commands`.
@@ -2995,6 +3044,30 @@ fn take_external_stream_commands(
                         }),
                 );
             }
+            WFCommandVariant::ExternalStreamChannels(report) => {
+                // Rejected rather than repaired: the set is what the subscribe commands are
+                // derived from, and a name the server would refuse or a channel named twice is
+                // a lang bug that replay would otherwise reproduce faithfully.
+                let mut seen = HashSet::with_capacity(report.channels.len());
+                for channel in &report.channels {
+                    if channel.is_empty() {
+                        return Err(WFMachinesError::Fatal(
+                            "WorkflowStreamChannels named an empty channel".to_string(),
+                        ));
+                    }
+                    if !seen.insert(channel.as_str()) {
+                        return Err(WFMachinesError::Fatal(format!(
+                            "WorkflowStreamChannels named channel {channel:?} twice"
+                        )));
+                    }
+                }
+                if taken.channels.replace(report.channels).is_some() {
+                    return Err(WFMachinesError::Fatal(
+                        "Lang sent more than one WorkflowStreamChannels in one completion"
+                            .to_string(),
+                    ));
+                }
+            }
             _ => {
                 seen_other_command = true;
                 remaining.push(command);
@@ -3047,6 +3120,8 @@ struct WaitingOnLocalWork {
     local_activities: Option<LocalActivityHeartbeatState>,
     /// This run's external stream waits. Empty until lang reports quiescence.
     external_wait_set: ExternalWaitSet,
+    /// The notification channels this run listens on, against the ones it is subscribed to.
+    channel_subscriptions: ChannelSubscriptions,
     /// Cancels the run-level workflow task rollover deadline, when one is running.
     ///
     /// Separate from the local-activity heartbeat handle: a retained task needs a rollover
