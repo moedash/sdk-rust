@@ -51,6 +51,11 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Workflow-originated external output no longer forces an empty replacement task from an old
+  stream wait after Workflow code has resumed and is awaiting an Activity or timer. This avoids
+  delaying that result behind an unnecessary task timeout. A completion that stages a commit and
+  reports output still buffered does keep forcing one, since the max publish latency it asked for
+  can only be honored while a task is held.
 * Workers now defensively buffer a replacement workflow task if it reaches a run that still owns
   one, preserving the outstanding task token in release builds.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before they
