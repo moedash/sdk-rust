@@ -497,11 +497,19 @@ service WorkflowService {
                 body: "*"
             }
             additional_bindings {
-                post: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{notification.channel}/notify"
+                post: "/namespaces/{namespace}/workflows/{execution.business_id}/channels/{notification.channel}/notify"
                 body: "*"
             }
             additional_bindings {
-                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{notification.channel}/notify"
+                post: "/api/v1/namespaces/{namespace}/workflows/{execution.business_id}/channels/{notification.channel}/notify"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/namespaces/{namespace}/activities/{execution.business_id}/channels/{notification.channel}/notify"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/activities/{execution.business_id}/channels/{notification.channel}/notify"
                 body: "*"
             }
         };
@@ -520,11 +528,19 @@ service WorkflowService {
                 body: "*"
             }
             additional_bindings {
-                post: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/listeners"
+                post: "/namespaces/{namespace}/workflows/{execution.business_id}/channels/{channel}/listeners"
                 body: "*"
             }
             additional_bindings {
-                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/listeners"
+                post: "/api/v1/namespaces/{namespace}/workflows/{execution.business_id}/channels/{channel}/listeners"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/namespaces/{namespace}/activities/{execution.business_id}/channels/{channel}/listeners"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/activities/{execution.business_id}/channels/{channel}/listeners"
                 body: "*"
             }
         };
@@ -542,10 +558,16 @@ service WorkflowService {
                 delete: "/api/v1/namespaces/{namespace}/channels/{channel}/listeners/{listener_id}"
             }
             additional_bindings {
-                delete: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/listeners/{listener_id}"
+                delete: "/namespaces/{namespace}/workflows/{execution.business_id}/channels/{channel}/listeners/{listener_id}"
             }
             additional_bindings {
-                delete: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/listeners/{listener_id}"
+                delete: "/api/v1/namespaces/{namespace}/workflows/{execution.business_id}/channels/{channel}/listeners/{listener_id}"
+            }
+            additional_bindings {
+                delete: "/namespaces/{namespace}/activities/{execution.business_id}/channels/{channel}/listeners/{listener_id}"
+            }
+            additional_bindings {
+                delete: "/api/v1/namespaces/{namespace}/activities/{execution.business_id}/channels/{channel}/listeners/{listener_id}"
             }
         };
     }
@@ -560,10 +582,16 @@ service WorkflowService {
                 get: "/api/v1/namespaces/{namespace}/channels/{channel}/notifications"
             }
             additional_bindings {
-                get: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/notifications"
+                get: "/namespaces/{namespace}/workflows/{execution.business_id}/channels/{channel}/notifications"
             }
             additional_bindings {
-                get: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}/notifications"
+                get: "/api/v1/namespaces/{namespace}/workflows/{execution.business_id}/channels/{channel}/notifications"
+            }
+            additional_bindings {
+                get: "/namespaces/{namespace}/activities/{execution.business_id}/channels/{channel}/notifications"
+            }
+            additional_bindings {
+                get: "/api/v1/namespaces/{namespace}/activities/{execution.business_id}/channels/{channel}/notifications"
             }
         };
     }
@@ -577,10 +605,16 @@ service WorkflowService {
                 get: "/api/v1/namespaces/{namespace}/channels/{channel}"
             }
             additional_bindings {
-                get: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}"
+                get: "/namespaces/{namespace}/workflows/{execution.business_id}/channels/{channel}"
             }
             additional_bindings {
-                get: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/channels/{channel}"
+                get: "/api/v1/namespaces/{namespace}/workflows/{execution.business_id}/channels/{channel}"
+            }
+            additional_bindings {
+                get: "/namespaces/{namespace}/activities/{execution.business_id}/channels/{channel}"
+            }
+            additional_bindings {
+                get: "/api/v1/namespaces/{namespace}/activities/{execution.business_id}/channels/{channel}"
             }
         };
     }
