@@ -829,6 +829,9 @@ const NOT_VALIDATED_FIELDS: &[&str] = &[
     "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.continued_failure",
     "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.last_completion_result",
     "temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest.details",
+    // Notification metadata: the server bounds it with its own notification size limit, not
+    // the blob limit, so the SDK has nothing to mirror.
+    "temporal.api.notification.v1.Notification.metadata",
     // Dedicated, non-fetchable limits (not blob/memo, not in DescribeNamespace): UserMetadata
     // (nexus-start only); Nexus EndpointSpec.description (maxDescriptionSize; cloud variant cloud-only).
     "temporal.api.sdk.v1.UserMetadata.details",

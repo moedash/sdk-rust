@@ -1118,6 +1118,11 @@ where
                     self.apply_resolution(resolution);
                     ActivationJobResult::None
                 }
+                Some(ActivationVariant::NotificationsReceived(_)) => {
+                    // This runtime cannot subscribe to a channel, and a notification
+                    // carries no data the workflow could lose by ignoring it.
+                    ActivationJobResult::None
+                }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
                 None => {
                     return Err(Box::new(Failure {
