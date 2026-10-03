@@ -1277,6 +1277,13 @@ pub mod coresdk {
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
                         }
+                        workflow_activation_job::Variant::DeliverStreamRecords(d) => {
+                            write!(
+                                f,
+                                "DeliverStreamRecords({}, {}..{})",
+                                d.stream_id, d.from_offset, d.to_offset
+                            )
+                        }
                         workflow_activation_job::Variant::NotificationsReceived(n) => {
                             write!(f, "NotificationsReceived({})", n.notifications.len())
                         }
