@@ -51,6 +51,9 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* External stream wake Signals encountered while replay advances through a History page now
+  resume reconstructed subscriptions. Workers with caching disabled no longer complete repeated
+  empty tasks while unread records remain in the external store.
 * Workflow-originated external output no longer forces an empty replacement task from an old
   stream wait after Workflow code has resumed and is awaiting an Activity or timer. This avoids
   delaying that result behind an unnecessary task timeout. A completion that stages a commit and
