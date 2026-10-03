@@ -33,6 +33,12 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Workflows can subscribe to notification channels with the `SubscribeNotificationChannel`
+  command and end a subscription with `UnsubscribeNotificationChannel`. The notifications the
+  server folds for a Workflow Task arrive as one `NotificationsReceived` activation job, taken from
+  the task's scheduled event, so replay yields the same job at the same point.
+
 ### Fixed
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
