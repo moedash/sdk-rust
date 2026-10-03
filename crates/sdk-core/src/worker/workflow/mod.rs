@@ -1728,6 +1728,8 @@ enum WFCommandVariant {
     ExternalOutputStreamCommit(WorkflowOutputStreamCommit),
     /// External output is buffered in lang and needs a run-scoped flush deadline.
     ExternalOutputStreamBuffered(WorkflowOutputStreamBuffered),
+    SubscribeNotificationChannel(SubscribeNotificationChannel),
+    UnsubscribeNotificationChannel(UnsubscribeNotificationChannel),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1806,6 +1808,12 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::WorkflowOutputStreamBuffered(buffered) => {
                 WFCommandVariant::ExternalOutputStreamBuffered(buffered)
+            }
+            workflow_command::Variant::SubscribeNotificationChannel(s) => {
+                WFCommandVariant::SubscribeNotificationChannel(s)
+            }
+            workflow_command::Variant::UnsubscribeNotificationChannel(u) => {
+                WFCommandVariant::UnsubscribeNotificationChannel(u)
             }
         };
         Ok(Self {
@@ -2026,7 +2034,7 @@ impl LocalActivityRequestSink for LAReqSink {
 /// 1. init workflow
 /// 2. patches
 /// 3. random-seed-updates
-/// 4. signals/updates
+/// 4. signals/updates/channel notifications
 /// 5. all others
 /// 6. local activity resolutions
 /// 7. queries
@@ -2066,6 +2074,7 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
                 workflow_activation_job::Variant::UpdateRandomSeed(_) => 2,
                 workflow_activation_job::Variant::SignalWorkflow(_) => 3,
                 workflow_activation_job::Variant::DoUpdate(_) => 3,
+                workflow_activation_job::Variant::NotificationsReceived(_) => 3,
                 workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => 5,
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is

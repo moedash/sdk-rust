@@ -16,13 +16,19 @@ mod modify_workflow_properties_state_machine;
 mod nexus_operation_state_machine;
 mod patch_state_machine;
 mod signal_external_state_machine;
+mod subscribe_notification_channel_state_machine;
 mod timer_state_machine;
+mod unsubscribe_notification_channel_state_machine;
 mod update_state_machine;
 mod upsert_search_attributes_state_machine;
 mod workflow_task_state_machine;
 
 #[cfg(test)]
+mod subscribe_notification_channel_state_machine_tests;
+#[cfg(test)]
 mod transition_coverage;
+#[cfg(test)]
+mod unsubscribe_notification_channel_state_machine_tests;
 
 pub(crate) use temporalio_common::fsm_trait::MachineError;
 pub(crate) use workflow_machines::{MachinesWFTResponseContent, WorkflowMachines};
@@ -48,6 +54,7 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt::{Debug, Display},
 };
+use subscribe_notification_channel_state_machine::SubscribeNotificationChannelMachine;
 use temporalio_common::{
     fsm_trait::{StateMachine, TransitionResult},
     protos::temporal::api::{
@@ -57,6 +64,7 @@ use temporalio_common::{
 };
 use temporalio_macros::fsm;
 use timer_state_machine::TimerMachine;
+use unsubscribe_notification_channel_state_machine::UnsubscribeNotificationChannelMachine;
 use update_state_machine::UpdateMachine;
 use upsert_search_attributes_state_machine::UpsertSearchAttributesMachine;
 use workflow_machines::MachineResponse;
@@ -85,6 +93,8 @@ enum Machines {
     ModifyWorkflowPropertiesMachine,
     UpdateMachine,
     NexusOperationMachine,
+    SubscribeNotificationChannelMachine,
+    UnsubscribeNotificationChannelMachine,
 }
 
 /// Extends [rustfsm::StateMachine] with some functionality specific to the temporal SDK.
