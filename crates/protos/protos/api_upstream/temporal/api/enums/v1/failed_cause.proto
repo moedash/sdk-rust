@@ -95,6 +95,14 @@ enum WorkflowTaskFailedCause {
     WORKFLOW_TASK_FAILED_CAUSE_BAD_SUBSCRIBE_NOTIFICATION_CHANNEL_ATTRIBUTES = 41;
     // An UnsubscribeNotificationChannel command named an empty or too-long channel.
     WORKFLOW_TASK_FAILED_CAUSE_BAD_UNSUBSCRIBE_NOTIFICATION_CHANNEL_ATTRIBUTES = 42;
+    // A workflow task completed with an invalid AppendStreamRecords command.
+    WORKFLOW_TASK_FAILED_CAUSE_BAD_APPEND_STREAM_RECORDS_ATTRIBUTES = 43;
+    // A workflow task completed with an invalid SubscribeStream command.
+    WORKFLOW_TASK_FAILED_CAUSE_BAD_SUBSCRIBE_STREAM_ATTRIBUTES = 44;
+    // A workflow task could not be started because a stream range it consumed and recorded in
+    // History can no longer be served, for example after truncation or because it exceeds the
+    // replay bound. Check the workflow task failure message for more information.
+    WORKFLOW_TASK_FAILED_CAUSE_STREAM_RANGE_UNAVAILABLE = 45;
 }
 
 // Activity tasks can fail for various reasons. Note that some of these reasons can only originate
