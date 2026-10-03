@@ -13,6 +13,7 @@ import "google/protobuf/empty.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/notification/v1/message.proto";
 import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
@@ -140,11 +141,26 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // 17 to 20 are taken by the external stream jobs, which are developed
+        // alongside this one and share this message. The number below is fixed
+        // with that family and must not be reused.
+        //
+        // Notifications from the channels the workflow subscribed to.
+        NotificationsReceived notifications_received = 21;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
         RemoveFromCache remove_from_cache = 50;
     }
+}
+
+// Hand a workflow the notifications the server folded for its channels.
+//
+// They come from the scheduled event of the Workflow Task this activation
+// belongs to. History is the record, so a replay yields the same job with the
+// same notifications at the same point.
+message NotificationsReceived {
+    repeated temporal.api.notification.v1.Notification notifications = 1;
 }
 
 // Initialize a new workflow

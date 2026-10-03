@@ -336,6 +336,12 @@ impl WorkflowFuture {
                         .context("Nexus operation must have result")?;
                     push_polled_context!(ActivationJobContext::Passive);
                 }
+                Variant::NotificationsReceived(_) => {
+                    // No channel API in this SDK, so nothing here subscribed, and a
+                    // notification carries no data a workflow could lose by this.
+                    debug!("Channel notifications received and ignored");
+                    push_polled_context!(ActivationJobContext::Passive);
+                }
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
                 }

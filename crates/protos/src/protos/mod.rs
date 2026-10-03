@@ -1277,6 +1277,9 @@ pub mod coresdk {
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
                         }
+                        workflow_activation_job::Variant::NotificationsReceived(n) => {
+                            write!(f, "NotificationsReceived({})", n.notifications.len())
+                        }
                     }
                 }
             }
