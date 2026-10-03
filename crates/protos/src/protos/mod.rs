@@ -1368,6 +1368,9 @@ pub mod coresdk {
                                 fin.reason()
                             )
                         }
+                        workflow_activation_job::Variant::NotificationsReceived(n) => {
+                            write!(f, "NotificationsReceived({})", n.notifications.len())
+                        }
                     }
                 }
             }
