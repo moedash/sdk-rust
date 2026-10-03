@@ -2178,7 +2178,27 @@ impl ManagedRun {
     /// activation, and notifications arriving while an activation is outstanding accumulate for
     /// the next one. There is never more than one outstanding activation per run.
     fn maybe_issue_external_stream_resolve(&mut self) {
-        if self.activation.is_some() || self.wft.is_none() || self.am_broken {
+        if self.activation.is_some() {
+            return;
+        }
+        self.queue_external_stream_resolve(false);
+    }
+
+    /// Queues the job without asking whether an activation is outstanding.
+    ///
+    /// Two callers are legal: the readiness path once no activation is outstanding, and the
+    /// completion path of the outstanding activation, after `apply_next_task_if_ready` and before
+    /// `prepare_complete_resp` picks the pending jobs up. Lang has finished that activation, so
+    /// the job lands on the next one. From anywhere else the job would ride an activation lang is
+    /// still working on, which breaks the one-outstanding-activation rule this run relies on.
+    /// `completing_outstanding_activation` is the caller saying which of the two it is.
+    fn queue_external_stream_resolve(&mut self, completing_outstanding_activation: bool) {
+        // Violating this reorders activations rather than crashing, so a release build has to say
+        // so as well; `debug_assert!` alone would leave it silent everywhere it matters.
+        if completing_outstanding_activation != self.activation.is_some() {
+            dbg_panic!("external stream resolve queued outside the readiness and completion paths");
+        }
+        if self.wft.is_none() || self.am_broken {
             return;
         }
         let set = &mut self.waiting_on_local_work.external_wait_set;
