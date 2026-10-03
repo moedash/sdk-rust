@@ -160,6 +160,15 @@ impl ManagedRun {
         self.waiting_on_local_work.local_activities.is_some()
     }
 
+    pub(super) fn retains_task_for_external_streams(&self) -> bool {
+        self.wft.is_some()
+            && (self.waiting_on_local_work.output_buffered
+                || matches!(
+                    self.external_stream_run_status(),
+                    ExternalStreamRunStatus::WftOpen
+                ))
+    }
+
     pub(super) fn have_seen_terminal_event(&self) -> bool {
         self.wfm.machines.have_seen_terminal_event
     }

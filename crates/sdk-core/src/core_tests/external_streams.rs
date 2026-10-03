@@ -9,7 +9,7 @@ use crate::{
     ExternalStreamReadyResult, ExternalStreamRunStatus, PollError,
     replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
-        MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt, build_fake_worker,
+        MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt, WorkerTestHelpers, build_fake_worker,
         build_mock_pollers, hist_to_poll_resp, mock_worker, query_ok, schedule_activity_cmd,
         start_timer_cmd,
     },
@@ -413,6 +413,111 @@ fn worker_counting_completions(
         w.max_cached_workflows = 1;
     });
     mock_worker(mock)
+}
+
+#[tokio::test]
+async fn zero_cache_keeps_a_retained_stream_task_until_its_boundary() {
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 0;
+    });
+    // Kept open so the eviction at the boundary can be polled after the mock's one task.
+    mock.make_wft_stream_interminable();
+    let worker = mock_worker(mock);
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id;
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            quiescent_command(1, &[1], Duration::from_secs(30)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::Accepted,
+        "disabling cache must not evict an incomplete retained Workflow Task"
+    );
+    assert_eq!(consume_resolve_activation(&worker, &run_id).await, vec![1]);
+    // The resolve activation completed with a timer, which does not retain the task, so the
+    // boundary has passed and the zero-sized cache lets the run go.
+    worker.handle_eviction().await;
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::RunNotFound,
+        "a retained task must be released once its boundary is reached"
+    );
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn zero_cache_keeps_a_task_with_buffered_output_until_the_flush() {
+    // The other reason a task is retained: output lang has buffered but not yet staged. The
+    // task has to survive the zero-sized cache until the flush deadline asks lang to finalize,
+    // and go once the flush has closed it.
+    let history = canned_histories::single_timer("1");
+    let manifest = output_manifest(history.get_orig_run_id(), 1, "zero-cache-stage-token");
+    let recorded: Arc<Mutex<Vec<ExternalStreamMarkerData>>> = Default::default();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
+    let collected = recorded.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| collected.lock().extend(stream_marker_data(wft)));
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 0;
+    });
+    mock.make_wft_stream_interminable();
+    let worker = mock_worker(mock);
+
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id;
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            output_buffered_command(Duration::from_millis(40)),
+        ))
+        .await
+        .unwrap();
+
+    // Retained: the flush deadline reaches this run rather than an eviction.
+    let flush = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        finalization_jobs(&flush),
+        vec![(0, ParkReason::OutputLatency, vec![])],
+        "disabling cache must not evict a task holding buffered output; jobs were {:?}",
+        flush.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                finalized_command(0, b""),
+                output_commit_command(manifest.clone()),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    worker.handle_eviction().await;
+    assert_eq!(
+        worker.notify_external_stream_ready(&run_id, 1, 0).await,
+        ExternalStreamReadyResult::RunNotFound,
+        "the flush closed the task, so nothing retains the run any longer"
+    );
+    {
+        let written = recorded.lock();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].output.as_ref(), Some(&manifest));
+    }
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
