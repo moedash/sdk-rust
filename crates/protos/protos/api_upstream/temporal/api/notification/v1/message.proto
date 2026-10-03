@@ -35,16 +35,12 @@ message Notification {
     // here what is true at `position`, such as which topic moved or a close
     // flag, never something a consumer must see once per write.
     map<string, temporal.api.common.v1.Payload> metadata = 4;
-
-    // Was temporal.api.common.v1.WorkflowExecution linked_to.
-    reserved 5;
-
     // Set for a channel linked to an execution: the owner and the run that
     // received the notification. Empty for an independent channel. A listener
     // that holds both kinds routes the notification by it.
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "to" names the owner the channel is linked to. --)
-    temporal.api.common.v1.Execution linked_to = 6;
+    temporal.api.common.v1.Execution linked_to = 5;
 }
 
 // A listener of a channel: a Workflow Execution woken with a Workflow Task, or
