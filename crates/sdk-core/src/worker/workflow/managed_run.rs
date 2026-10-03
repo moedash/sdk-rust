@@ -1437,6 +1437,18 @@ impl ManagedRun {
             if !completion.activation_was_eviction && !self.am_broken {
                 self.wfm.apply_next_task_if_ready()?;
             }
+            // A cold replay can reach a wake already contained in this History page, without
+            // admitting another server task. Its reconstructed waits must receive that wake
+            // before this task is reported empty and the zero-sized cache evicts them again.
+            if !self.wfm.machines.replaying && self.apply_external_stream_wakes() {
+                self.waiting_on_local_work
+                    .external_wait_set
+                    .set_wft_open(true);
+                // Lang has finished this activation; only its completion bookkeeping remains.
+                // Queue now so prepare_complete_resp sees pending work rather than reporting
+                // this task before finish_activation makes the next activation deliverable.
+                self.queue_external_stream_resolve(true);
+            }
             let new_local_acts = self.wfm.drain_queued_local_activities();
             self.sink_la_requests(new_local_acts)?;
 
