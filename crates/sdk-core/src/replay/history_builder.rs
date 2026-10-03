@@ -142,6 +142,16 @@ impl TestHistoryBuilder {
         self.previous_task_completed_id = id;
     }
 
+    /// Add the event a subscribe-stream command produces.
+    pub fn add_stream_subscribed(&mut self, stream_id: &str, start_offset: i64) -> i64 {
+        let attrs = WorkflowStreamSubscribedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            stream_id: stream_id.to_string(),
+            start_offset,
+        };
+        self.add(attrs)
+    }
+
     /// Add the event a subscribe-notification-channel command produces.
     pub fn add_notification_channel_subscribed(&mut self, channel: &str) -> i64 {
         let attrs = WorkflowNotificationChannelSubscribedEventAttributes {
@@ -163,6 +173,23 @@ impl TestHistoryBuilder {
             workflow_task_completed_event_id: self.previous_task_completed_id,
             channel: channel.to_string(),
             subscribed_event_id,
+        };
+        self.add(attrs)
+    }
+
+    /// Add the event an append-stream-records command produces. The range is
+    /// half-open, as it is on the event.
+    pub fn add_stream_records_appended(
+        &mut self,
+        stream_id: &str,
+        from_offset: i64,
+        to_offset: i64,
+    ) -> i64 {
+        let attrs = WorkflowStreamRecordsAppendedEventAttributes {
+            workflow_task_completed_event_id: self.previous_task_completed_id,
+            stream_id: stream_id.to_string(),
+            from_offset,
+            to_offset,
         };
         self.add(attrs)
     }
