@@ -68,6 +68,7 @@ use temporalio_common::{
             common::v1::SearchAttributes,
             enums::v1::EventType,
             history::v1::{HistoryEvent, history_event},
+            notification::v1::Notification,
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
         },
@@ -86,6 +87,11 @@ pub(crate) struct WorkflowMachines {
     /// kept because the lang side polls & completes for every workflow task, but we do not need
     /// to poll the server that often during replay.
     last_history_from_server: HistoryUpdate,
+    /// Channel notifications from the scheduled events of the task being applied, folded per
+    /// channel. The server clears what it put on a scheduled event, so a retry's event carries
+    /// only later arrivals, and a failed task's notifications reach lang only here, together
+    /// with the retry's.
+    pending_notifications: Vec<Notification>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
@@ -276,6 +282,7 @@ impl WorkflowMachines {
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
             drive_me: driven_wf,
+            pending_notifications: vec![],
             replaying,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -744,6 +751,13 @@ impl WorkflowMachines {
             }
             self.last_processed_event = eid;
         }
+        // One job for every scheduled event in the batch, so a failed task and its retry
+        // reach lang the way the server folds them.
+        if !self.pending_notifications.is_empty() {
+            let notifications = std::mem::take(&mut self.pending_notifications);
+            self.drive_me
+                .send_job(workflow_activation::NotificationsReceived { notifications }.into());
+        }
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
         #[allow(clippy::large_enum_variant)]
@@ -1019,6 +1033,15 @@ impl WorkflowMachines {
                 }
             }
             Ok(EventType::WorkflowTaskScheduled) => {
+                // The notifications ride on the event itself, so the same job
+                // comes out of it live and on replay with nothing to re-supply.
+                if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) =
+                    &event_dat.event.attributes
+                {
+                    for n in &a.notifications {
+                        fold_notification(&mut self.pending_notifications, n.clone());
+                    }
+                }
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
                 self.submachine_handle_event(key, event_dat)?;
@@ -1816,4 +1839,18 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+/// Keep one notification per channel, in order of first appearance. A later one replaces
+/// the held one only when its counter is strictly higher, so on a tie the held one stays,
+/// which is the rule the external lineage folds by.
+fn fold_notification(folded: &mut Vec<Notification>, n: Notification) {
+    match folded.iter_mut().find(|held| held.channel == n.channel) {
+        Some(held) => {
+            if n.counter > held.counter {
+                *held = n;
+            }
+        }
+        None => folded.push(n),
+    }
 }
