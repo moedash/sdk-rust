@@ -21,6 +21,7 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
+import "temporal/api/notification/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 
@@ -584,6 +585,32 @@ message NexusOperationCancellationInfo {
 
     // If the state is BLOCKED, blocked reason provides additional information.
     string blocked_reason = 7;
+}
+
+// A workflow's standing on a notification channel, as reported by DescribeWorkflowExecution.
+message ChannelSubscriptionInfo {
+    // Channel name.
+    string channel = 1;
+    // CHANNEL_KIND_INDEPENDENT for a channel the workflow subscribed to with a
+    // SubscribeNotificationChannel command. CHANNEL_KIND_LINKED for a channel linked to this
+    // workflow, which lists it once the channel holds any state.
+    temporal.api.notification.v1.ChannelKind kind = 2;
+    // Independent kind: id of the WorkflowNotificationChannelSubscribed event that recorded the
+    // subscription. Zero for the linked kind.
+    int64 subscribed_event_id = 3;
+    // Highest counter the workflow has accepted from the channel. Zero when none has arrived.
+    int64 last_counter = 4;
+    // The notification held for the workflow's next Workflow Task, when one is pending.
+    temporal.api.notification.v1.Notification pending_notification = 5;
+    // Counter carried by the scheduled event of a Workflow Task that has not started yet. Zero
+    // otherwise.
+    int64 scheduled_counter = 6;
+    // Linked kind: callback listeners registered on the channel.
+    int32 listener_count = 7;
+    // Linked kind: notifications retained for pollers.
+    int32 retained_count = 8;
+    // Linked kind: notifications the channel has accepted over its life.
+    int64 accepted_count = 9;
 }
 
 message WorkflowExecutionOptions {
