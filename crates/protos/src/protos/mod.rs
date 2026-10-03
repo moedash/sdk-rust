@@ -1368,6 +1368,9 @@ pub mod coresdk {
                                 fin.reason()
                             )
                         }
+                        workflow_activation_job::Variant::NotificationsReceived(n) => {
+                            write!(f, "NotificationsReceived({})", n.notifications.len())
+                        }
                     }
                 }
             }
@@ -1994,6 +1997,12 @@ pub mod temporal {
                                 CommandType::ScheduleActivityTask
                             }
                             Attributes::StartTimerCommandAttributes(_) => CommandType::StartTimer,
+                            Attributes::SubscribeNotificationChannelCommandAttributes(_) => {
+                                CommandType::SubscribeNotificationChannel
+                            }
+                            Attributes::UnsubscribeNotificationChannelCommandAttributes(_) => {
+                                CommandType::UnsubscribeNotificationChannel
+                            }
                             Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                 CommandType::CompleteWorkflowExecution
                             }
@@ -2506,6 +2515,8 @@ pub mod temporal {
                                 | EventType::TimerStarted
                                 | EventType::UpsertWorkflowSearchAttributes
                                 | EventType::WorkflowPropertiesModified
+                                | EventType::WorkflowNotificationChannelSubscribed
+                                | EventType::WorkflowNotificationChannelUnsubscribed
                                 | EventType::NexusOperationScheduled
                                 | EventType::NexusOperationCancelRequested
                                 | EventType::WorkflowExecutionCanceled
@@ -2605,6 +2616,12 @@ pub mod temporal {
                             // mark any new event types as ignorable or not.
                             if let Some(a) = self.attributes.as_ref() {
                                 match a {
+                                    Attributes::WorkflowNotificationChannelSubscribedEventAttributes(_) => {
+                                        false
+                                    }
+                                    Attributes::WorkflowNotificationChannelUnsubscribedEventAttributes(_) => {
+                                        false
+                                    }
                                     Attributes::WorkflowExecutionStartedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionCompletedEventAttributes(_) => false,
                                     Attributes::WorkflowExecutionFailedEventAttributes(_) => false,
@@ -2692,6 +2709,10 @@ pub mod temporal {
                         pub fn event_type(&self) -> EventType {
                             // I just absolutely _love_ this
                             match self {
+                            Attributes::WorkflowNotificationChannelSubscribedEventAttributes(_) => { EventType::WorkflowNotificationChannelSubscribed }
+                            Attributes::WorkflowNotificationChannelUnsubscribedEventAttributes(_) => {
+                                EventType::WorkflowNotificationChannelUnsubscribed
+                            }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
                             Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
                             Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }
@@ -2761,6 +2782,11 @@ pub mod temporal {
         pub mod namespace {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.namespace.v1");
+            }
+        }
+        pub mod notification {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.notification.v1");
             }
         }
         pub mod operatorservice {

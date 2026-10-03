@@ -669,6 +669,9 @@ async fn call_workflow_service(
         "DescribeBatchOperation" => {
             rpc_call_on_trait!(client, call, WorkflowService, describe_batch_operation)
         }
+        "DescribeChannel" => {
+            rpc_call_on_trait!(client, call, WorkflowService, describe_channel)
+        }
         "DescribeDeployment" => {
             rpc_call_on_trait!(client, call, WorkflowService, describe_deployment)
         }
@@ -802,6 +805,9 @@ async fn call_workflow_service(
         "ListWorkflowRules" => {
             rpc_call_on_trait!(client, call, WorkflowService, list_workflow_rules)
         }
+        "NotifyChannel" => {
+            rpc_call_on_trait!(client, call, WorkflowService, notify_channel)
+        }
         "PatchSchedule" => rpc_call_on_trait!(client, call, WorkflowService, patch_schedule),
         "PauseActivity" => rpc_call_on_trait!(client, call, WorkflowService, pause_activity),
         "PauseActivityExecution" => {
@@ -809,6 +815,9 @@ async fn call_workflow_service(
         }
         "PauseWorkflowExecution" => {
             rpc_call_on_trait!(client, call, WorkflowService, pause_workflow_execution)
+        }
+        "PollChannel" => {
+            rpc_call_on_trait!(client, call, WorkflowService, poll_channel)
         }
         "PollActivityExecution" => {
             rpc_call_on_trait!(client, call, WorkflowService, poll_activity_execution)
@@ -861,6 +870,9 @@ async fn call_workflow_service(
         }
         "RecordWorkerHeartbeat" => {
             rpc_call_on_trait!(client, call, WorkflowService, record_worker_heartbeat)
+        }
+        "RegisterChannelListener" => {
+            rpc_call_on_trait!(client, call, WorkflowService, register_channel_listener)
         }
         "RegisterNamespace" => {
             rpc_call_on_trait!(client, call, WorkflowService, register_namespace)
@@ -1029,6 +1041,9 @@ async fn call_workflow_service(
         }
         "TriggerWorkflowRule" => {
             rpc_call_on_trait!(client, call, WorkflowService, trigger_workflow_rule)
+        }
+        "UnregisterChannelListener" => {
+            rpc_call_on_trait!(client, call, WorkflowService, unregister_channel_listener)
         }
         "UnpauseActivity" => {
             rpc_call_on_trait!(client, call, WorkflowService, unpause_activity)
