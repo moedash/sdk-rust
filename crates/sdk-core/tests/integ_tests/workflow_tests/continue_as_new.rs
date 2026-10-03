@@ -12,13 +12,14 @@ use temporalio_common::{
     search_attributes::{SearchAttributeKey, SearchAttributes},
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ContinueAsNewOptions, WorkflowContext, WorkflowResult, WorkflowTermination};
+use temporalio_sdk::{
+    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, WorkflowContext, WorkflowResult,
+};
 use temporalio_sdk_core::{
     TunerHolder,
     replay::{DEFAULT_WORKFLOW_TYPE, canned_histories},
     test_help::MockPollCfg,
 };
-use temporalio_workflow::runtime::types::ContinueAsNewRequest;
 
 const SA_TXT: SearchAttributeKey<String> = SearchAttributeKey::text(SEARCH_ATTR_TXT);
 
@@ -60,12 +61,61 @@ async fn continue_as_new_happy_path() {
     worker.run_until_done().await.unwrap();
 }
 
+#[workflow]
+#[derive(Default)]
+struct ContinueAsNewRandomWf;
+
+#[workflow_methods]
+impl ContinueAsNewRandomWf {
+    #[run]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        previous_value: Option<u64>,
+    ) -> WorkflowResult<(u64, u64)> {
+        let value = ctx.random_stream("continue-as-new-test").random::<u64>();
+        if ctx.info().continued_from_run_id().is_none() {
+            ctx.continue_as_new(Some(value), ContinueAsNewOptions::default())?;
+        }
+        Ok((
+            previous_value.expect("first run should pass its stream value"),
+            value,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn continue_as_new_reseeds_named_random_streams() {
+    let wf_name = "continue_as_new_reseeds_named_random_streams";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<ContinueAsNewRandomWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            ContinueAsNewRandomWf::run,
+            None,
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    let (first_value, continued_value) = handle.get_result(Default::default()).await.unwrap();
+    assert_ne!(
+        first_value, continued_value,
+        "continue-as-new should independently seed named streams"
+    );
+}
+
 #[tokio::test]
 async fn continue_as_new_multiple_concurrent() {
     let wf_name = "continue_as_new_multiple_concurrent";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.max_cached_workflows = 5_usize;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 1, 1, 1)));
     starter
         .sdk_config
         .register_workflow::<ContinueAsNewWf>()
@@ -96,14 +146,17 @@ impl WfWithTimer {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
-        Err(WorkflowTermination::continue_as_new(ContinueAsNewRequest {
-            arguments: vec![[1].into()],
-            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::AutoUpgrade.into(),
-            ..Default::default()
-        }))
+        ctx.continue_as_new(
+            (),
+            ContinueAsNewOptions::builder()
+                .initial_versioning_behavior(ContinueAsNewVersioningBehavior::AutoUpgrade)
+                .build(),
+        )?;
+        Ok(())
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn wf_completing_with_continue_as_new() {
     let t = canned_histories::timer_then_continue_as_new("1");
@@ -154,6 +207,7 @@ impl ContinueAsNewSuggestedWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn continue_as_new_suggested_flag_exposed() {
     let mut t = canned_histories::timer_then_continue_as_new("1");
@@ -195,6 +249,10 @@ impl ClearSearchAttrsOnContinueAsNewWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Uses a custom search attribute that isolated Cloud CI does not provision."
+)]
 #[tokio::test]
 async fn clear_search_attributes_on_continue_as_new() {
     let wf_name = "clear_search_attrs_on_continue_as_new";

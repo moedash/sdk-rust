@@ -121,7 +121,7 @@ impl FailurePayloadActivities {
             "codec-heartbeat-details".to_string(),
         )))
         .await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        ctx.cancelled().await;
         Ok(())
     }
 }
@@ -159,7 +159,7 @@ impl FailureConverter for FailingFailureConverter {
         payload_converter: &PayloadConverter,
         context: &SerializationContextData,
     ) -> Result<IncomingError, PayloadConversionError> {
-        DefaultFailureConverter.to_error(failure, payload_converter, context)
+        DefaultFailureConverter::default().to_error(failure, payload_converter, context)
     }
 }
 
@@ -441,9 +441,12 @@ async fn custom_failure_converter_fallback_applied_to_activity_panic_failures() 
     worker.run_until_done().await.unwrap();
     handle.get_result(Default::default()).await.unwrap();
 
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    let activity_failure = history
+    let history = handle
+        .fetch_history(Default::default())
         .into_events()
+        .await
+        .unwrap();
+    let activity_failure = history
         .into_iter()
         .find_map(|event| match event.attributes {
             Some(Attributes::ActivityTaskFailedEventAttributes(attrs)) => attrs.failure,
@@ -717,9 +720,9 @@ async fn multi_args_serializes_as_multiple_payloads() {
     let events = client
         .get_workflow_handle::<UntypedWorkflow>(wf_name)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
 
     let workflow_started_event = events
         .iter()
@@ -754,6 +757,60 @@ async fn multi_args_serializes_as_multiple_payloads() {
     let second_payload_data: i32 =
         serde_json::from_slice(&input_payloads.payloads[1].data).unwrap();
     assert_eq!(second_payload_data, 42);
+}
+
+#[workflow]
+#[derive(Default)]
+struct BinaryNullWorkflow;
+
+#[workflow_methods]
+impl BinaryNullWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>, input: Option<String>) -> WorkflowResult<()> {
+        assert_eq!(input, None);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn option_none_workflow_input_is_recorded_as_binary_null() {
+    let wf_name = BinaryNullWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<BinaryNullWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let handle = worker
+        .submit_workflow(
+            BinaryNullWorkflow::run,
+            Option::<String>::None,
+            WorkflowStartOptions::new(starter.get_task_queue(), wf_name).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let events = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    let input = events
+        .iter()
+        .find_map(|event| match event.attributes.as_ref() {
+            Some(Attributes::WorkflowExecutionStartedEventAttributes(attributes)) => {
+                attributes.input.as_ref()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input.payloads.len(), 1);
+    assert_eq!(
+        input.payloads[0].metadata.get("encoding").unwrap(),
+        b"binary/null"
+    );
+    assert!(input.payloads[0].data.is_empty());
 }
 
 /// A codec that XORs payload data with a key and tracks encode/decode operations.
@@ -877,10 +934,10 @@ impl PayloadCodec for FailOnceCodec {
             (self.failure_point, context),
             (
                 CodecFailurePoint::WorkflowEncode,
-                SerializationContextData::Workflow
+                SerializationContextData::Workflow(_)
             ) | (
                 CodecFailurePoint::ActivityEncode,
-                SerializationContextData::Activity
+                SerializationContextData::Activity(_)
             )
         );
         let marker = if matches!(self.failure_point, CodecFailurePoint::WorkflowEncode) {
@@ -920,10 +977,10 @@ impl PayloadCodec for FailOnceCodec {
             (self.failure_point, context),
             (
                 CodecFailurePoint::WorkflowDecode,
-                SerializationContextData::Workflow
+                SerializationContextData::Workflow(_)
             ) | (
                 CodecFailurePoint::ActivityDecode,
-                SerializationContextData::Activity
+                SerializationContextData::Activity(_)
             )
         );
         let matches_payload = payloads.iter().any(|payload| {
@@ -961,7 +1018,7 @@ async fn codec_errors_fail_tasks_and_retry(#[case] failure_point: CodecFailurePo
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1009,7 +1066,7 @@ async fn codec_encodes_and_decodes_payloads() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1067,7 +1124,7 @@ async fn describe_decodes_workflow_payload_fields() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1145,7 +1202,7 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1209,7 +1266,7 @@ async fn codec_roundtrips_activity_cancellation_details() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1258,7 +1315,7 @@ async fn codec_roundtrips_activity_heartbeat_timeout_details() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())

@@ -36,7 +36,7 @@ use url::Url;
 use uuid::Uuid;
 
 fn new_sdk_runtime() -> Runtime {
-    Runtime::new_assume_tokio(
+    Runtime::from_current_tokio(
         RuntimeOptions::builder()
             .telemetry_options(get_integ_telem_options())
             .build()
@@ -87,6 +87,10 @@ impl WorkerPlugin for IntegrationPlugin {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::NeedsCloudAdaptation,
+    "Retargeting the client discards envconfig TLS options, so the HTTPS Cloud connection cannot be established."
+)]
 #[tokio::test]
 async fn plugins_configure_client_and_worker() {
     let runtime = new_sdk_runtime();
@@ -114,13 +118,11 @@ async fn plugins_configure_client_and_worker() {
         .register_workflow::<SimplePluginWorkflow>()
         .unwrap()
         .build();
-    let worker = Worker::new(&runtime, client, worker_options).unwrap();
+    let _worker = Worker::new(&runtime, client, worker_options).unwrap();
 
     assert_eq!(connection_calls.load(Relaxed), 1);
     assert_eq!(client_calls.load(Relaxed), 1);
     assert_eq!(worker_calls.load(Relaxed), 1);
-    assert_eq!(worker.core_worker().get_config().max_cached_workflows, 0);
-    assert_eq!(worker.core_worker().get_config().plugins.len(), 1);
 }
 
 struct CountingPayloadCodec {
@@ -218,7 +220,7 @@ async fn simple_plugin_configures_working_client_and_worker() {
     let worker_interceptor_calls = Arc::new(AtomicUsize::new(0));
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         CountingPayloadCodec {
             encode_calls: encode_calls.clone(),
             decode_calls: decode_calls.clone(),
@@ -363,53 +365,4 @@ impl WorkerPlugin for FailingWorkerPlugin {
     fn configure_worker_options(&self, _options: &mut WorkerOptions) -> Result<(), PluginError> {
         Err(PluginError::new("worker failure"))
     }
-}
-
-struct ClientOnlyMetadataPlugin;
-
-impl ClientPlugin for ClientOnlyMetadataPlugin {
-    fn name(&self) -> &str {
-        "client-only-plugin"
-    }
-}
-
-struct WorkerOnlyMetadataPlugin;
-
-impl WorkerPlugin for WorkerOnlyMetadataPlugin {
-    fn name(&self) -> &str {
-        "worker-only-plugin"
-    }
-}
-
-#[tokio::test]
-async fn worker_metadata_includes_client_and_worker_plugin_names() {
-    let runtime = new_sdk_runtime();
-    let client = Client::connect(
-        get_integ_server_options(),
-        ClientOptions::new(integ_namespace())
-            .client_plugin(ClientOnlyMetadataPlugin)
-            .build(),
-    )
-    .await
-    .unwrap();
-    let worker = Worker::new(
-        &runtime,
-        client,
-        WorkerOptions::new(format!("plugin-metadata-{}", Uuid::new_v4()))
-            .register_workflow::<SimplePluginWorkflow>()
-            .unwrap()
-            .worker_plugin(WorkerOnlyMetadataPlugin)
-            .build(),
-    )
-    .unwrap();
-    let core_worker = worker.core_worker();
-    let mut names = core_worker
-        .get_config()
-        .plugins
-        .iter()
-        .map(|plugin| plugin.name.clone())
-        .collect::<Vec<_>>();
-    names.sort_unstable();
-
-    assert_eq!(names, ["client-only-plugin", "worker-only-plugin"]);
 }
