@@ -100,6 +100,8 @@ pub(crate) struct WorkflowMachines {
     /// only later arrivals, and a failed task's notifications reach lang only here, together
     /// with the retry's.
     pending_notifications: Vec<Notification>,
+    /// Set when notifications were handed to lang and the run's wait set has not seen them yet.
+    pending_notification_wake: bool,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// Reserved external stream wake Signals seen in history, decoded and suppressed from user
@@ -306,6 +308,7 @@ impl WorkflowMachines {
             run_id: basics.run_id,
             drive_me: driven_wf,
             pending_notifications: vec![],
+            pending_notification_wake: false,
             replaying,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -593,6 +596,12 @@ impl WorkflowMachines {
     /// split: decode and suppress here, classify there.
     pub(crate) fn take_external_stream_wakes(&mut self) -> Vec<external_stream::WakeSignal> {
         std::mem::take(&mut self.pending_external_stream_wakes)
+    }
+
+    /// Whether notifications reached lang since the last call. They come from History, so a
+    /// replay reports the same as the live run did.
+    pub(crate) fn take_notification_wake(&mut self) -> bool {
+        std::mem::take(&mut self.pending_notification_wake)
     }
 
     /// Queue a Core-generated job for lang.
@@ -912,6 +921,7 @@ impl WorkflowMachines {
             let notifications = std::mem::take(&mut self.pending_notifications);
             self.drive_me
                 .send_job(workflow_activation::NotificationsReceived { notifications }.into());
+            self.pending_notification_wake = true;
         }
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
