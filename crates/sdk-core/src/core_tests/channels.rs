@@ -2,8 +2,8 @@ use crate::{
     init_replay_worker,
     replay::{HistoryFeeder, HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
-        MockPollCfg, ResponseType, WorkerTestHelpers, build_mock_pollers, mock_worker,
-        test_worker_cfg,
+        MockPollCfg, PollWFTRespExt, ResponseType, WorkerTestHelpers, build_mock_pollers,
+        hist_to_poll_resp, mock_worker, test_worker_cfg,
     },
     worker::client::mocks::mock_worker_client,
 };
@@ -351,6 +351,7 @@ fn job_kinds(task: &WorkflowActivation) -> Vec<&'static str> {
         .map(|j| match j.variant.as_ref().unwrap() {
             workflow_activation_job::Variant::InitializeWorkflow(_) => "init",
             workflow_activation_job::Variant::NotificationsReceived(_) => "notifications",
+            workflow_activation_job::Variant::DeliverStreamRecords(_) => "stream",
             _ => "other",
         })
         .collect()
@@ -366,6 +367,34 @@ fn one_task_with_notifications() -> TestHistoryBuilder {
     ]);
     t.add_workflow_task_started();
     t
+}
+
+/// The notifications on the scheduled event reach the activation of that task,
+/// as one job, ahead of the stream ranges the same task was handed.
+#[tokio::test]
+async fn notifications_on_the_scheduled_event_reach_the_live_activation() {
+    let t = one_task_with_notifications();
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory);
+    poll_resp.add_stream_slice("s1", 0, 0, &["alpha"]);
+
+    let mock = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [ResponseType::Raw(poll_resp.resp)],
+        mock_worker_client(),
+    );
+    let core = mock_worker(build_mock_pollers(mock));
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert!(!task.is_replaying);
+    assert_eq!(job_kinds(&task), vec!["init", "notifications", "stream"]);
+    assert_eq!(
+        received(&task),
+        vec![vec![notification("orders", 3), notification("invoices", 7)]]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
 }
 
 /// Replaying the same history yields the same job. Nothing is re-supplied: the
