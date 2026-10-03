@@ -115,6 +115,9 @@ relevant information.
 * Workers now warn when autoscaling task polling encounters errors continuously for one minute.
   Repeated warnings use exponential backoff up to 15-minute intervals and stop after polling
   recovers.
+* Workers with caching disabled now keep an incomplete retained external stream task until its
+  normal boundary, as they do for local Activities. This prevents repeated shutdown markers and
+  replacement tasks from starving asynchronous input readiness.
 * External stream wake Signals encountered while replay advances through a History page now
   resume reconstructed subscriptions. Workers with caching disabled no longer complete repeated
   empty tasks while unread records remain in the external store.
