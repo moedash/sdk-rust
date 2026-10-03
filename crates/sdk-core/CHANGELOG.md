@@ -109,6 +109,11 @@ relevant information.
 * Workers now warn when autoscaling task polling encounters errors continuously for one minute.
   Repeated warnings use exponential backoff up to 15-minute intervals and stop after polling
   recovers.
+* Workflow-originated external output no longer forces an empty replacement task from an old
+  stream wait after Workflow code has resumed and is awaiting an Activity or timer. This avoids
+  delaying that result behind an unnecessary task timeout. A completion that stages a commit and
+  reports output still buffered does keep forcing one, since the max publish latency it asked for
+  can only be honored while a task is held.
 * Workers now defensively buffer a replacement workflow task if it reaches a run that still owns
   one, preserving the outstanding task token in release builds.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before they

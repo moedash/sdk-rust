@@ -1309,6 +1309,18 @@ impl ManagedRun {
             || park_retains
             || self.waiting_on_local_work.external_wait_set.retains_wft()
             || self.waiting_on_local_work.output_buffered;
+        // A registered wait can belong to a previous task whose input has since resumed lang.
+        // Only a current wait (or a query-only activation preserving that wait) justifies an
+        // output replacement. Otherwise an empty forced task can buffer the Activity or timer
+        // result that lang is actually waiting for until the task times out.
+        //
+        // Buffered output is not one of those stale waits. Staging the commit clears the flag, so
+        // it can only be set here by a `WorkflowOutputStreamBuffered` on this same completion, and
+        // the flush deadline it asks for fires into nothing once the task is gone.
+        let output_waits_need_replacement = stream_commands.quiescence.is_some()
+            || park_retains
+            || self.waiting_on_local_work.output_buffered
+            || (answering_a_query && self.waiting_on_local_work.external_wait_set.retains_wft());
         let query_refused_retention = stream_waits_still_pending
             && !boundary_closes_the_run
             && !has_server_bound_commands
@@ -1505,7 +1517,7 @@ impl ManagedRun {
                         || completing_shutdown
                         || completing_output_capacity
                         || completing_output_latency
-                        || (output_commit_pending && stream_waits_still_pending),
+                        || (output_commit_pending && output_waits_need_replacement),
                 )))
             }
             Ok(Some((start_t, wft_timeout))) => {
