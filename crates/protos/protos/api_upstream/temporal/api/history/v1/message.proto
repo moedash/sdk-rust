@@ -17,6 +17,7 @@ import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/update.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/notification/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
@@ -302,6 +303,10 @@ message WorkflowTaskScheduledEventAttributes {
     google.protobuf.Duration start_to_close_timeout = 2;
     // Starting at 1, how many attempts there have been to complete this task
     int32 attempt = 3;
+    // Notifications for channels this Workflow listens to, folded per channel
+    // since the last task was scheduled. In History so a Workflow may act on
+    // them deterministically and replay sees the same.
+    repeated temporal.api.notification.v1.Notification notifications = 4;
 }
 
 message WorkflowTaskStartedEventAttributes {
@@ -953,6 +958,26 @@ message ActivityPropertiesModifiedExternallyEventAttributes {
     temporal.api.common.v1.RetryPolicy new_retry_policy = 2;
 }
 
+message WorkflowNotificationChannelSubscribedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command created this
+    // subscription.
+    int64 workflow_task_completed_event_id = 1;
+    // The channel the Workflow listens on for the rest of this run.
+    string channel = 2;
+}
+
+message WorkflowNotificationChannelUnsubscribedEventAttributes {
+    // The WorkflowTaskCompleted event of the task whose command ended this
+    // subscription.
+    int64 workflow_task_completed_event_id = 1;
+    // The channel the Workflow stopped listening on.
+    string channel = 2;
+    // The WorkflowNotificationChannelSubscribed event that recorded the
+    // subscription this command ended. Zero when the run held no subscription
+    // for the channel.
+    int64 subscribed_event_id = 3;
+}
+
 message WorkflowExecutionUpdateAcceptedEventAttributes {
     // The instance ID of the update protocol that generated this event.
     string protocol_instance_id = 1;
@@ -1276,6 +1301,10 @@ message HistoryEvent {
         WorkflowExecutionPausedEventAttributes workflow_execution_paused_event_attributes = 63;
         WorkflowExecutionUnpausedEventAttributes workflow_execution_unpaused_event_attributes = 64;
         WorkflowExecutionTimeSkippingTransitionedEventAttributes workflow_execution_time_skipping_transitioned_event_attributes = 65;
+        WorkflowNotificationChannelSubscribedEventAttributes
+            workflow_notification_channel_subscribed_event_attributes = 66;
+        WorkflowNotificationChannelUnsubscribedEventAttributes
+            workflow_notification_channel_unsubscribed_event_attributes = 67;
     }
 }
 
