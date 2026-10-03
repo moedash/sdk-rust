@@ -13,6 +13,7 @@ import "google/protobuf/empty.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/notification/v1/message.proto";
@@ -42,6 +43,8 @@ import "temporal/sdk/core/workflow_commands/workflow_commands.proto";
 // * Patches are expected to apply to the entire activation
 // * Signal and update handlers should be invoked before workflow routines are iterated. That is to
 //  say before the users' main workflow function and anything spawned by it is allowed to continue.
+// * Channel notifications are input from outside the workflow, like signals, so they go with
+//  them and ahead of the stream ranges among the other jobs.
 // * Local activities resolutions go after other normal jobs because while *not* replaying, they
 //  will always take longer than anything else that produces an immediate job (which is
 //  effectively instant). When *replaying* we need to scan ahead for LA markers so that we can
@@ -156,8 +159,13 @@ message WorkflowActivationJob {
         // Runtime-internal: encode the terminal boundary for a marker Core is about to write.
         // Runs no user code.
         FinalizeExternalStreams finalize_external_streams = 20;
+        // The numbers below are shared with the native stream tree, which leaves 17
+        // to 20 to the jobs above, and must not be reused.
+        //
         // Notifications from the channels the workflow subscribed to.
         NotificationsReceived notifications_received = 21;
+        // A range of a stream the workflow subscribed to.
+        DeliverStreamRecords deliver_stream_records = 22;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -229,6 +237,25 @@ message FinalizeExternalStreams {
     repeated coresdk.workflow_commands.ExternalStreamWait waits = 2;
     // One of PARK_REASON_ROLLOVER or PARK_REASON_SHUTDOWN.
     coresdk.external_data.ParkReason reason = 3;
+}
+
+// Hand a workflow the next range of a stream it subscribed to.
+//
+// The range is delivered once, on the task the server decided it belongs to,
+// and the offsets it covered are recorded in History rather than the payloads.
+// On replay the server re-supplies the same range by reading the stream again,
+// so this job appears at the same point with the same contents both times.
+//
+// An empty range is still delivered: a task where the subscription saw nothing
+// is a fact replay has to reproduce, not an absence of one.
+message DeliverStreamRecords {
+    // Id of the stream this range came from.
+    string stream_id = 1;
+    // Inclusive.
+    int64 from_offset = 2;
+    // Exclusive. Equal to from_offset when the subscription saw nothing.
+    int64 to_offset = 3;
+    repeated temporal.api.stream.v1.StreamRecord records = 4;
 }
 
 // Initialize a new workflow
