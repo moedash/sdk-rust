@@ -1,22 +1,33 @@
 use crate::{
-    ClientInterceptor, ClientPlugin, ErasedClientPlugin, HttpConnectProxyOptions, RetryOptions,
-    RpcOptions, VERSION, callback_based,
+    ClientInterceptor, HttpConnectProxyOptions, RetryOptions, RpcOptions, VERSION, callback_based,
 };
+#[cfg(feature = "experimental")]
+use crate::{ClientPlugin, ErasedClientPlugin};
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
-    RetryPolicy,
-    data_converters::DataConverter,
+    ActivityCloseTimeouts, MemoValues, RetryPolicy,
+    data_converters::{
+        DataConverter, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
+        SerializationContext, SerializationContextData, WorkflowSerializationContext,
+    },
+    payload_visitor::encode_payloads,
     protos::temporal::api::{
         common::{
             self,
-            v1::{Header, Payloads},
+            v1::{Header, Memo as ProtoMemo, Payloads},
         },
         enums::v1::{
-            ArchivalState, HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
-            WorkflowIdReusePolicy,
+            ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
+            ActivityIdReusePolicy as ProtoActivityIdReusePolicy,
+            ArchivalState as ProtoArchivalState,
+            HistoryEventFilterType as ProtoHistoryEventFilterType,
+            QueryRejectCondition as ProtoQueryRejectCondition,
+            WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+            WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
         },
         replication::v1::ClusterReplicationConfig,
+        sdk::v1::UserMetadata,
         workflowservice::v1::RegisterNamespaceRequest,
     },
     search_attributes::SearchAttributes,
@@ -26,6 +37,9 @@ use temporalio_common::{
 use tokio_rustls::rustls::client::ResolvesClientCert;
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use url::Url;
+
+pub(crate) const DEFAULT_PAYLOADS_WARN_SIZE: u64 = 512 * 1024;
+pub(crate) const DEFAULT_MEMO_WARN_SIZE: u64 = 2 * 1024;
 
 /// Options for [crate::Connection::connect].
 #[derive(bon::Builder, Clone, Debug)]
@@ -99,6 +113,14 @@ pub struct ConnectionOptions {
     /// Payload size limit options for this connection. Defaults to the standard warning thresholds;
     /// disable an individual warning by setting its threshold to `0`.
     /// NOTE: Experimental
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(
+        docsrs,
+        builder(setters(
+            some_fn(name = payload_limits_impl, vis = "pub(crate)"),
+            option_fn(name = maybe_payload_limits_impl, vis = "pub(crate)")
+        ))
+    )]
     #[builder(default)]
     pub payload_limits: PayloadLimitsOptions,
 
@@ -119,6 +141,35 @@ pub struct ConnectionOptions {
     #[builder(default = VERSION.to_owned())]
     #[cfg_attr(feature = "core-based-sdk", builder(setters(vis = "pub")))]
     pub(crate) client_version: String,
+}
+
+// Bon does not propagate `doc(cfg)` to generated setters, so these docs-only methods forward to
+// renamed generated implementations.
+#[cfg(all(feature = "experimental", docsrs))]
+impl<S: connection_options_builder::State> ConnectionOptionsBuilder<S> {
+    /// Set the payload size limit options for this connection.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn payload_limits(
+        self,
+        value: PayloadLimitsOptions,
+    ) -> ConnectionOptionsBuilder<connection_options_builder::SetPayloadLimits<S>>
+    where
+        S::PayloadLimits: connection_options_builder::IsUnset,
+    {
+        self.payload_limits_impl(value)
+    }
+
+    /// Set the payload size limit options for this connection from an optional value.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn maybe_payload_limits(
+        self,
+        value: Option<PayloadLimitsOptions>,
+    ) -> ConnectionOptionsBuilder<connection_options_builder::SetPayloadLimits<S>>
+    where
+        S::PayloadLimits: connection_options_builder::IsUnset,
+    {
+        self.maybe_payload_limits_impl(value)
+    }
 }
 
 // Setters/getters for fields that should only be touched by SDK implementers.
@@ -153,10 +204,12 @@ pub struct ClientOptions {
 
     #[builder(field)]
     #[debug(skip)]
+    #[cfg(feature = "experimental")]
     plugins: Vec<ErasedClientPlugin>,
 
     #[builder(field)]
     #[debug(skip)]
+    #[cfg(feature = "experimental")]
     client_plugins_applied: bool,
 
     /// The data converter used for serializing/deserializing payloads.
@@ -168,6 +221,7 @@ pub struct ClientOptions {
     pub client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
 }
 
+#[cfg(feature = "experimental")]
 impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register a type-erased client plugin.
     ///
@@ -204,14 +258,17 @@ impl ClientOptions {
     /// This is intended for SDK integrations that propagate worker plugin registrations.
     ///
     /// **Experimental:** This API may change or be removed.
+    #[cfg(feature = "experimental")]
     pub fn plugins(&self) -> &[ErasedClientPlugin] {
         &self.plugins
     }
 
+    #[cfg(feature = "experimental")]
     pub(crate) fn client_plugins_applied(&self) -> bool {
         self.client_plugins_applied
     }
 
+    #[cfg(feature = "experimental")]
     pub(crate) fn mark_client_plugins_applied(&mut self) {
         self.client_plugins_applied = true;
     }
@@ -346,19 +403,21 @@ impl Default for DnsLoadBalancingOptions {
 
 /// Payload size limit options for a connection.
 /// NOTE: Experimental
+#[cfg(feature = "experimental")]
 #[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
     /// fields are logged but still sent to server. Defaults to 512 KiB. Set to `0` to disable.
-    #[builder(default = 512 * 1024)]
+    #[builder(default = DEFAULT_PAYLOADS_WARN_SIZE)]
     pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are logged but still
     /// sent to server. Defaults to 2 KiB. Set to `0` to disable.
-    #[builder(default = 2 * 1024)]
+    #[builder(default = DEFAULT_MEMO_WARN_SIZE)]
     pub memo_warn_size: u64,
 }
 
+#[cfg(feature = "experimental")]
 impl Default for PayloadLimitsOptions {
     fn default() -> Self {
         Self::builder().build()
@@ -369,6 +428,59 @@ impl std::fmt::Debug for ClientTlsOptions {
     // Intentionally omit details here since they could leak a key if ever printed
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ClientTlsOptions(..)")
+    }
+}
+
+/// Controls whether a closed workflow ID may be reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum WorkflowIdReusePolicy {
+    /// Use the server's default policy.
+    #[default]
+    Unspecified,
+    /// Allow starting a workflow using the same workflow ID.
+    AllowDuplicate,
+    /// Allow reuse only when the previous execution did not complete successfully.
+    AllowDuplicateFailedOnly,
+    /// Reject reuse of the workflow ID.
+    RejectDuplicate,
+}
+
+impl From<WorkflowIdReusePolicy> for ProtoWorkflowIdReusePolicy {
+    fn from(value: WorkflowIdReusePolicy) -> Self {
+        match value {
+            WorkflowIdReusePolicy::Unspecified => Self::Unspecified,
+            WorkflowIdReusePolicy::AllowDuplicate => Self::AllowDuplicate,
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly => Self::AllowDuplicateFailedOnly,
+            WorkflowIdReusePolicy::RejectDuplicate => Self::RejectDuplicate,
+        }
+    }
+}
+
+/// Controls how starting a workflow resolves a conflict with a running workflow using the same
+/// workflow ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum WorkflowIdConflictPolicy {
+    /// Use the server's default policy.
+    #[default]
+    Unspecified,
+    /// Do not start a new workflow and return an already-started error.
+    Fail,
+    /// Do not start a new workflow and return a handle for the running workflow.
+    UseExisting,
+    /// Terminate the running workflow before starting a new one.
+    TerminateExisting,
+}
+
+impl From<WorkflowIdConflictPolicy> for ProtoWorkflowIdConflictPolicy {
+    fn from(value: WorkflowIdConflictPolicy) -> Self {
+        match value {
+            WorkflowIdConflictPolicy::Unspecified => Self::Unspecified,
+            WorkflowIdConflictPolicy::Fail => Self::Fail,
+            WorkflowIdConflictPolicy::UseExisting => Self::UseExisting,
+            WorkflowIdConflictPolicy::TerminateExisting => Self::TerminateExisting,
+        }
     }
 }
 
@@ -410,18 +522,13 @@ pub struct WorkflowStartOptions {
     /// Additional search attributes for the workflow.
     pub search_attributes: Option<SearchAttributes>,
 
-    /// Optionally enable Eager Workflow Start, a latency optimization using local workers
-    /// NOTE: Experimental
+    /// Optionally enable Eager Workflow Start, a latency optimization using local workers.
     #[builder(default)]
     pub enable_eager_workflow_start: bool,
 
     /// Optionally set a retry policy for the workflow
     #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
-
-    /// If set, send a signal to the workflow atomically with start.
-    /// The workflow will receive this signal before its first task.
-    pub start_signal: Option<WorkflowStartSignal>,
 
     /// Links to associate with the workflow. Ex: References to a nexus operation.
     #[builder(default)]
@@ -439,6 +546,9 @@ pub struct WorkflowStartOptions {
     /// Headers to include with the start request.
     pub header: Option<Header>,
 
+    /// Non-indexed values attached to the workflow, serialized with the client's data converter.
+    pub memo: Option<MemoValues>,
+
     /// Single-line static summary for the workflow, shown in the Temporal UI.
     pub static_summary: Option<String>,
 
@@ -450,19 +560,184 @@ pub struct WorkflowStartOptions {
     pub rpc_options: RpcOptions,
 }
 
-/// A signal to send atomically when starting a workflow.
-/// Use with `WorkflowStartOptions::start_signal` to achieve signal-with-start behavior.
+impl WorkflowStartOptions {
+    pub(crate) async fn encoded_memo(
+        &self,
+        data_converter: &DataConverter,
+    ) -> Result<Option<ProtoMemo>, PayloadConversionError> {
+        let Some(memo) = &self.memo else {
+            return Ok(None);
+        };
+
+        let payload_converter = data_converter.payload_converter();
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let context = SerializationContext::new(&context_data, payload_converter);
+        let mut memo = ProtoMemo {
+            fields: memo
+                .iter()
+                .map(|(key, value)| {
+                    payload_converter
+                        .to_payload(&context, value)
+                        .map(|payload| (key.to_owned(), payload))
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        encode_payloads(
+            &mut memo,
+            data_converter.codec(),
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+        )
+        .await?;
+        Ok(Some(memo))
+    }
+
+    pub(crate) fn user_metadata(&self) -> Option<UserMetadata> {
+        (self.static_summary.is_some() || self.static_details.is_some()).then(|| {
+            let payload_converter = PayloadConverter::default();
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let context = SerializationContext::new(&context_data, &payload_converter);
+            UserMetadata {
+                summary: self.static_summary.as_ref().map(|summary| {
+                    payload_converter
+                        .to_payload(&context, summary)
+                        .expect("String-to-JSON payload serialization is infallible")
+                }),
+                details: self.static_details.as_ref().map(|details| {
+                    payload_converter
+                        .to_payload(&context, details)
+                        .expect("String-to-JSON payload serialization is infallible")
+                }),
+            }
+        })
+    }
+}
+
+/// Options for starting a workflow and sending it an update in one atomic operation.
+///
+/// See [crate::Client::start_update_with_start_workflow] and
+/// [crate::Client::execute_update_with_start_workflow].
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(start_fn = new, on(String, into))]
 #[non_exhaustive]
-pub struct WorkflowStartSignal {
-    /// Name of the signal to send.
+pub struct WorkflowUpdateWithStartOptions {
+    /// The task queue to run the workflow on.
     #[builder(start_fn)]
-    pub signal_name: String,
-    /// Payload for the signal.
-    pub input: Option<Payloads>,
-    /// Headers for the signal.
-    pub header: Option<Header>,
+    pub task_queue: String,
+
+    /// The workflow ID.
+    #[builder(start_fn)]
+    pub workflow_id: String,
+
+    /// How to resolve a conflict with an already-running workflow. This is required so callers
+    /// explicitly choose whether an update may attach to an existing workflow.
+    #[builder(start_fn)]
+    pub id_conflict_policy: WorkflowIdConflictPolicy,
+
+    /// The policy for reusing the workflow ID after a workflow closes.
+    #[builder(default)]
+    pub id_reuse_policy: WorkflowIdReusePolicy,
+
+    /// The workflow execution timeout.
+    pub execution_timeout: Option<Duration>,
+
+    /// The workflow run timeout.
+    pub run_timeout: Option<Duration>,
+
+    /// The workflow task timeout.
+    pub task_timeout: Option<Duration>,
+
+    /// Search attributes for the workflow.
+    pub search_attributes: Option<SearchAttributes>,
+
+    /// The workflow retry policy.
+    #[builder(into)]
+    pub retry_policy: Option<RetryPolicy>,
+
+    /// Links to associate with the workflow.
+    #[builder(default)]
+    pub links: Vec<common::v1::Link>,
+
+    /// Callbacks invoked when the workflow completes.
+    #[builder(default)]
+    pub completion_callbacks: Vec<common::v1::Callback>,
+
+    /// Priority for the workflow. Defaults to all-inherited (empty).
+    #[builder(default)]
+    pub priority: Priority,
+
+    /// Headers to include with the start operation.
+    pub start_header: Option<Header>,
+
+    /// Headers to include with the update operation.
+    pub update_header: Option<Header>,
+
+    /// Non-indexed values attached to the workflow, serialized with the client's data converter.
+    pub memo: Option<MemoValues>,
+
+    /// Single-line static summary for the workflow, shown in the Temporal UI.
+    pub static_summary: Option<String>,
+
+    /// Multi-line static details for the workflow, shown in the Temporal UI.
+    pub static_details: Option<String>,
+
+    /// Update ID for idempotency. If not provided, a UUID will be generated.
+    pub update_id: Option<String>,
+
+    /// Controls for the multi-operation RPC and, when executing the update, subsequent polling.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+impl WorkflowUpdateWithStartOptions {
+    pub(crate) fn into_parts(self) -> (WorkflowStartOptions, Option<String>, Option<Header>) {
+        let Self {
+            task_queue,
+            workflow_id,
+            id_conflict_policy,
+            id_reuse_policy,
+            execution_timeout,
+            run_timeout,
+            task_timeout,
+            search_attributes,
+            retry_policy,
+            links,
+            completion_callbacks,
+            priority,
+            start_header,
+            update_header,
+            memo,
+            static_summary,
+            static_details,
+            update_id,
+            rpc_options: _,
+        } = self;
+        (
+            WorkflowStartOptions {
+                task_queue,
+                workflow_id,
+                id_reuse_policy,
+                id_conflict_policy,
+                execution_timeout,
+                run_timeout,
+                task_timeout,
+                cron_schedule: None,
+                search_attributes,
+                enable_eager_workflow_start: false,
+                retry_policy,
+                links,
+                completion_callbacks,
+                priority,
+                header: start_header,
+                memo,
+                static_summary,
+                static_details,
+                rpc_options: RpcOptions::default(),
+            },
+            update_id,
+            update_header,
+        )
+    }
 }
 
 pub use temporalio_common::Priority;
@@ -512,6 +787,32 @@ pub struct WorkflowSignalOptions {
     /// Controls for the signal RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,
+}
+
+/// Controls when a workflow query should be rejected based on workflow state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum QueryRejectCondition {
+    /// Use the server's default condition.
+    #[default]
+    Unspecified,
+    /// Do not reject the query based on workflow state.
+    None,
+    /// Reject the query if the workflow is not open.
+    NotOpen,
+    /// Reject the query if the workflow did not complete successfully.
+    NotCompletedCleanly,
+}
+
+impl From<QueryRejectCondition> for ProtoQueryRejectCondition {
+    fn from(value: QueryRejectCondition) -> Self {
+        match value {
+            QueryRejectCondition::Unspecified => Self::Unspecified,
+            QueryRejectCondition::None => Self::None,
+            QueryRejectCondition::NotOpen => Self::NotOpen,
+            QueryRejectCondition::NotCompletedCleanly => Self::NotCompletedCleanly,
+        }
+    }
 }
 
 /// Options for querying a workflow.
@@ -569,6 +870,29 @@ pub struct WorkflowDescribeOptions {
 
 /// Default workflow execution retention for a Namespace is 3 days
 const DEFAULT_WORKFLOW_EXECUTION_RETENTION_PERIOD: Duration = Duration::from_secs(60 * 60 * 24 * 3);
+
+/// Controls whether archival is enabled for a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum ArchivalState {
+    /// Use the server's default archival state.
+    #[default]
+    Unspecified,
+    /// Disable archival.
+    Disabled,
+    /// Enable archival.
+    Enabled,
+}
+
+impl From<ArchivalState> for ProtoArchivalState {
+    fn from(value: ArchivalState) -> Self {
+        match value {
+            ArchivalState::Unspecified => Self::Unspecified,
+            ArchivalState::Disabled => Self::Disabled,
+            ArchivalState::Enabled => Self::Enabled,
+        }
+    }
+}
 
 /// Helper struct for `register_namespace`.
 #[derive(Clone, Debug, bon::Builder)]
@@ -629,10 +953,34 @@ impl From<RegisterNamespaceOptions> for RegisterNamespaceRequest {
             data: val.data,
             security_token: val.security_token,
             is_global_namespace: val.is_global_namespace,
-            history_archival_state: val.history_archival_state as i32,
+            history_archival_state: ProtoArchivalState::from(val.history_archival_state) as i32,
             history_archival_uri: val.history_archival_uri,
-            visibility_archival_state: val.visibility_archival_state as i32,
+            visibility_archival_state: ProtoArchivalState::from(val.visibility_archival_state)
+                as i32,
             visibility_archival_uri: val.visibility_archival_uri,
+        }
+    }
+}
+
+/// Selects which workflow history events are returned when fetching history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum HistoryEventFilterType {
+    /// Use the server's default filter.
+    #[default]
+    Unspecified,
+    /// Return all history events.
+    AllEvent,
+    /// Return only the workflow's close event.
+    CloseEvent,
+}
+
+impl From<HistoryEventFilterType> for ProtoHistoryEventFilterType {
+    fn from(value: HistoryEventFilterType) -> Self {
+        match value {
+            HistoryEventFilterType::Unspecified => Self::Unspecified,
+            HistoryEventFilterType::AllEvent => Self::AllEvent,
+            HistoryEventFilterType::CloseEvent => Self::CloseEvent,
         }
     }
 }
@@ -668,6 +1016,17 @@ pub struct WorkflowStartUpdateOptions {
     pub rpc_options: RpcOptions,
 }
 
+impl From<WorkflowExecuteUpdateOptions> for WorkflowStartUpdateOptions {
+    /// Execute-update is start-update followed by waiting for the update result.
+    fn from(options: WorkflowExecuteUpdateOptions) -> Self {
+        Self::builder()
+            .maybe_update_id(options.update_id)
+            .maybe_header(options.header)
+            .rpc_options(options.rpc_options)
+            .build()
+    }
+}
+
 /// Options for listing workflows.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
@@ -687,4 +1046,180 @@ pub struct WorkflowCountOptions {
     /// Controls for the count RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,
+}
+
+/// Options for starting a standalone activity.
+#[derive(Clone, Debug, bon::Builder)]
+#[builder(start_fn = new, on(String, into))]
+#[non_exhaustive]
+pub struct ActivityStartOptions {
+    /// Task queue to run this activity on.
+    #[builder(start_fn)]
+    pub task_queue: String,
+    /// Activity ID of the started activity. It's recommended to use a meaningful business ID.
+    #[builder(start_fn)]
+    pub id: String,
+    /// Timeouts for activity completion.
+    ///
+    /// See [`ActivityCloseTimeouts`] for the meaning of each timeout variant.
+    #[builder(start_fn)]
+    pub close_timeouts: ActivityCloseTimeouts,
+    /// If set, specifies maximum time the activity can wait in the task queue before being picked
+    /// up by a worker. This timeout is non-retryable.
+    pub schedule_to_start_timeout: Option<Duration>,
+    /// If set, specifies maximum time between successful heartbeats.
+    pub heartbeat_timeout: Option<Duration>,
+    /// Controls how Activity is retried. If not set, the server will assign default retry policy.
+    #[builder(into)]
+    pub retry_policy: Option<RetryPolicy>,
+    /// Priority to use when starting this activity.
+    #[builder(default)]
+    pub priority: Priority,
+    /// Specifies behavior if there's a *closed* activity with the same ID.
+    #[builder(default)]
+    pub id_reuse_policy: ActivityIdReusePolicy,
+    /// Specifies behavior if there's a *running* activity with the same ID. Note that there can
+    /// only be one running activity for each Activity ID.
+    #[builder(default)]
+    pub id_conflict_policy: ActivityIdConflictPolicy,
+    /// Search attributes for the activity.
+    pub search_attributes: Option<SearchAttributes>,
+    /// Headers to include with the start request.
+    pub header: Option<Header>,
+    /// Single-line static summary for the activity, shown in the Temporal UI.
+    pub summary: Option<String>,
+    /// Multi-line static details for the activity, shown in the Temporal UI.
+    pub static_details: Option<String>,
+    /// Time to wait before dispatching the first activity task.
+    /// This delay is not applied to retry attempts.
+    pub start_delay: Option<Duration>,
+}
+
+impl ActivityStartOptions {
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::StartToClose`].
+    pub fn with_start_to_close_timeout(
+        task_queue: impl Into<String>,
+        activity_id: impl Into<String>,
+        start_to_close_timeout: Duration,
+    ) -> ActivityStartOptionsBuilder {
+        Self::new(
+            task_queue,
+            activity_id,
+            ActivityCloseTimeouts::StartToClose(start_to_close_timeout),
+        )
+    }
+
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::ScheduleToClose`].
+    pub fn with_schedule_to_close_timeout(
+        task_queue: impl Into<String>,
+        activity_id: impl Into<String>,
+        schedule_to_close_timeout: Duration,
+    ) -> ActivityStartOptionsBuilder {
+        Self::new(
+            task_queue,
+            activity_id,
+            ActivityCloseTimeouts::ScheduleToClose(schedule_to_close_timeout),
+        )
+    }
+}
+
+/// Specifies behavior when starting a standalone activity if there's a *closed* activity with
+/// the same ID. See [`ActivityStartOptions::id_reuse_policy`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ActivityIdReusePolicy {
+    #[default]
+    /// Always allow starting an activity using the same activity ID. This is the default.
+    AllowDuplicate,
+    /// Allow starting an activity using the same ID only when the last execution did not complete
+    /// successfully.
+    AllowDuplicateFailedOnly,
+    /// Do not permit re-use of the ID for this activity.
+    RejectDuplicate,
+}
+
+impl From<ActivityIdReusePolicy> for ProtoActivityIdReusePolicy {
+    fn from(value: ActivityIdReusePolicy) -> Self {
+        match value {
+            ActivityIdReusePolicy::AllowDuplicate => Self::AllowDuplicate,
+            ActivityIdReusePolicy::AllowDuplicateFailedOnly => Self::AllowDuplicateFailedOnly,
+            ActivityIdReusePolicy::RejectDuplicate => Self::RejectDuplicate,
+        }
+    }
+}
+
+/// Specifies behavior when starting a standalone activity if there's a *running* activity with
+/// the same ID. See [`ActivityStartOptions::id_conflict_policy`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ActivityIdConflictPolicy {
+    #[default]
+    /// Don't start a new activity; instead return
+    /// [`StartActivityError::AlreadyStarted`](crate::errors::StartActivityError::AlreadyStarted).
+    Fail,
+    /// Don't start a new activity; instead return a handle for the running activity.
+    UseExisting,
+}
+
+impl From<ActivityIdConflictPolicy> for ProtoActivityIdConflictPolicy {
+    fn from(value: ActivityIdConflictPolicy) -> Self {
+        match value {
+            ActivityIdConflictPolicy::Fail => Self::Fail,
+            ActivityIdConflictPolicy::UseExisting => Self::UseExisting,
+        }
+    }
+}
+
+/// Options for listing activities.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityListOptions {}
+
+/// Options for counting activities.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityCountOptions {}
+
+/// Controls which optional fields will be requested in
+/// [`ActivityHandle::describe`](crate::ActivityHandle::describe) operation. The fields will be
+/// present in returned [`ActivityExecutionDescription`](crate::ActivityExecutionDescription),
+/// subject to data availability and server support.
+///
+/// Note that these fields contain payloads that can be arbitrarily large. It's recommended not to
+/// include them unless they're needed.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityDescribeOptions {
+    /// If set and the activity received input, the input will be included.
+    #[builder(default)]
+    pub include_input: bool,
+    /// If set and the activity is closed, the activity outcome will be included.
+    #[builder(default)]
+    pub include_outcome: bool,
+    /// If set and the activity sent heartbeat details, the heartbeat details will be included.
+    #[builder(default)]
+    pub include_heartbeat_details: bool,
+    /// If set and the activity has a failed attempt, the last failure will be included.
+    #[builder(default)]
+    pub include_last_failure: bool,
+}
+
+/// Options for [`ActivityHandle::cancel`](crate::ActivityHandle::cancel).
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
+pub struct ActivityCancelOptions {
+    /// Reason for cancellation. Can be empty.
+    #[builder(default)]
+    pub reason: String,
+}
+
+/// Options for [`ActivityHandle::terminate`](crate::ActivityHandle::terminate).
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
+pub struct ActivityTerminateOptions {
+    /// Reason for termination. Can be empty.
+    #[builder(default)]
+    pub reason: String,
 }

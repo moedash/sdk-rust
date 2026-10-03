@@ -95,7 +95,10 @@ async fn wasm_patch_activation_callback_can_decline() {
     let callback_input = input.clone();
     let callback: PatchActivationCallback = Arc::new(move |value| {
         callback_calls.fetch_add(1, Ordering::Relaxed);
-        *callback_input.lock().unwrap() = Some(value);
+        *callback_input.lock().unwrap() = Some((
+            value.workflow_info.workflow_type().to_string(),
+            value.patch_id,
+        ));
         false
     });
 
@@ -108,11 +111,8 @@ async fn wasm_patch_activation_callback_can_decline() {
     assert_eq!(marker_count, 0);
     let input = input.lock().unwrap();
     let input = input.as_ref().unwrap();
-    assert_eq!(
-        input.workflow_info.workflow_type(),
-        WASM_PATCH_ACTIVATION_WORKFLOW_TYPE
-    );
-    assert_eq!(input.patch_id, WASM_PATCH_ID);
+    assert_eq!(input.0, WASM_PATCH_ACTIVATION_WORKFLOW_TYPE);
+    assert_eq!(input.1, WASM_PATCH_ID);
 }
 
 #[tokio::test]
@@ -205,7 +205,7 @@ async fn wasm_patch_activation_callback_panic_fails_workflow_task() {
 
 #[tokio::test]
 async fn wasm_task_failure_preserves_wit_failure_details() {
-    let component_path = build_wasm_hello_component().await;
+    let component_path = build_wasm_task_failure_component().await;
     let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
         .expect("sample WASM component should be loadable");
 
@@ -387,6 +387,11 @@ async fn build_wasm_patch_activation_component() -> PathBuf {
     let fixture_dir =
         repository_root().join("crates/sdk-core/tests/fixtures/wasm_patch_activation");
     build_wasm_component(fixture_dir, "temporal_wasm_patch_activation_workflow.wasm").await
+}
+
+async fn build_wasm_task_failure_component() -> PathBuf {
+    let fixture_dir = repository_root().join("crates/sdk-core/tests/fixtures/wasm_task_failure");
+    build_wasm_component(fixture_dir, "temporal_wasm_task_failure_workflow.wasm").await
 }
 
 fn repository_root() -> PathBuf {
