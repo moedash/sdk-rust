@@ -1573,6 +1573,8 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    SubscribeNotificationChannel(SubscribeNotificationChannel),
+    UnsubscribeNotificationChannel(UnsubscribeNotificationChannel),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1581,6 +1583,12 @@ impl TryFrom<WorkflowCommand> for WFCommand {
     fn try_from(c: WorkflowCommand) -> result::Result<Self, Self::Error> {
         let variant = match c.variant.ok_or(EmptyWorkflowCommandErr)? {
             workflow_command::Variant::StartTimer(s) => WFCommandVariant::AddTimer(s),
+            workflow_command::Variant::SubscribeNotificationChannel(s) => {
+                WFCommandVariant::SubscribeNotificationChannel(s)
+            }
+            workflow_command::Variant::UnsubscribeNotificationChannel(s) => {
+                WFCommandVariant::UnsubscribeNotificationChannel(s)
+            }
             workflow_command::Variant::CancelTimer(s) => WFCommandVariant::CancelTimer(s),
             workflow_command::Variant::ScheduleActivity(s) => WFCommandVariant::AddActivity(s),
             workflow_command::Variant::RequestCancelActivity(s) => {

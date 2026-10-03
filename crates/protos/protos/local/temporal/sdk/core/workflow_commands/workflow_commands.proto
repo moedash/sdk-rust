@@ -54,7 +54,32 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        // 23 to 28 are taken by the external stream commands, which are developed
+        // alongside these and share this message. The two numbers below are fixed
+        // with that family and must not be reused.
+        SubscribeNotificationChannel subscribe_notification_channel = 29;
+        UnsubscribeNotificationChannel unsubscribe_notification_channel = 30;
     }
+}
+
+// Subscribe this workflow to a notification channel, so the scheduled event of
+// each later Workflow Task carries the notifications folded for it.
+//
+// The notifications live in History rather than arriving by a side channel, so
+// a replay reads the same ones the live run saw.
+message SubscribeNotificationChannel {
+    // Name of the channel, scoped to the namespace.
+    string channel = 1;
+}
+
+// End this workflow's subscription to a notification channel. Notifications
+// already recorded on a scheduled event still reach that Workflow Task.
+//
+// The server records an event for every unsubscribe, also one naming a channel
+// the run is not subscribed to, so replay can hold each command to its event.
+message UnsubscribeNotificationChannel {
+    // Name of the channel, scoped to the namespace.
+    string channel = 1;
 }
 
 message StartTimer {

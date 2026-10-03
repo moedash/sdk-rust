@@ -1489,6 +1489,18 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for SubscribeNotificationChannel {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "SubscribeNotificationChannel({})", self.channel)
+                }
+            }
+
+            impl Display for UnsubscribeNotificationChannel {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "UnsubscribeNotificationChannel({})", self.channel)
+                }
+            }
+
             impl Display for StartTimer {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "StartTimer({})", self.seq)
@@ -1884,6 +1896,26 @@ pub mod temporal {
                     impl Display for command::Attributes {
                         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                             write!(f, "{:?}", self.as_type())
+                        }
+                    }
+
+                    impl From<workflow_commands::SubscribeNotificationChannel> for Attributes {
+                        fn from(s: workflow_commands::SubscribeNotificationChannel) -> Self {
+                            Self::SubscribeNotificationChannelCommandAttributes(
+                                SubscribeNotificationChannelCommandAttributes {
+                                    channel: s.channel,
+                                },
+                            )
+                        }
+                    }
+
+                    impl From<workflow_commands::UnsubscribeNotificationChannel> for Attributes {
+                        fn from(s: workflow_commands::UnsubscribeNotificationChannel) -> Self {
+                            Self::UnsubscribeNotificationChannelCommandAttributes(
+                                UnsubscribeNotificationChannelCommandAttributes {
+                                    channel: s.channel,
+                                },
+                            )
                         }
                     }
 
