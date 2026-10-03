@@ -30,14 +30,21 @@ message Notification {
     // notifications folded together, the one with the highest counter is kept.
     int64 counter = 3;
     // Details for the listener, such as which topic moved. Bounded in size and
-    // carried as payloads, so a codec applies as to any payload.
+    // carried as payloads, so a codec applies as to any payload. This is state,
+    // not a log: a fold keeps the latest notification only, so a writer puts
+    // here what is true at `position`, such as which topic moved or a close
+    // flag, never something a consumer must see once per write.
     map<string, temporal.api.common.v1.Payload> metadata = 4;
-    // Set for a channel linked to a workflow: the owner and the run that
+
+    // Was temporal.api.common.v1.WorkflowExecution linked_to.
+    reserved 5;
+
+    // Set for a channel linked to an execution: the owner and the run that
     // received the notification. Empty for an independent channel. A listener
     // that holds both kinds routes the notification by it.
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "to" names the owner the channel is linked to. --)
-    temporal.api.common.v1.WorkflowExecution linked_to = 5;
+    temporal.api.common.v1.Execution linked_to = 6;
 }
 
 // A listener of a channel: a Workflow Execution woken with a Workflow Task, or
@@ -66,7 +73,7 @@ enum ChannelKind {
     // Its own execution, keyed by namespace and channel name. Any number of
     // workflows and callbacks listen to it.
     CHANNEL_KIND_INDEPENDENT = 1;
-    // Kept in one workflow's state, keyed by namespace, workflow id and
-    // channel name. The owning workflow is its listener by construction.
+    // Kept in one execution's state, keyed by namespace, execution and
+    // channel name. The owning execution is its listener by construction.
     CHANNEL_KIND_LINKED = 2;
 }
