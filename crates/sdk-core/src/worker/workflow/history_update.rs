@@ -741,10 +741,14 @@ fn find_end_index_of_next_wft_seq(
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
+                            && !scheduled_with_notifications(next_next_event)
                         {
                             // If we've never seen an interesting event and the next two events are
                             // a completion followed immediately again by scheduled, then this is a
-                            // WFT heartbeat and also doesn't conclude the sequence.
+                            // WFT heartbeat and also doesn't conclude the sequence. A scheduled
+                            // event with notifications is work lang saw in its own activation
+                            // live, so folding it into this one on replay would hand lang the
+                            // notifications one activation early.
                             continue;
                         } else {
                             // If we see an update accepted command after WFT completed, we want to
@@ -799,6 +803,15 @@ fn find_end_index_of_next_wft_seq(
     }
 
     NextWFTSeqEndIndex::Incomplete(last_index)
+}
+
+/// A task scheduled with notifications was handed them as an activation of its own, so it
+/// cannot be folded into the heartbeat chain before it the way an empty task is.
+fn scheduled_with_notifications(e: &HistoryEvent) -> bool {
+    matches!(
+        &e.attributes,
+        Some(Attributes::WorkflowTaskScheduledEventAttributes(a)) if !a.notifications.is_empty()
+    )
 }
 
 #[cfg(test)]
