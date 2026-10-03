@@ -14,6 +14,7 @@ import "google/protobuf/duration.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/enums/v1/command_type.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
@@ -328,6 +329,8 @@ message Command {
             subscribe_notification_channel_command_attributes = 20;
         UnsubscribeNotificationChannelCommandAttributes
             unsubscribe_notification_channel_command_attributes = 21;
+        AppendStreamRecordsCommandAttributes append_stream_records_command_attributes = 22;
+        SubscribeStreamCommandAttributes subscribe_stream_command_attributes = 23;
     }
 }
 
@@ -346,4 +349,44 @@ message SubscribeNotificationChannelCommandAttributes {
 message UnsubscribeNotificationChannelCommandAttributes {
     // The channel to stop listening on, as the writers name it.
     string channel = 1;
+}
+
+// Appends records to a stream the Workflow owns. Applied inside the Workflow
+// Task's own commit. Produces one `WorkflowStreamRecordsAppended` event
+// carrying the offset range and none of the payload; it schedules no further
+// work.
+message AppendStreamRecordsCommandAttributes {
+    // Name of a stream this Workflow owns, scoped to the Workflow. Created on
+    // first use. Empty means the Workflow's default output stream. A Workflow
+    // cannot append to a stream in another execution, so this is never the id
+    // of a standalone stream.
+    string stream_name = 1;
+    // Stored in order. The server sets `producer_id` to empty on each record,
+    // because the owning Workflow is the producer here.
+    repeated temporal.api.stream.v1.StreamRecord records = 2;
+}
+
+// Subscribe this Workflow to a stream, so later Workflow Tasks carry the ranges
+// it has not consumed yet.
+//
+// The stream's addressing is resolved by the server rather than supplied here.
+// A Workflow cannot look it up without doing I/O, and a value it carried would
+// be a reading rather than a fact, so it could differ on replay.
+message SubscribeStreamCommandAttributes {
+    // Stream to consume, named either way round: a stream this Workflow owns
+    // by the name it appends under, a stream in another execution by its id.
+    // The server tries them in that order, so a Workflow that owns a stream
+    // under this name cannot reach a standalone stream with the same id. When
+    // neither exists the Workflow gets a stream of its own by that name, which
+    // is how a reader subscribes before the first record is written.
+    string stream_name_or_id = 1;
+    // Where to start, as an absolute offset. Read only when `start_position`
+    // is unset. A negative value is refused: the head of the stream is asked
+    // for with `start_position.tail`.
+    int64 start_offset = 2;
+    // Where to start. The server resolves it once, when it registers the
+    // subscription, and records the resolved absolute offset on the subscribed
+    // event, so replay does not resolve it again. Setting it together with a
+    // non-zero `start_offset` fails the command.
+    temporal.api.stream.v1.StreamStartPosition start_position = 3;
 }
