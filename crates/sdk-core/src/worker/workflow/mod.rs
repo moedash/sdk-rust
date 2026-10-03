@@ -1858,6 +1858,8 @@ enum WFCommandVariant {
     ExternalOutputStreamCommit(WorkflowOutputStreamCommit),
     /// External output is buffered in lang and needs a run-scoped flush deadline.
     ExternalOutputStreamBuffered(WorkflowOutputStreamBuffered),
+    /// The complete set of notification channels the run listens on. Never implies retention.
+    ExternalStreamChannels(WorkflowStreamChannels),
     SubscribeNotificationChannel(SubscribeNotificationChannel),
     UnsubscribeNotificationChannel(UnsubscribeNotificationChannel),
 }
@@ -1944,6 +1946,9 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::WorkflowOutputStreamBuffered(buffered) => {
                 WFCommandVariant::ExternalOutputStreamBuffered(buffered)
+            }
+            workflow_command::Variant::WorkflowStreamChannels(channels) => {
+                WFCommandVariant::ExternalStreamChannels(channels)
             }
         };
         Ok(Self {
