@@ -582,11 +582,148 @@ impl ExternalWaitSet {
     }
 }
 
+/// The notification channels a Run listens on, held against the ones Core has subscribed it to.
+///
+/// Lang reports the complete set on its completions, and Core turns the difference into
+/// subscribe commands on the completion that ends the Workflow Task. Both halves are per-Worker
+/// runtime state: a replayed Run rebuilds them from the same reports and reissues the same
+/// commands, which is what the recorded events are matched against.
+#[derive(Debug, Default)]
+pub(crate) struct ChannelSubscriptions {
+    /// The set lang reported last, in its order.
+    listened: Vec<String>,
+    /// Channels a subscribe command went out for, in the order they went out.
+    subscribed: Vec<String>,
+}
+
+impl ChannelSubscriptions {
+    /// Replaces the listened set with lang's report.
+    pub(crate) fn report(&mut self, channels: Vec<String>) {
+        self.listened = channels;
+    }
+
+    /// The channels listened on but not yet subscribed, in report order, now counted as
+    /// subscribed.
+    ///
+    /// Only the latest report counts. A channel that was listened on and dropped between two
+    /// reports of one task was never subscribed, so a replay that sees only the task's final
+    /// report reissues exactly what the live run sent.
+    pub(crate) fn take_due_subscriptions(&mut self) -> Vec<String> {
+        let due: Vec<String> = self
+            .listened
+            .iter()
+            .filter(|channel| !self.subscribed.contains(channel))
+            .cloned()
+            .collect();
+        self.subscribed.extend(due.iter().cloned());
+        due
+    }
+
+    /// The channels subscribed but no longer listened on, in subscription order, now counted as
+    /// unsubscribed. A channel listened on again later is due a new subscription.
+    pub(crate) fn take_due_unsubscriptions(&mut self) -> Vec<String> {
+        let (leaving, staying): (Vec<String>, Vec<String>) = std::mem::take(&mut self.subscribed)
+            .into_iter()
+            .partition(|channel| !self.listened.contains(channel));
+        self.subscribed = staying;
+        leaving
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const IDLE: Duration = Duration::from_secs(1);
+
+    fn names(channels: &[&str]) -> Vec<String> {
+        channels.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn a_reported_channel_is_due_once() {
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs"]));
+
+        assert_eq!(subscriptions.take_due_subscriptions(), names(&["inputs"]));
+        assert_eq!(subscriptions.take_due_subscriptions(), Vec::<String>::new());
+
+        // The same set reported on a later task adds nothing.
+        subscriptions.report(names(&["inputs"]));
+        assert_eq!(subscriptions.take_due_subscriptions(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn only_the_channels_new_to_the_run_are_due() {
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs"]));
+        subscriptions.take_due_subscriptions();
+
+        subscriptions.report(names(&["inputs", "control"]));
+        assert_eq!(subscriptions.take_due_subscriptions(), names(&["control"]));
+    }
+
+    #[test]
+    fn only_the_latest_report_counts() {
+        // Two reports inside one retained task: the first channel was dropped before the task
+        // ended, so it was never subscribed, and replay, which sees only the final report, agrees.
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs"]));
+        subscriptions.report(names(&["control"]));
+
+        assert_eq!(subscriptions.take_due_subscriptions(), names(&["control"]));
+    }
+
+    #[test]
+    fn nothing_reported_means_nothing_due() {
+        let mut subscriptions = ChannelSubscriptions::default();
+        assert_eq!(subscriptions.take_due_subscriptions(), Vec::<String>::new());
+        assert_eq!(
+            subscriptions.take_due_unsubscriptions(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_channel_that_left_the_set_is_due_an_unsubscription_once() {
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs", "control"]));
+        subscriptions.take_due_subscriptions();
+
+        subscriptions.report(names(&["control"]));
+        assert_eq!(subscriptions.take_due_unsubscriptions(), names(&["inputs"]));
+        assert_eq!(
+            subscriptions.take_due_unsubscriptions(),
+            Vec::<String>::new()
+        );
+        assert_eq!(subscriptions.take_due_subscriptions(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_channel_never_subscribed_is_not_unsubscribed_when_it_leaves() {
+        // Two reports inside one retained task again: the channel came and went before the task
+        // ended, so no subscribe went out and no unsubscribe is owed.
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs"]));
+        subscriptions.report(names(&[]));
+
+        assert_eq!(
+            subscriptions.take_due_unsubscriptions(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_channel_listened_on_again_is_due_a_new_subscription() {
+        let mut subscriptions = ChannelSubscriptions::default();
+        subscriptions.report(names(&["inputs"]));
+        subscriptions.take_due_subscriptions();
+        subscriptions.report(names(&[]));
+        subscriptions.take_due_unsubscriptions();
+
+        subscriptions.report(names(&["inputs"]));
+        assert_eq!(subscriptions.take_due_subscriptions(), names(&["inputs"]));
+    }
 
     fn quiescent_set(wait_ids: &[u32]) -> ExternalWaitSet {
         let mut set = ExternalWaitSet::new();
