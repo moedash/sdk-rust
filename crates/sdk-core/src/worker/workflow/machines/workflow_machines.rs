@@ -1864,6 +1864,8 @@ impl WorkflowMachines {
                 | WFCommandVariant::ExternalOutputStreamCommit(_)
                 | WFCommandVariant::ExternalOutputStreamBuffered(_)
                 | WFCommandVariant::ExternalStreamChannels(_)) => {
+                    // Named, because this is the only diagnostic for a wait-set bug and seven
+                    // commands share the branch.
                     return Err(fatal!(
                         "External stream command {leaked} reached the state machines; it should \
                          have been consumed by the run's external wait set"
