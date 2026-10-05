@@ -24,7 +24,11 @@ mod upsert_search_attributes_state_machine;
 mod workflow_task_state_machine;
 
 #[cfg(test)]
+mod subscribe_notification_channel_state_machine_tests;
+#[cfg(test)]
 mod transition_coverage;
+#[cfg(test)]
+mod unsubscribe_notification_channel_state_machine_tests;
 
 pub(crate) use temporalio_common::fsm_trait::MachineError;
 pub(crate) use workflow_machines::{MachinesWFTResponseContent, WorkflowMachines};
