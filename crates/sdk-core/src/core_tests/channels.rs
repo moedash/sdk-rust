@@ -589,3 +589,58 @@ async fn a_counter_tie_keeps_the_held_notification() {
     let task = live_first_activation(t).await;
     assert_eq!(received(&task), vec![vec![held]]);
 }
+
+/// The failed attempt is a later task, so a sticky worker reaches it in an incremental history
+/// update together with its retry, and a cold one replays the first task before it. Either way
+/// the retry's activation holds the fold of both attempts' notifications and the first holds none.
+#[rstest::rstest]
+#[case::incremental(vec![ResponseType::ToTaskNum(1), ResponseType::ToTaskNum(2)])]
+#[case::cold(vec![ResponseType::AllHistory])]
+#[tokio::test]
+async fn a_failed_later_task_hands_its_notifications_to_the_retry(
+    #[case] batches: Vec<ResponseType>,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_with_notifications(vec![notification("a", 1)]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_failed_with_failure(
+        WorkflowTaskFailedCause::Unspecified,
+        Failure::default(),
+    );
+    t.add_workflow_task_scheduled_with_notifications(vec![
+        notification("a", 5),
+        notification("b", 2),
+    ]);
+    t.add_workflow_task_started();
+
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        batches,
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| w.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert!(received(&task).is_empty(), "got jobs {:?}", task.jobs);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert!(!task.is_replaying);
+    assert_eq!(
+        received(&task),
+        vec![vec![notification("a", 5), notification("b", 2)]]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![CompleteWorkflowExecution { result: None }.into()],
+    ))
+    .await
+    .unwrap();
+    core.shutdown().await;
+}
