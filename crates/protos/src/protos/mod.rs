@@ -1374,6 +1374,13 @@ pub mod coresdk {
                                 fin.reason()
                             )
                         }
+                        workflow_activation_job::Variant::DeliverStreamRecords(d) => {
+                            write!(
+                                f,
+                                "DeliverStreamRecords({}, {}..{})",
+                                d.stream_id, d.from_offset, d.to_offset
+                            )
+                        }
                         workflow_activation_job::Variant::NotificationsReceived(n) => {
                             write!(f, "NotificationsReceived({})", n.notifications.len())
                         }
@@ -1586,6 +1593,12 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for SubscribeStream {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "SubscribeStream({})", self.stream_name_or_id)
+                }
+            }
+
             impl Display for SubscribeNotificationChannel {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "SubscribeNotificationChannel({})", self.channel)
@@ -1595,6 +1608,17 @@ pub mod coresdk {
             impl Display for UnsubscribeNotificationChannel {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "UnsubscribeNotificationChannel({})", self.channel)
+                }
+            }
+
+            impl Display for AppendStreamRecords {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "AppendStreamRecords({}, {} records)",
+                        self.stream_name,
+                        self.records.len()
+                    )
                 }
             }
 
@@ -2029,6 +2053,12 @@ pub mod temporal {
                                 CommandType::ScheduleActivityTask
                             }
                             Attributes::StartTimerCommandAttributes(_) => CommandType::StartTimer,
+                            Attributes::SubscribeStreamCommandAttributes(_) => {
+                                CommandType::SubscribeStream
+                            }
+                            Attributes::AppendStreamRecordsCommandAttributes(_) => {
+                                CommandType::AppendStreamRecords
+                            }
                             Attributes::SubscribeNotificationChannelCommandAttributes(_) => {
                                 CommandType::SubscribeNotificationChannel
                             }
@@ -2085,6 +2115,29 @@ pub mod temporal {
                     impl Display for command::Attributes {
                         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                             write!(f, "{:?}", self.as_type())
+                        }
+                    }
+
+                    impl From<workflow_commands::AppendStreamRecords> for command::Attributes {
+                        fn from(s: workflow_commands::AppendStreamRecords) -> Self {
+                            Self::AppendStreamRecordsCommandAttributes(
+                                AppendStreamRecordsCommandAttributes {
+                                    stream_name: s.stream_name,
+                                    records: s.records,
+                                },
+                            )
+                        }
+                    }
+
+                    impl From<workflow_commands::SubscribeStream> for command::Attributes {
+                        fn from(s: workflow_commands::SubscribeStream) -> Self {
+                            Self::SubscribeStreamCommandAttributes(
+                                SubscribeStreamCommandAttributes {
+                                    stream_name_or_id: s.stream_name_or_id,
+                                    start_offset: s.start_offset,
+                                    start_position: s.start_position,
+                                },
+                            )
                         }
                     }
 
@@ -2567,6 +2620,8 @@ pub mod temporal {
                                 | EventType::TimerStarted
                                 | EventType::UpsertWorkflowSearchAttributes
                                 | EventType::WorkflowPropertiesModified
+                                | EventType::WorkflowStreamSubscribed
+                                | EventType::WorkflowStreamRecordsAppended
                                 | EventType::WorkflowNotificationChannelSubscribed
                                 | EventType::WorkflowNotificationChannelUnsubscribed
                                 | EventType::NexusOperationScheduled
@@ -2668,6 +2723,10 @@ pub mod temporal {
                             // mark any new event types as ignorable or not.
                             if let Some(a) = self.attributes.as_ref() {
                                 match a {
+                                    Attributes::WorkflowStreamSubscribedEventAttributes(_) => false,
+                                    Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => {
+                                        false
+                                    }
                                     Attributes::WorkflowNotificationChannelSubscribedEventAttributes(_) => {
                                         false
                                     }
@@ -2761,6 +2820,8 @@ pub mod temporal {
                         pub fn event_type(&self) -> EventType {
                             // I just absolutely _love_ this
                             match self {
+                            Attributes::WorkflowStreamSubscribedEventAttributes(_) => { EventType::WorkflowStreamSubscribed }
+                            Attributes::WorkflowStreamRecordsAppendedEventAttributes(_) => { EventType::WorkflowStreamRecordsAppended }
                             Attributes::WorkflowNotificationChannelSubscribedEventAttributes(_) => { EventType::WorkflowNotificationChannelSubscribed }
                             Attributes::WorkflowNotificationChannelUnsubscribedEventAttributes(_) => { EventType::WorkflowNotificationChannelUnsubscribed }
                             Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
@@ -2883,6 +2944,11 @@ pub mod temporal {
         pub mod sdk {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.sdk.v1");
+            }
+        }
+        pub mod stream {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.stream.v1");
             }
         }
         pub mod taskqueue {
