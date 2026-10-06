@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+/*
+ * Wire formats for External Workflow Streams that are neither commands nor activation jobs.
+ *
+ * The one member today is the reserved wake Signal's envelope. It lives here, at the protocol
+ * level, rather than being a user payload: Core must read its fields, and Core has no access to
+ * the user's DataConverter or codec. A user codec that encrypts payloads would otherwise make the
+ * envelope unreadable to the component that must read it.
+ */
+package coresdk.external_stream;
+option ruby_package = "Temporalio::Internal::Bridge::Api::ExternalStream";
+
+// The payload of the reserved `__temporal_external_stream_wake` Signal.
+//
+// Sent as a single argument whose Payload uses metadata
+// `encoding = "binary/protobuf"` and
+// `messageType = "coresdk.external_stream.WakeSignal"`, serialized with the protocol's own
+// serialization rather than through the user's DataConverter.
+//
+// The Signal carries no user data, so bypassing the codec leaks nothing.
+message WakeSignal {
+    // Starts at 1. Core ignores an unknown version harmlessly rather than failing -- an old Core
+    // must not break because a newer producer learned a new field.
+    uint32 envelope_version = 1;
+    // The stream this wake was prompted by. Only a hint: on wakeup the runtime rechecks every
+    // active subscription, not just this one.
+    string stream_name = 2;
+    uint32 wait_id = 3;
+    // 0 is reserved and means "no park generation" -- an unparked wake, which Core accepts as a
+    // recheck request after validating chain identity. Park generations are quiescence
+    // generations, which start at 1, so a *non-zero* generation the current Run does not
+    // recognize is a claim that turned out to be wrong and is ignored as stale.
+    uint64 park_generation = 4;
+    // Chain identity, not the current Run. The Signal is addressed to the Workflow ID without a
+    // Run ID so it always lands on the current Run of the chain; this field is what lets Core
+    // tell "same chain, stale generation" from "different chain".
+    string first_execution_run_id = 5;
+    // Diagnostics only. Never used for validation or deduplication.
+    string producer_session_id = 6;
+}

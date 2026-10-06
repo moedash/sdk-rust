@@ -29,8 +29,10 @@ use crate::{
             WFMachinesError, WorkflowStartedInfo, fatal,
             history_update::NextWFT,
             machines::{
-                HistEventData, activity_state_machine::ActivityMachine,
+                HistEventData,
+                activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
+                external_stream_state_machine::{ExternalStreamMachine, extract_stream_marker},
                 modify_workflow_properties_state_machine::modify_workflow_properties,
                 nexus_operation_state_machine::NexusOperationMachine,
                 update_state_machine::UpdateMachine,
@@ -58,10 +60,13 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_data::{ExternalStreamMarkerData, ParkReason},
+            external_stream,
             workflow_activation::{
-                self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
+                self, NotifyHasPatch, ReplayExternalStreams, UpdateRandomSeed, WorkflowActivation,
+                workflow_activation_job,
             },
-            workflow_commands::ContinueAsNewWorkflowExecution,
+            workflow_commands::{ContinueAsNewWorkflowExecution, ExternalStreamWait},
         },
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
@@ -88,8 +93,23 @@ pub(crate) struct WorkflowMachines {
     last_history_from_server: HistoryUpdate,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
+    /// Reserved external stream wake Signals seen in history, decoded and suppressed from user
+    /// dispatch, waiting to be classified against the run's wait set.
+    pending_external_stream_wakes: Vec<external_stream::WakeSignal>,
+    /// External stream marker machines whose `MarkerRecorded` event has not been reached yet, in
+    /// the order the markers appear in History.
+    ///
+    /// Matched positionally rather than by id: an external stream marker carries no lang-issued
+    /// sequence number, and its `quiescence_generation` is not unique either -- a Workflow Task
+    /// that never became quiescent writes generation 0, and two of those in a row would collide.
+    /// Markers are written one per Workflow Task and read in History order, so first-in-first-out
+    /// is exactly the pairing.
+    external_stream_marker_machines: VecDeque<MachineKey>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
+    /// The exact predecessor of the current WorkflowTaskScheduled event in the ordered History
+    /// view. Output staging must fail rather than guess when this is unavailable.
+    current_wft_history_floor_event_id: Option<i64>,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -280,6 +300,7 @@ impl WorkflowMachines {
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
+            current_wft_history_floor_event_id: None,
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -287,6 +308,8 @@ impl WorkflowMachines {
             wft_start_time: None,
             current_wf_time: None,
             observed_internal_flags: Rc::new(RefCell::new(observed_internal_flags)),
+            pending_external_stream_wakes: vec![],
+            external_stream_marker_machines: Default::default(),
             history_size_bytes: 0,
             continue_as_new_suggested: false,
             suggest_continue_as_new_reasons: Default::default(),
@@ -399,6 +422,10 @@ impl WorkflowMachines {
         self.current_started_event_id
     }
 
+    pub(crate) fn current_wft_history_floor_event_id(&self) -> Option<i64> {
+        self.current_wft_history_floor_event_id
+    }
+
     pub(crate) fn history_size_bytes(&self) -> u64 {
         self.history_size_bytes
     }
@@ -472,7 +499,102 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
+            history_floor_event_id: self.current_wft_history_floor_event_id.unwrap_or_default(),
         }
+    }
+
+    /// Emits **exactly one** marker for this Workflow Task's accumulated annotation.
+    ///
+    /// The refusal below belongs to emission itself and needs no finalization job to state it: an
+    /// annotation without its terminal is durable and wrong, while an abandoned Workflow Task
+    /// commits no cursor and loses no record. So there is no best-effort path -- if the terminal
+    /// is missing, nothing is written and the task fails for retry.
+    pub(crate) fn emit_external_stream_marker(
+        &mut self,
+        data: ExternalStreamMarkerData,
+    ) -> Result<()> {
+        if data.terminal_boundary() == ParkReason::Unspecified {
+            return Err(fatal!(
+                "Refusing to write an external stream marker with no terminal boundary for \
+                 quiescence generation {}",
+                data.quiescence_generation
+            ));
+        }
+        if self.replaying {
+            // The marker for this Workflow Task is already in History and C10's lookahead has
+            // already handed it back to lang. Issuing a command for it now would be matched
+            // against the very event it was read from and fail as a command mismatch.
+            debug!(
+                quiescence_generation = data.quiescence_generation,
+                "Not re-writing an external stream marker while replaying"
+            );
+            return Ok(());
+        }
+        let key = self.add_cmd_to_wf_task(
+            ExternalStreamMachine::record_marker(data),
+            Default::default(),
+            CommandIdKind::CoreInternal,
+        );
+        self.external_stream_marker_machines.push_back(key);
+        // Core generates this command *after* lang's own iteration has already prepared its
+        // commands, so it has to prepare its own. Without this the marker sits in the current
+        // task's queue and never reaches the server -- silently, since nothing else looks there.
+        self.prepare_commands()
+    }
+
+    /// Hands lang a marker the replay lookahead found, and creates the machine that settles it.
+    ///
+    /// Exactly one `ReplayExternalStreams` job per marker. Core is annotation-blind, so it copies
+    /// the annotation through untouched and supplies only what it can read itself: the quiescent
+    /// snapshot the marker closed, the waits it covered, and the terminal boundary. Everything the
+    /// live run needed the backend for -- offsets, integrity, delivery order -- is inside the
+    /// annotation and is lang's to interpret.
+    fn replay_external_stream_marker(&mut self, data: ExternalStreamMarkerData) {
+        let waits = data
+            .waits
+            .iter()
+            .map(|w| ExternalStreamWait {
+                wait_id: w.wait_id,
+                generation: w.generation,
+                // Never set on replay. `immediately_parkable` is a live observation about a write
+                // fence, and replay reproduces the boundary the marker recorded rather than
+                // re-deciding it -- the terminal boundary already says how the task ended.
+                immediately_parkable: false,
+            })
+            .collect();
+        self.drive_me.send_job(
+            workflow_activation_job::Variant::ReplayExternalStreams(ReplayExternalStreams {
+                quiescence_generation: data.quiescence_generation,
+                waits,
+                replay_annotation: data.replay_annotation.clone(),
+                terminal_boundary: data.terminal_boundary,
+                output: data.output.clone(),
+            })
+            .into(),
+        );
+        let machine = ExternalStreamMachine::resolved_from_marker_lookahead(data);
+        let key = self.all_machines.insert(machine.into());
+        self.external_stream_marker_machines.push_back(key);
+    }
+
+    /// Wake Signals decoded from history and not yet validated against the wait set.
+    ///
+    /// Validation needs the run's wait set, which lives on `ManagedRun`, so the two steps are
+    /// split: decode and suppress here, classify there.
+    pub(crate) fn take_external_stream_wakes(&mut self) -> Vec<external_stream::WakeSignal> {
+        std::mem::take(&mut self.pending_external_stream_wakes)
+    }
+
+    /// Queue a Core-generated job for lang.
+    ///
+    /// Used by the external stream paths, whose activations originate in Core rather than from a
+    /// history event, so they have no state machine to be driven by.
+    pub(crate) fn send_core_generated_job(&mut self, variant: workflow_activation_job::Variant) {
+        self.drive_me.send_job(variant.into());
+    }
+
+    pub(crate) fn discard_pending_external_stream_park(&mut self) {
+        self.drive_me.discard_pending_external_stream_park();
     }
 
     pub(crate) fn has_pending_jobs(&self) -> bool {
@@ -513,6 +635,33 @@ impl WorkflowMachines {
     pub(crate) fn reset_last_started_id(&mut self, id: i64) {
         debug!("Resetting back to event id {} due to speculative WFT", id);
         self.current_started_event_id = id;
+        self.current_wft_history_floor_event_id = None;
+        // A speculative rejection means the server discarded every command from that task. Most
+        // command machines are forbidden on a rejected Update task, but Core's external-output
+        // marker is generated after lang has answered and is therefore the exception. Leaving it
+        // queued makes the redelivery report both the rejected token and its fresh token.
+        let discarded_stream_markers: Vec<_> = self
+            .commands
+            .iter()
+            .chain(&self.current_wf_task_commands)
+            .filter_map(|command| {
+                matches!(
+                    self.all_machines.get(command.machine),
+                    Some(Machines::ExternalStreamMachine(_))
+                )
+                .then_some(command.machine)
+            })
+            .collect();
+        self.commands
+            .retain(|command| !discarded_stream_markers.contains(&command.machine));
+        self.current_wf_task_commands
+            .retain(|command| !discarded_stream_markers.contains(&command.machine));
+        self.external_stream_marker_machines
+            .retain(|key| !discarded_stream_markers.contains(key));
+        for key in discarded_stream_markers {
+            self.machine_is_core_created.remove(key);
+            self.all_machines.remove(key);
+        }
         // We must reset the last event we "processed" to be after the last WFT we really completed
         // + any command events (since the SDK "processed" those when it emitted the commands). This
         // is also equal to what we just processed in the speculative task, minus two, since we
@@ -660,6 +809,9 @@ impl WorkflowMachines {
                     eid
                 ));
             }
+            if event.event_type() == EventType::WorkflowTaskScheduled {
+                self.current_wft_history_floor_event_id = Some(self.last_processed_event);
+            }
             let next_event = history.peek();
 
             // This definition of replaying here is that we are no longer replaying as soon as we
@@ -749,6 +901,7 @@ impl WorkflowMachines {
         #[allow(clippy::large_enum_variant)]
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
+            ExternalStreamMarker(Box<ExternalStreamMarkerData>),
             ProtocolMessage(IncomingProtocolMessage),
         }
         let mut delayed_actions = vec![];
@@ -785,6 +938,12 @@ impl WorkflowMachines {
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
+            } else if let Some(stream_dat) = extract_stream_marker(e) {
+                // The marker for a Workflow Task is written by that task's *completion*, so it
+                // lands in the sequence after it. Finding it here is what lets lang be handed the
+                // recorded observations in the same activation that consumed them live -- and
+                // therefore before the wait set they close is resolved.
+                delayed_actions.push(DelayedAction::ExternalStreamMarker(Box::new(stream_dat)));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -817,6 +976,9 @@ impl WorkflowMachines {
                         self.local_activity_data.insert_peeked_marker(*la_dat);
                         self.apply_local_activity_peeked_resolutions()?;
                     }
+                }
+                DelayedAction::ExternalStreamMarker(stream_dat) => {
+                    self.replay_external_stream_marker(*stream_dat);
                 }
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
@@ -949,6 +1111,39 @@ impl WorkflowMachines {
             }
         }
 
+        if extract_stream_marker(event).is_some() {
+            // Same shape as the local activity marker above, and for the same reason: a marker the
+            // lookahead resolved has no command in the outgoing queue to be matched against,
+            // because replay issues none. A marker no machine is expecting at all is the case
+            // local activities report as nondeterminism, and it is nondeterminism here too --
+            // Core writes exactly one of these per Workflow Task, so an unexpected one means
+            // history and the machines disagree about what this run did.
+            let mkey = self
+                .external_stream_marker_machines
+                .front()
+                .copied()
+                .ok_or_else(|| {
+                    nondeterminism!(
+                        "Encountered an external stream marker with no state machine expecting \
+                         it: {event:?}"
+                    )
+                })?;
+            let handle_directly = match self.machine(mkey) {
+                Machines::ExternalStreamMachine(m) => m.marker_should_get_special_handling()?,
+                _ => {
+                    return Err(fatal!(
+                        "Encountered external stream marker but the associated machine was of \
+                         the wrong type! {event:?}"
+                    ));
+                }
+            };
+            self.external_stream_marker_machines.pop_front();
+            if handle_directly {
+                self.submachine_handle_event(mkey, event_dat)?;
+                return Ok(EventHandlingOutcome::Normal);
+            }
+        }
+
         let event_id = event.event_id;
 
         let consumed_cmd = loop {
@@ -1029,9 +1224,23 @@ impl WorkflowMachines {
                     attrs,
                 )) = event_dat.event.attributes
                 {
-                    self.drive_me.send_job(
-                        workflow_activation::SignalWorkflow::from((attrs, event_id)).into(),
-                    );
+                    if attrs.signal_name == external_stream::WAKE_SIGNAL_NAME {
+                        // Suppressed from user handlers **whether or not it decodes**, so an
+                        // unknown envelope version or a stale generation can never surface in
+                        // Workflow code as an unhandled Signal. Decoded without a DataConverter
+                        // because Core is the component that has to read it, and a user codec
+                        // that encrypts payloads would make it unreadable to exactly that
+                        // component.
+                        if let Some(wake) = decode_wake_signal(&attrs) {
+                            self.pending_external_stream_wakes.push(wake);
+                        } else {
+                            debug!("Ignoring an unreadable external stream wake Signal");
+                        }
+                    } else {
+                        self.drive_me.send_job(
+                            workflow_activation::SignalWorkflow::from((attrs, event_id)).into(),
+                        );
+                    }
                 } else {
                     // err
                 }
@@ -1557,6 +1766,22 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
+                // External stream commands are consumed above the machine level -- progress
+                // accumulates into the wait set (C14a), three are answers to
+                // runtime-internal activations that `ManagedRun` resolves (C6, C8, C15a). None of
+                // them should reach the machines; the output commit is also intercepted there.
+                // Reaching any one silently would drop replay-visible state on the floor.
+                leaked @ (WFCommandVariant::ExternalStreamProgress(_)
+                | WFCommandVariant::ExternalStreamQuiescent(_)
+                | WFCommandVariant::ExternalStreamParkResult(_)
+                | WFCommandVariant::ExternalStreamFinalized(_)
+                | WFCommandVariant::ExternalOutputStreamCommit(_)
+                | WFCommandVariant::ExternalOutputStreamBuffered(_)) => {
+                    return Err(fatal!(
+                        "External stream command {leaked} reached the state machines; it should \
+                         have been consumed by the run's external wait set"
+                    ));
+                }
                 WFCommandVariant::NoCommandsFromLang => (),
             }
         }
@@ -1816,4 +2041,26 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+/// Decodes a reserved wake Signal's envelope **without** a `DataConverter`.
+///
+/// Returns `None` for anything unreadable -- wrong metadata, an unknown envelope version, or
+/// bytes that are not a `WakeSignal`. All of those are ignored harmlessly rather than failing the
+/// Workflow Task: an old Core must not break because a newer producer learned a new field, and
+/// the Signal carries no user data whose loss would matter.
+fn decode_wake_signal(
+    attrs: &temporalio_common::protos::temporal::api::history::v1::WorkflowExecutionSignaledEventAttributes,
+) -> Option<external_stream::WakeSignal> {
+    let payload = attrs.input.as_ref()?.payloads.first()?;
+    let message_type = payload.metadata.get("messageType").map(|v| v.as_slice());
+    if message_type != Some(external_stream::WAKE_SIGNAL_MESSAGE_TYPE.as_bytes()) {
+        return None;
+    }
+    let wake =
+        <external_stream::WakeSignal as prost::Message>::decode(payload.data.as_slice()).ok()?;
+    if wake.envelope_version != external_stream::WAKE_SIGNAL_ENVELOPE_VERSION {
+        return None;
+    }
+    Some(wake)
 }

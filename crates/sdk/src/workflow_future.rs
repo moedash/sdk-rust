@@ -339,6 +339,15 @@ impl WorkflowFuture {
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
                 }
+                // External Workflow Streams are a Python-SDK feature. This SDK never emits
+                // `WorkflowStreamQuiescent`, so Core has nothing to retain a Workflow Task for
+                // and cannot produce any of these jobs for it.
+                Variant::ResolveExternalStreamWaits(_)
+                | Variant::PrepareExternalStreamPark(_)
+                | Variant::ReplayExternalStreams(_)
+                | Variant::FinalizeExternalStreams(_) => {
+                    bail!("External stream activation jobs are not supported by this SDK");
+                }
             }
         }
 

@@ -3,6 +3,7 @@
 //! a diagram of the internals.
 
 mod driven_workflow;
+mod external_streams;
 mod history_update;
 mod machines;
 mod managed_run;
@@ -10,6 +11,8 @@ mod run_cache;
 mod wft_extraction;
 pub(crate) mod wft_poller;
 mod workflow_stream;
+
+pub use external_streams::{ExternalStreamReadyResult, ExternalStreamRunStatus};
 
 pub(crate) use driven_workflow::DrivenWorkflow;
 pub(crate) use history_update::HistoryUpdate;
@@ -44,7 +47,12 @@ use crate::{
     },
 };
 use anyhow::anyhow;
-use futures_util::{Stream, StreamExt, future::abortable, stream, stream::BoxStream};
+use futures_util::{
+    Stream, StreamExt,
+    future::{AbortHandle, abortable},
+    stream,
+    stream::BoxStream,
+};
 use itertools::Itertools;
 use prost_types::TimestampError;
 use std::{
@@ -147,6 +155,12 @@ pub(crate) struct Workflows {
 pub(crate) struct WorkflowBasics {
     pub(crate) worker_config: Arc<WorkerConfig>,
     pub(crate) shutdown_token: CancellationToken,
+    /// The Worker's *own* shutdown token, of which `shutdown_token` is a child.
+    ///
+    /// Cancelled only when shutdown was actually requested, whereas the child is also cancelled
+    /// by the workflow stream itself when the workflow task poller dies. Both mean "stop", but
+    /// only this one means "the Worker is going away", which is the boundary C15b closes.
+    pub(crate) worker_shutdown_token: CancellationToken,
     pub(crate) metrics: MetricsContext,
     pub(crate) server_capabilities: get_system_info_response::Capabilities,
     pub(crate) namespace_capabilities: Arc<NamespaceCapabilities>,
@@ -182,6 +196,9 @@ impl Workflows {
         tracing_sub: Option<Arc<dyn Subscriber + Send + Sync>>,
     ) -> Self {
         let (local_tx, local_rx) = unbounded_channel();
+        let run_timers = RunTimerSink {
+            tx: local_tx.clone(),
+        };
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
@@ -240,6 +257,7 @@ impl Workflows {
                         extracted_wft_stream,
                         locals_stream,
                         local_activity_request_sink,
+                        run_timers,
                     );
 
                     while let Some(output) = stream.next().await {
@@ -696,6 +714,141 @@ impl Workflows {
             reason,
             auto_reply_fail: None,
         });
+    }
+
+    /// Tell a workflow that a record is buffered for one of its external stream waits.
+    ///
+    /// Routed like `notify_of_local_result` but **acknowledged**: the caller is a watcher whose
+    /// next action depends on which result comes back, so a fire-and-forget send would leave it
+    /// unable to tell "Core will activate" from "send a wake Signal".
+    pub(super) fn notify_external_stream_ready(
+        &self,
+        run_id: impl Into<String>,
+        wait_id: u32,
+        wait_generation: u64,
+    ) -> impl Future<Output = ExternalStreamReadyResult> {
+        let (tx, rx) = oneshot::channel();
+        self.send_local(ExternalStreamReadyMsg {
+            run_id: run_id.into(),
+            wait_id,
+            wait_generation,
+            response_tx: tx,
+        });
+        // A dropped sender means the workflow stream is gone, which for the watcher is
+        // indistinguishable from the run having been evicted -- and calls for the same action.
+        async move { rx.await.unwrap_or(ExternalStreamReadyResult::RunNotFound) }
+    }
+
+    /// Ask what state a run's external stream wait set is in, changing nothing.
+    ///
+    /// Answered on the same serialized lane as readiness, so the answer is as authoritative as a
+    /// readiness acknowledgement. Deliberately not the readiness call: readiness means "a record
+    /// is buffered", and probing with it would assert something false and manufacture a spurious
+    /// activation during shutdown.
+    pub(super) fn external_stream_run_status(
+        &self,
+        run_id: impl Into<String>,
+    ) -> impl Future<Output = ExternalStreamRunStatus> {
+        let (tx, rx) = oneshot::channel();
+        self.send_local(ExternalStreamRunStatusMsg {
+            run_id: run_id.into(),
+            response_tx: tx,
+        });
+        async move { rx.await.unwrap_or(ExternalStreamRunStatus::RunNotFound) }
+    }
+
+    /// Tell a workflow its external stream idle timer expired.
+    ///
+    /// Core's own quiescence timer starts calling this once retention exists (C6); until then
+    /// only tests drive it.
+    #[allow(dead_code, reason = "driven by the quiescence timer in C6")]
+    pub(super) fn notify_external_stream_idle_timeout(
+        &self,
+        run_id: impl Into<String>,
+        quiescence_generation: u64,
+    ) {
+        self.send_local(ExternalStreamIdleTimeoutMsg {
+            run_id: run_id.into(),
+            quiescence_generation,
+        });
+    }
+
+    /// Test-only reach into the output deadline's serialized local input.
+    #[cfg(test)]
+    pub(super) fn notify_external_output_flush_deadline(&self, run_id: impl Into<String>) {
+        self.send_local(LocalInputs::ExternalOutputFlushDeadline(run_id.into()));
+    }
+
+    /// Test scaffolding -- see [`EmitTerminalLessMarkerMsg`].
+    #[cfg(test)]
+    pub(super) fn emit_terminal_less_external_stream_marker(
+        &self,
+        run_id: impl Into<String>,
+    ) -> impl Future<Output = bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send_local(EmitTerminalLessMarkerMsg {
+            run_id: run_id.into(),
+            response_tx: tx,
+        });
+        async move { rx.await.unwrap_or(false) }
+    }
+
+    /// Test scaffolding -- see [`ExternalStreamAnnotationMsg`].
+    #[cfg(test)]
+    pub(super) fn external_stream_annotation(
+        &self,
+        run_id: impl Into<String>,
+    ) -> impl Future<Output = Vec<u8>> {
+        let (tx, rx) = oneshot::channel();
+        self.send_local(ExternalStreamAnnotationMsg {
+            run_id: run_id.into(),
+            response_tx: tx,
+        });
+        async move { rx.await.unwrap_or_default() }
+    }
+
+    /// Test scaffolding -- see [`StartRolloverTimerMsg`].
+    #[cfg(test)]
+    pub(super) fn start_wft_rollover_timer(
+        &self,
+        run_id: impl Into<String>,
+        wft_timeout: Duration,
+    ) -> impl Future<Output = ()> {
+        let (tx, rx) = oneshot::channel();
+        self.send_local(StartRolloverTimerMsg {
+            run_id: run_id.into(),
+            wft_timeout,
+            response_tx: tx,
+        });
+        async move {
+            let _ = rx.await;
+        }
+    }
+
+    /// Test scaffolding -- see [`ExternalStreamSeedWaitsMsg`].
+    #[cfg(test)]
+    pub(super) fn seed_external_stream_waits(
+        &self,
+        run_id: impl Into<String>,
+        wait_ids: Vec<u32>,
+        parked_at: Option<u64>,
+        wft_open: bool,
+    ) -> impl Future<Output = ()> {
+        let (tx, rx) = oneshot::channel();
+        self.send_local(ExternalStreamSeedWaitsMsg {
+            run_id: run_id.into(),
+            wait_ids,
+            // Long enough that no seeded set parks itself out from under a test. Seeding starts no
+            // timer, but a wait set carried onto a replacement Workflow Task re-arms one from this
+            // value, and a set that parked mid-test would be answering a question nobody asked.
+            idle_timeout: Duration::from_secs(300),
+            parked_at,
+            wft_open,
+            response_tx: tx,
+        });
+        async move {
+            let _ = rx.await;
+        }
     }
 
     /// Send a `GetStateInfoMsg` to the workflow stream. Can be used to bump the stream if there
@@ -1277,9 +1430,129 @@ pub(crate) struct HeartbeatTimeoutMsg {
     pub(crate) run_id: String,
     pub(crate) span: Span,
 }
+
+/// Schedules run-scoped timers **without** going through the local-activity request sink.
+///
+/// The sink is `Some` only when `WorkerTaskTypes.enable_local_activities` is set, and lang sets
+/// that from whether any activities are registered. A worker registering workflows and no
+/// activities therefore has no sink -- and `sink_heartbeat_timeout_start` silently returned a
+/// handle to a timer that was never started. That is fine when the only thing a timer bounds is a
+/// local activity, and not fine at all once a workflow task can be retained for a reason that has
+/// nothing to do with local activities.
+///
+/// So the timer facility becomes the run's, and the local-activity heartbeat becomes one caller of
+/// it rather than its owner.
+#[derive(Clone)]
+pub(in crate::worker::workflow) struct RunTimerSink {
+    tx: UnboundedSender<LocalInput>,
+}
+
+impl RunTimerSink {
+    /// Sends `on_elapse` onto the run's local-input lane at `deadline`.
+    ///
+    /// Returns a handle that cancels the timer. Dropping the handle does **not** cancel it --
+    /// same as the local-activity heartbeat handle it replaces, whose callers all abort
+    /// explicitly.
+    pub(in crate::worker::workflow) fn start(
+        &self,
+        deadline: Instant,
+        on_elapse: LocalInputs,
+    ) -> AbortHandle {
+        let (abort_handle, abort_reg) = AbortHandle::new_pair();
+        let tx = self.tx.clone();
+        let span = Span::current();
+        tokio::spawn(futures_util::future::Abortable::new(
+            async move {
+                tokio::time::sleep_until(deadline.into()).await;
+                let _ = tx.send(LocalInput {
+                    input: on_elapse,
+                    span,
+                });
+            },
+            abort_reg,
+        ));
+        abort_handle
+    }
+}
 #[derive(Debug)]
 struct GetStateInfoMsg {
     response_tx: oneshot::Sender<WorkflowStateInfo>,
+}
+
+/// A watcher reporting that a record is buffered for one external stream wait.
+///
+/// Unlike a local-activity resolution this is **acknowledged**, not fire-and-forget: what the
+/// watcher does next -- keep waiting, re-probe, send a wake Signal, or tear itself down --
+/// depends entirely on which of the five results comes back.
+#[derive(Debug)]
+pub(crate) struct ExternalStreamReadyMsg {
+    pub(crate) run_id: String,
+    pub(crate) wait_id: u32,
+    pub(crate) wait_generation: u64,
+    pub(crate) response_tx: oneshot::Sender<ExternalStreamReadyResult>,
+}
+
+/// The global quiescence timer for one run's wait set expired.
+#[derive(Debug)]
+pub(crate) struct ExternalStreamIdleTimeoutMsg {
+    pub(crate) run_id: String,
+    /// The snapshot the timer was started for. A timer that fires for a superseded snapshot is
+    /// discarded rather than parking a set the Workflow has since run past.
+    pub(crate) quiescence_generation: u64,
+}
+
+/// The read-only status probe lang's shutdown sweep uses.
+#[derive(Debug)]
+pub(crate) struct ExternalStreamRunStatusMsg {
+    pub(crate) run_id: String,
+    pub(crate) response_tx: oneshot::Sender<ExternalStreamRunStatus>,
+}
+
+/// Test scaffolding: put a run's wait set into a given state.
+///
+/// Registering waits for real is C6's `WorkflowStreamQuiescent` handling and confirming a park is
+/// C8's handshake, neither of which exists yet. This rides the same serialized local-input lane
+/// as everything else, so a test that uses it still exercises the real routing rather than
+/// reaching into `ManagedRun`'s state.
+/// Test scaffolding: ask a run to emit a marker with no terminal boundary.
+///
+/// No completion path can produce this, which is exactly why the guard needs driving directly.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct EmitTerminalLessMarkerMsg {
+    pub(crate) run_id: String,
+    /// Whether emission refused. `false` would mean a terminal-less annotation was written.
+    pub(crate) response_tx: oneshot::Sender<bool>,
+}
+
+/// Test scaffolding: read a run's accumulated, unwritten replay annotation.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ExternalStreamAnnotationMsg {
+    pub(crate) run_id: String,
+    pub(crate) response_tx: oneshot::Sender<Vec<u8>>,
+}
+
+/// Test scaffolding: ask a run to start its workflow task rollover deadline.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct StartRolloverTimerMsg {
+    pub(crate) run_id: String,
+    pub(crate) wft_timeout: Duration,
+    pub(crate) response_tx: oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ExternalStreamSeedWaitsMsg {
+    pub(crate) run_id: String,
+    pub(crate) wait_ids: Vec<u32>,
+    pub(crate) idle_timeout: Duration,
+    /// When set, the seeded set is left confirmed-parked at this generation.
+    pub(crate) parked_at: Option<u64>,
+    /// When false, the set is left with no Workflow Task open.
+    pub(crate) wft_open: bool,
+    pub(crate) response_tx: oneshot::Sender<()>,
 }
 
 /// Each activation completion produces one of these
@@ -1573,6 +1846,18 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    /// Commits an external stream observation delta. Never implies WFT retention.
+    ExternalStreamProgress(WorkflowStreamProgress),
+    /// Asks Core to retain the open WFT. Carries no annotation data.
+    ExternalStreamQuiescent(WorkflowStreamQuiescent),
+    /// Lang's answer to `PrepareExternalStreamPark`.
+    ExternalStreamParkResult(ExternalStreamParkResult),
+    /// Lang's answer to `FinalizeExternalStreams`.
+    ExternalStreamFinalized(ExternalStreamFinalized),
+    /// Compact manifest for an external output batch already staged by lang.
+    ExternalOutputStreamCommit(WorkflowOutputStreamCommit),
+    /// External output is buffered in lang and needs a run-scoped flush deadline.
+    ExternalOutputStreamBuffered(WorkflowOutputStreamBuffered),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1634,6 +1919,24 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            workflow_command::Variant::WorkflowStreamProgress(s) => {
+                WFCommandVariant::ExternalStreamProgress(s)
+            }
+            workflow_command::Variant::WorkflowStreamQuiescent(s) => {
+                WFCommandVariant::ExternalStreamQuiescent(s)
+            }
+            workflow_command::Variant::ExternalStreamParkResult(s) => {
+                WFCommandVariant::ExternalStreamParkResult(s)
+            }
+            workflow_command::Variant::ExternalStreamFinalized(s) => {
+                WFCommandVariant::ExternalStreamFinalized(s)
+            }
+            workflow_command::Variant::WorkflowOutputStreamCommit(commit) => {
+                WFCommandVariant::ExternalOutputStreamCommit(commit)
+            }
+            workflow_command::Variant::WorkflowOutputStreamBuffered(buffered) => {
+                WFCommandVariant::ExternalOutputStreamBuffered(buffered)
+            }
         };
         Ok(Self {
             variant,
@@ -1678,6 +1981,9 @@ enum CommandID {
 #[derive(Debug, Clone)]
 struct WorkflowStartedInfo {
     workflow_task_timeout: Option<Duration>,
+    /// Chain identity, not this Run's id. A wake Signal names it so Core can tell "same chain,
+    /// stale generation" -- harmless -- from "different chain" -- rejected.
+    first_execution_run_id: String,
     memo: Option<Memo>,
     search_attrs: Option<SearchAttributes>,
     retry_policy: Option<RetryPolicy>,

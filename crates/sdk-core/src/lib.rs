@@ -43,14 +43,15 @@ pub use temporalio_common::protos::TaskToken;
 pub use url::Url;
 pub use worker::{
     ActivitySlotKind, CompleteActivityError, CompleteNexusError, CompleteWfError,
-    FixedSizeSlotSupplier, LocalActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollError,
-    PollerBehavior, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
-    ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
-    SlotInfo, SlotInfoTrait, SlotKind, SlotKindType, SlotMarkUsedContext, SlotReleaseContext,
-    SlotReservationContext, SlotSupplier, SlotSupplierOptions, SlotSupplierPermit, TunerBuilder,
-    TunerHolder, TunerHolderOptions, TunerHolderOptionsBuilder, Worker, WorkerConfig,
-    WorkerConfigBuilder, WorkerTuner, WorkerValidationError, WorkerVersioningStrategy,
-    WorkflowErrorType, WorkflowSlotKind,
+    ExternalStreamReadyResult, ExternalStreamRunStatus, FixedSizeSlotSupplier,
+    LocalActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollError, PollerBehavior,
+    ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder, ResourceBasedTuner,
+    ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions, SlotInfo, SlotInfoTrait,
+    SlotKind, SlotKindType, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
+    SlotSupplier, SlotSupplierOptions, SlotSupplierPermit, TunerBuilder, TunerHolder,
+    TunerHolderOptions, TunerHolderOptionsBuilder, Worker, WorkerConfig, WorkerConfigBuilder,
+    WorkerTuner, WorkerValidationError, WorkerVersioningStrategy, WorkflowErrorType,
+    WorkflowSlotKind,
 };
 
 use crate::{

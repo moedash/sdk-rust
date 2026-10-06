@@ -54,6 +54,9 @@ relevant information.
   failure cause alongside the existing failure.
 * Language SDKs can opt in to recording local activity arguments in the local activity marker's
   `input` detail.
+* Added the Core protocol for replay-safe Workflow-originated external stream output, including
+  exact Workflow Task History floors, compact staged-output marker proofs, and shared input/output
+  replay segmentation.
 * Core console logs can now be emitted as newline-delimited JSON when an SDK selects the JSON log
   format. Configured log filters continue to apply to JSON output.
 * Workflow completion-as-cancelled commands can now carry details for recording on the terminal
@@ -106,6 +109,8 @@ relevant information.
 * Workers now warn when autoscaling task polling encounters errors continuously for one minute.
   Repeated warnings use exponential backoff up to 15-minute intervals and stop after polling
   recovers.
+* Workers now defensively buffer a replacement workflow task if it reaches a run that still owns
+  one, preserving the outstanding task token in release builds.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before they
   begin polling.
 * Ephemeral server processes no longer leak on failed start.

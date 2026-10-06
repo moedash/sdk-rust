@@ -19,6 +19,8 @@ import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/common/common.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
+import "temporal/sdk/core/external_data/external_data.proto";
+import "temporal/sdk/core/workflow_commands/workflow_commands.proto";
 
 // An instruction to the lang sdk to run some workflow code, whether for the first time or from
 // a cached state.
@@ -103,6 +105,10 @@ message WorkflowActivation {
     // the workflow is Pinned.
     // Experimental.
     bool target_worker_deployment_version_changed = 12;
+    // The event immediately preceding this Workflow Task's WorkflowTaskScheduled event in the
+    // ordered History view Core used to build the activation. Zero means Core could not identify
+    // that exact predecessor, in which case output must not be staged for this task.
+    int64 history_floor_event_id = 13;
 }
 
 message WorkflowActivationJob {
@@ -140,11 +146,77 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // One or more external stream waits may have data buffered. Runs user workflow code.
+        ResolveExternalStreamWaits resolve_external_stream_waits = 17;
+        // Runtime-internal: install park intents and recheck every stream. Runs no user code.
+        PrepareExternalStreamPark prepare_external_stream_park = 18;
+        // Replay: deliver the recorded external stream observations from a marker.
+        ReplayExternalStreams replay_external_streams = 19;
+        // Runtime-internal: encode the terminal boundary for a marker Core is about to write.
+        // Runs no user code.
+        FinalizeExternalStreams finalize_external_streams = 20;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
         RemoveFromCache remove_from_cache = 50;
     }
+}
+
+// Tells lang that one or more external stream waits may now have data.
+//
+// This job contains no records. The listed waits are readiness *hints*, not an exhaustive
+// availability claim: on receipt lang probes every active wait, drains all currently available
+// inputs, and only then resumes Workflow futures.
+message ResolveExternalStreamWaits {
+    uint64 quiescence_generation = 1;
+    repeated coresdk.workflow_commands.ExternalStreamWait ready_hints = 2;
+}
+
+// Asks lang to park the complete active wait set through the backend handshake.
+//
+// Runtime-internal: no user Workflow code runs. Lang installs a park intent per subscription,
+// rechecks every stream, and answers with ExternalStreamParkResult. A recheck that finds records
+// answers `became_ready` instead, and Core issues a normal resolve activation next.
+//
+// Requires backend I/O, so lang must not handle this on the synchronous Workflow thread.
+message PrepareExternalStreamPark {
+    uint64 quiescence_generation = 1;
+    // Always the complete active wait set.
+    repeated coresdk.workflow_commands.ExternalStreamWait waits = 2;
+    // One of PARK_REASON_IDLE, PARK_REASON_ALL_WRITE_FENCED, or PARK_REASON_SHUTDOWN.
+    coresdk.external_data.ParkReason reason = 3;
+}
+
+// Carries a recorded marker's annotation back to lang during replay.
+//
+// Core issues exactly one of these per marker. Lang's replay driver walks the annotation's
+// segments in order, performing one event-loop drain per segment, so the live run's k
+// activations become k drains inside this one activation and condition evaluation matches.
+//
+// Requires backend I/O (the recorded range reads and their integrity validation), so lang must
+// prepare it off the Workflow thread and deliver from memory once it is on it.
+message ReplayExternalStreams {
+    uint64 quiescence_generation = 1;
+    repeated coresdk.workflow_commands.ExternalStreamWait waits = 2;
+    // Opaque to Core.
+    bytes replay_annotation = 3;
+    coresdk.external_data.ParkReason terminal_boundary = 4;
+    // The output manifest recorded in the same marker, if this Workflow Task published output.
+    coresdk.external_data.ExternalOutputStreamManifest output = 5;
+}
+
+// Issued before Core writes a marker for a boundary Core itself decided and no park handshake
+// will run: rollover-deadline expiry, and shutdown or eviction with a Workflow Task open.
+//
+// Runs no user Workflow code, cannot resolve futures, and its only legal responses are
+// ExternalStreamFinalized or an activation failure. It requires *no* backend I/O: lang reads the
+// blocked cursor snapshot from its own in-memory manager state. If lang cannot answer, Core
+// writes no marker and the Workflow Task fails for retry -- there is no best-effort path.
+message FinalizeExternalStreams {
+    uint64 quiescence_generation = 1;
+    repeated coresdk.workflow_commands.ExternalStreamWait waits = 2;
+    // One of PARK_REASON_ROLLOVER or PARK_REASON_SHUTDOWN.
+    coresdk.external_data.ParkReason reason = 3;
 }
 
 // Initialize a new workflow

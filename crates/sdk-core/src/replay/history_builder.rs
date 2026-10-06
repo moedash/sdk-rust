@@ -6,14 +6,17 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common::protos::{
-    constants::{LOCAL_ACTIVITY_MARKER_NAME, PATCH_MARKER_NAME},
+    constants::{EXTERNAL_STREAM_MARKER_NAME, LOCAL_ACTIVITY_MARKER_NAME, PATCH_MARKER_NAME},
     coresdk::{
         AsJsonPayloadExt, IntoPayloadsExt,
         common::{
             NamespacedWorkflowExecution, build_has_change_marker_details,
             build_local_activity_marker_details,
         },
-        external_data::LocalActivityMarkerData,
+        external_data::{
+            ExternalStreamMarkerData, ExternalWaitMarker, LocalActivityMarkerData, ParkReason,
+            build_external_stream_marker_details,
+        },
         workflow_commands::ScheduleActivity,
     },
     temporal::api::{
@@ -327,6 +330,64 @@ impl TestHistoryBuilder {
             details: build_local_activity_marker_details(lamd, payload),
             workflow_task_completed_event_id: self.previous_task_completed_id,
             failure,
+            ..Default::default()
+        };
+        self.build_and_push_event(EventType::MarkerRecorded, attrs.into());
+    }
+
+    /// Add an External Workflow Stream marker.
+    ///
+    /// Needed by any test that runs a Workflow Task *after* one that emitted a marker: commands
+    /// are matched to history events in order, so a history missing the marker event hands the
+    /// marker machine whatever event happens to be next.
+    pub fn add_external_stream_marker(
+        &mut self,
+        quiescence_generation: u64,
+        terminal_boundary: ParkReason,
+        replay_annotation: &[u8],
+    ) {
+        self.add_external_stream_marker_covering(
+            quiescence_generation,
+            terminal_boundary,
+            replay_annotation,
+            &[],
+        );
+    }
+
+    /// Add an External Workflow Stream marker recording the waits it closed.
+    ///
+    /// The wait list is what replay hands back to lang alongside the annotation, so a test that
+    /// asserts a replayed set was resolved from history needs a marker that actually names one.
+    pub fn add_external_stream_marker_covering(
+        &mut self,
+        quiescence_generation: u64,
+        terminal_boundary: ParkReason,
+        replay_annotation: &[u8],
+        waits: &[(u32, u64)],
+    ) {
+        let data = ExternalStreamMarkerData {
+            schema_version: 1,
+            quiescence_generation,
+            waits: waits
+                .iter()
+                .map(|(wait_id, generation)| ExternalWaitMarker {
+                    wait_id: *wait_id,
+                    generation: *generation,
+                })
+                .collect(),
+            replay_annotation: replay_annotation.to_vec(),
+            terminal_boundary: terminal_boundary as i32,
+            output: None,
+        };
+        self.add_external_stream_marker_data(data);
+    }
+
+    /// Add an External Workflow Stream marker with an exact test-provided envelope.
+    pub fn add_external_stream_marker_data(&mut self, data: ExternalStreamMarkerData) {
+        let attrs = MarkerRecordedEventAttributes {
+            marker_name: EXTERNAL_STREAM_MARKER_NAME.to_string(),
+            details: build_external_stream_marker_details(&data),
+            workflow_task_completed_event_id: self.previous_task_completed_id,
             ..Default::default()
         };
         self.build_and_push_event(EventType::MarkerRecorded, attrs.into());

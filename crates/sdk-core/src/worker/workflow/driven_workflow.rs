@@ -8,7 +8,9 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
 };
 use temporalio_common::protos::{
-    coresdk::workflow_activation::{WorkflowActivationJob, start_workflow_from_attribs},
+    coresdk::workflow_activation::{
+        WorkflowActivationJob, start_workflow_from_attribs, workflow_activation_job,
+    },
     temporal::api::{
         common::v1::{Payload, SearchAttributes},
         history::v1::WorkflowExecutionStartedEventAttributes,
@@ -50,6 +52,7 @@ impl DrivenWorkflow {
         debug!(run_id = %attribs.original_execution_run_id, "Driven WF start");
         let started_info = WorkflowStartedInfo {
             workflow_task_timeout: attribs.workflow_task_timeout.try_into_or_none(),
+            first_execution_run_id: attribs.first_execution_run_id.clone(),
             memo: attribs.memo.clone(),
             search_attrs: attribs.search_attributes.clone(),
             retry_policy: attribs.retry_policy.clone(),
@@ -73,6 +76,16 @@ impl DrivenWorkflow {
     /// Observe pending jobs
     pub(super) fn peek_pending_jobs(&self) -> &[OutgoingJob] {
         self.outgoing_wf_activation_jobs.as_slice()
+    }
+
+    /// Discards a park job which lost a local race before it was delivered to lang.
+    pub(super) fn discard_pending_external_stream_park(&mut self) {
+        self.outgoing_wf_activation_jobs.retain(|job| {
+            !matches!(
+                &job.variant,
+                workflow_activation_job::Variant::PrepareExternalStreamPark(_)
+            )
+        });
     }
 
     /// Drain all pending jobs, so that they may be sent to the driven workflow
