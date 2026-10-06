@@ -1340,6 +1340,10 @@ impl ManagedRun {
         // consumed data, and so must the marker recording it. Emitting after lang's commands were
         // pushed would put the marker *after* the terminal command in History, and on replay the
         // command would then be matched before the record it came from was validated.
+        //
+        // Completion pagination does not weaken that. It distributes the same command list across
+        // pages in order, the server only buffers the intermediate ones, and the final page is
+        // what merges them, so History still sees one commit with the marker where it was put.
         let terminal = if will_retain {
             None
         } else if let Some(ParkApplication::Confirmed(reason)) = park_outcome {
