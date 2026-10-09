@@ -1573,6 +1573,8 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    /// Compact manifest for an external output batch already staged by lang.
+    ExternalOutputStreamCommit(WorkflowOutputStreamCommit),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1633,6 +1635,9 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
+            }
+            workflow_command::Variant::WorkflowOutputStreamCommit(commit) => {
+                WFCommandVariant::ExternalOutputStreamCommit(commit)
             }
         };
         Ok(Self {

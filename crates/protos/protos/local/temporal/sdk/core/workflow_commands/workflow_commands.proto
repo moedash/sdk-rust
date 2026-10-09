@@ -20,6 +20,7 @@ import "temporal/api/workflow/v1/message.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
+import "temporal/sdk/core/external_data/external_data.proto";
 
 message WorkflowCommand {
     // User metadata that may or may not be persisted into history depending on the command type.
@@ -55,7 +56,15 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        WorkflowOutputStreamCommit workflow_output_stream_commit = 23;
     }
+}
+
+// Reports that the output batch for this Workflow Task has been durably staged outside History.
+// Core records only this compact manifest, in a `core_external_stream` marker ordered before the
+// completion's other commands, so the batch becomes visible exactly when the task is accepted.
+message WorkflowOutputStreamCommit {
+    coresdk.external_data.ExternalOutputStreamManifest manifest = 1;
 }
 
 message StartTimer {
