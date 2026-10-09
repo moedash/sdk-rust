@@ -29,8 +29,10 @@ use crate::{
             WFMachinesError, WorkflowStartedInfo, fatal,
             history_update::NextWFT,
             machines::{
-                HistEventData, activity_state_machine::ActivityMachine,
+                HistEventData,
+                activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
+                external_stream_state_machine::{ExternalStreamMachine, extract_stream_marker},
                 modify_workflow_properties_state_machine::modify_workflow_properties,
                 nexus_operation_state_machine::NexusOperationMachine,
                 update_state_machine::UpdateMachine,
@@ -58,8 +60,10 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_data::{ExternalStreamBoundary, ExternalStreamMarkerData},
             workflow_activation::{
-                self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
+                self, NotifyHasPatch, ReplayExternalStreams, UpdateRandomSeed, WorkflowActivation,
+                workflow_activation_job,
             },
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
@@ -88,8 +92,18 @@ pub(crate) struct WorkflowMachines {
     last_history_from_server: HistoryUpdate,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
+    /// External stream marker machines whose `MarkerRecorded` event has not been reached yet, in
+    /// the order the markers appear in History.
+    ///
+    /// Matched positionally rather than by id: an external stream marker carries no lang-issued
+    /// sequence number. Markers are read in History order, so first-in-first-out is exactly the
+    /// pairing.
+    external_stream_marker_machines: VecDeque<MachineKey>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
+    /// The exact predecessor of the current WorkflowTaskScheduled event in the ordered History
+    /// view. Output staging must fail rather than guess when this is unavailable.
+    current_wft_history_floor_event_id: Option<i64>,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -280,6 +294,7 @@ impl WorkflowMachines {
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
+            current_wft_history_floor_event_id: None,
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -287,6 +302,7 @@ impl WorkflowMachines {
             wft_start_time: None,
             current_wf_time: None,
             observed_internal_flags: Rc::new(RefCell::new(observed_internal_flags)),
+            external_stream_marker_machines: Default::default(),
             history_size_bytes: 0,
             continue_as_new_suggested: false,
             suggest_continue_as_new_reasons: Default::default(),
@@ -406,6 +422,10 @@ impl WorkflowMachines {
         self.current_started_event_id
     }
 
+    pub(crate) fn current_wft_history_floor_event_id(&self) -> Option<i64> {
+        self.current_wft_history_floor_event_id
+    }
+
     pub(crate) fn history_size_bytes(&self) -> u64 {
         self.history_size_bytes
     }
@@ -483,7 +503,54 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
+            history_floor_event_id: self.current_wft_history_floor_event_id.unwrap_or_default(),
         }
+    }
+
+    /// Writes one external stream marker for an output commit lang sent.
+    ///
+    /// Must be called before lang's own commands for the same completion are pushed, so the
+    /// marker precedes every command in History and replay delivers the recorded output before
+    /// any command that followed it is matched.
+    pub(crate) fn emit_external_stream_marker(
+        &mut self,
+        data: ExternalStreamMarkerData,
+    ) -> Result<()> {
+        if data.terminal_boundary() == ExternalStreamBoundary::Unspecified {
+            return Err(fatal!(
+                "Refusing to write an external stream marker with no terminal boundary"
+            ));
+        }
+        if self.replaying {
+            // The marker for this Workflow Task is already in History and the lookahead has
+            // already handed it back to lang. Issuing a command for it now would be matched
+            // against the very event it was read from and fail as a command mismatch.
+            debug!("Not re-writing an external stream marker while replaying");
+            return Ok(());
+        }
+        let key = self.add_cmd_to_wf_task(
+            ExternalStreamMachine::record_marker(data),
+            Default::default(),
+            CommandIdKind::CoreInternal,
+        );
+        self.external_stream_marker_machines.push_back(key);
+        // Lang's iteration has already prepared its commands by the time Core generates this one,
+        // so without preparing again the marker would never leave the current task's queue.
+        self.prepare_commands()
+    }
+
+    /// Hands lang a marker the replay lookahead found, and creates the machine that settles it.
+    fn replay_external_stream_marker(&mut self, data: ExternalStreamMarkerData) {
+        self.drive_me.send_job(
+            workflow_activation_job::Variant::ReplayExternalStreams(ReplayExternalStreams {
+                terminal_boundary: data.terminal_boundary,
+                output: data.output.clone(),
+            })
+            .into(),
+        );
+        let machine = ExternalStreamMachine::resolved_from_marker_lookahead(data);
+        let key = self.all_machines.insert(machine.into());
+        self.external_stream_marker_machines.push_back(key);
     }
 
     pub(crate) fn has_pending_jobs(&self) -> bool {
@@ -524,6 +591,33 @@ impl WorkflowMachines {
     pub(crate) fn reset_last_started_id(&mut self, id: i64) {
         debug!("Resetting back to event id {} due to speculative WFT", id);
         self.current_started_event_id = id;
+        self.current_wft_history_floor_event_id = None;
+        // The server discarded every command from the rejected task. Most command machines are
+        // forbidden on a rejected Update task, but the output marker is generated by Core after
+        // lang answered, so it is the exception. Leaving it queued would report the rejected
+        // stage token alongside the fresh one on the redelivery.
+        let discarded_stream_markers: Vec<_> = self
+            .commands
+            .iter()
+            .chain(&self.current_wf_task_commands)
+            .filter_map(|command| {
+                matches!(
+                    self.all_machines.get(command.machine),
+                    Some(Machines::ExternalStreamMachine(_))
+                )
+                .then_some(command.machine)
+            })
+            .collect();
+        self.commands
+            .retain(|command| !discarded_stream_markers.contains(&command.machine));
+        self.current_wf_task_commands
+            .retain(|command| !discarded_stream_markers.contains(&command.machine));
+        self.external_stream_marker_machines
+            .retain(|key| !discarded_stream_markers.contains(key));
+        for key in discarded_stream_markers {
+            self.machine_is_core_created.remove(key);
+            self.all_machines.remove(key);
+        }
         // We must reset the last event we "processed" to be after the last WFT we really completed
         // + any command events (since the SDK "processed" those when it emitted the commands). This
         // is also equal to what we just processed in the speculative task, minus two, since we
@@ -675,6 +769,9 @@ impl WorkflowMachines {
                     eid
                 ));
             }
+            if event.event_type() == EventType::WorkflowTaskScheduled {
+                self.current_wft_history_floor_event_id = Some(self.last_processed_event);
+            }
             let next_event = history.peek();
 
             // This definition of replaying here is that we are no longer replaying as soon as we
@@ -764,6 +861,7 @@ impl WorkflowMachines {
         #[allow(clippy::large_enum_variant)]
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
+            ExternalStreamMarker(Box<ExternalStreamMarkerData>),
             ProtocolMessage(IncomingProtocolMessage),
         }
         let mut delayed_actions = vec![];
@@ -800,6 +898,11 @@ impl WorkflowMachines {
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
+            } else if let Some(stream_dat) = extract_stream_marker(e) {
+                // The marker is written by the task's completion, so it follows the task in
+                // History. Finding it here hands lang the recorded output in the same activation
+                // that produced it live.
+                delayed_actions.push(DelayedAction::ExternalStreamMarker(Box::new(stream_dat)));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -832,6 +935,9 @@ impl WorkflowMachines {
                         self.local_activity_data.insert_peeked_marker(*la_dat);
                         self.apply_local_activity_peeked_resolutions(false)?;
                     }
+                }
+                DelayedAction::ExternalStreamMarker(stream_dat) => {
+                    self.replay_external_stream_marker(*stream_dat);
                 }
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
@@ -962,6 +1068,36 @@ impl WorkflowMachines {
                     "Encountered local activity marker but the associated machine was of the \
                      wrong type! {event:?}"
                 ));
+            }
+        }
+
+        if extract_stream_marker(event).is_some() {
+            // A marker the lookahead resolved has no command in the outgoing queue, because replay
+            // issues none. A marker no machine expects at all means History and the machines
+            // disagree about what this run did.
+            let mkey = self
+                .external_stream_marker_machines
+                .front()
+                .copied()
+                .ok_or_else(|| {
+                    nondeterminism!(
+                        "Encountered an external stream marker with no state machine expecting \
+                         it: {event:?}"
+                    )
+                })?;
+            let handle_directly = match self.machine(mkey) {
+                Machines::ExternalStreamMachine(m) => m.marker_should_get_special_handling()?,
+                _ => {
+                    return Err(fatal!(
+                        "Encountered external stream marker but the associated machine was of \
+                         the wrong type! {event:?}"
+                    ));
+                }
+            };
+            self.external_stream_marker_machines.pop_front();
+            if handle_directly {
+                self.submachine_handle_event(mkey, event_dat)?;
+                return Ok(EventHandlingOutcome::Normal);
             }
         }
 
@@ -1581,6 +1717,12 @@ impl WorkflowMachines {
                         cancel,
                         annotations
                     );
+                }
+                WFCommandVariant::ExternalOutputStreamCommit(_) => {
+                    return Err(fatal!(
+                        "WorkflowOutputStreamCommit reached the state machines; it should have \
+                         been consumed when the completion was processed"
+                    ));
                 }
                 WFCommandVariant::NoCommandsFromLang => (),
             }

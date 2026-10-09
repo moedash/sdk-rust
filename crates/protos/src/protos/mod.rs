@@ -1000,6 +1000,46 @@ pub mod coresdk {
     }
     pub mod external_data {
         tonic::include_proto!("coresdk.external_data");
+        pub use self::stream_marker_helpers::*;
+        mod stream_marker_helpers {
+            use super::ExternalStreamMarkerData;
+            use crate::protos::temporal::api::common::v1::{Payload, Payloads};
+            use prost::Message;
+            use std::collections::HashMap;
+
+            const DETAILS_KEY: &str = "external_stream";
+
+            /// Packs the marker envelope into a `RecordMarker` details map.
+            ///
+            /// Encoded as proto binary rather than JSON so the marker stays compact and its
+            /// fields keep their wire numbers when the envelope grows.
+            pub fn build_external_stream_marker_details(
+                data: &ExternalStreamMarkerData,
+            ) -> HashMap<String, Payloads> {
+                let payload = Payload {
+                    metadata: HashMap::from([(
+                        "encoding".to_string(),
+                        b"binary/protobuf".to_vec(),
+                    )]),
+                    data: data.encode_to_vec(),
+                    ..Default::default()
+                };
+                HashMap::from([(
+                    DETAILS_KEY.to_string(),
+                    Payloads {
+                        payloads: vec![payload],
+                    },
+                )])
+            }
+
+            /// Reads the envelope back out, or `None` if this is not one of ours.
+            pub fn extract_external_stream_marker_data(
+                details: &HashMap<String, Payloads>,
+            ) -> Option<ExternalStreamMarkerData> {
+                let payload = details.get(DETAILS_KEY)?.payloads.first()?;
+                ExternalStreamMarkerData::decode(payload.data.as_slice()).ok()
+            }
+        }
         mod sdk_helpers {
             use prost_types::{Duration, Timestamp};
             use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1130,6 +1170,7 @@ pub mod coresdk {
                     last_sdk_version: String::new(),
                     suggest_continue_as_new_reasons: vec![],
                     target_worker_deployment_version_changed: false,
+                    history_floor_event_id: 0,
                 }
             }
 
@@ -1276,6 +1317,14 @@ pub mod coresdk {
                         }
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
+                        }
+                        workflow_activation_job::Variant::ReplayExternalStreams(r) => {
+                            write!(
+                                f,
+                                "ReplayExternalStreams({:?}, output: {})",
+                                r.terminal_boundary(),
+                                r.output.is_some()
+                            )
                         }
                     }
                 }
@@ -1640,6 +1689,19 @@ pub mod coresdk {
             impl Display for RequestCancelNexusOperation {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "RequestCancelNexusOperation({})", self.seq)
+                }
+            }
+
+            impl Display for WorkflowOutputStreamCommit {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "WorkflowOutputStreamCommit({} topic(s))",
+                        self.manifest
+                            .as_ref()
+                            .map(|manifest| manifest.topics.len())
+                            .unwrap_or_default()
+                    )
                 }
             }
 

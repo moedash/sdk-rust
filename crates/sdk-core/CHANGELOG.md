@@ -33,6 +33,14 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Experimental: a workflow can commit output it staged in an external stream store with the new
+  `WorkflowOutputStreamCommit` command. Core records the output manifest in a
+  `core_external_stream` marker ahead of the completion's other commands, so the output becomes
+  visible only when the workflow task is accepted. On replay, Core hands the recorded manifest
+  back in a `ReplayExternalStreams` job instead of expecting the output to be staged again.
+  Activations now carry `history_floor_event_id`, which the manifest must match.
+
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
   metrics backends, including the Python SDK's `MetricBuffer`. Previously these counts could
