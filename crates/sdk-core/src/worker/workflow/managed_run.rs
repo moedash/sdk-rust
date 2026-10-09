@@ -32,11 +32,14 @@ use temporalio_common::protos::{
     TaskToken,
     coresdk::{
         common::ExternalStorageMetrics,
+        external_data::{
+            ExternalOutputStreamManifest, ExternalStreamBoundary, ExternalStreamMarkerData,
+        },
         workflow_activation::{
             WorkflowActivation, create_evict_activation, query_to_job,
             remove_from_cache::EvictionReason, workflow_activation_job,
         },
-        workflow_commands::{FailWorkflowExecution, QueryResult},
+        workflow_commands::{FailWorkflowExecution, QueryResult, WorkflowOutputStreamCommit},
         workflow_completion,
     },
     temporal::api::{
@@ -771,10 +774,18 @@ impl ManagedRun {
             )));
         }
 
+        let mut lang_commands = completion.commands;
+        if let Err(source) = self.commit_external_output(&mut lang_commands) {
+            return Err(RunUpdateErr {
+                source,
+                complete_resp_chan: completion.resp_chan,
+            });
+        }
+
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
-            self.wfm.push_commands_and_iterate(completion.commands)?;
+            self.wfm.push_commands_and_iterate(lang_commands)?;
             if let Some(update) = update_from_new_page {
                 self.wfm.feed_history_from_new_page(update)?;
             }
@@ -867,6 +878,45 @@ impl ManagedRun {
                 complete_resp_chan: completion.resp_chan,
             }),
         }
+    }
+
+    /// Records lang's staged output, if it sent any, as a marker ahead of its other commands.
+    ///
+    /// The marker is what makes the staged batch visible: readers promote it only once the marker
+    /// is in History, so a Workflow Task that fails or times out publishes nothing.
+    fn commit_external_output(&mut self, commands: &mut Vec<WFCommand>) -> Result<()> {
+        let Some(commit) = take_output_stream_commit(commands)? else {
+            return Ok(());
+        };
+        let Some(manifest) = commit.manifest else {
+            return Err(WFMachinesError::Fatal(
+                "WorkflowOutputStreamCommit carried no staged output manifest".to_string(),
+            ));
+        };
+        validate_output_manifest(
+            &manifest,
+            self.wfm.machines.current_wft_history_floor_event_id(),
+            &self.wfm.machines.run_id,
+        )?;
+        let terminal_boundary = if commands.iter().any(|c| c.variant.is_terminal()) {
+            ExternalStreamBoundary::WorkflowCompleted
+        } else if commands.iter().any(|c| {
+            !matches!(
+                c.variant,
+                WFCommandVariant::NoCommandsFromLang | WFCommandVariant::QueryResponse(_)
+            )
+        }) {
+            ExternalStreamBoundary::CommandsProduced
+        } else {
+            ExternalStreamBoundary::TaskCompleted
+        };
+        self.wfm
+            .machines
+            .emit_external_stream_marker(ExternalStreamMarkerData {
+                schema_version: EXTERNAL_STREAM_MARKER_SCHEMA_VERSION,
+                terminal_boundary: terminal_boundary as i32,
+                output: Some(manifest),
+            })
     }
 
     fn _local_resolution(
@@ -1306,6 +1356,115 @@ impl ManagedRun {
 // placed at the end. Return new command sequence and query commands. Note that
 // multiple coroutines may have generated a terminal command, leading to
 // multiple terminal commands in the input to this function.
+/// The marker version Core writes. Readers must accept every version up to this one.
+const EXTERNAL_STREAM_MARKER_SCHEMA_VERSION: u32 = 1;
+/// Keeps one output proof well inside the server's per-event payload limits.
+const MAX_OUTPUT_MANIFEST_BYTES: usize = 64 * 1024;
+
+/// Removes lang's output commit from `commands`, if it sent one.
+fn take_output_stream_commit(
+    commands: &mut Vec<WFCommand>,
+) -> Result<Option<WorkflowOutputStreamCommit>> {
+    let mut commit = None;
+    let mut error = None;
+    commands.retain_mut(|command| {
+        let WFCommandVariant::ExternalOutputStreamCommit(taken) = &mut command.variant else {
+            return true;
+        };
+        if commit.replace(mem::take(taken)).is_some() {
+            error = Some(WFMachinesError::Fatal(
+                "Lang sent more than one WorkflowOutputStreamCommit in one completion".to_string(),
+            ));
+        }
+        false
+    });
+    match error {
+        Some(err) => Err(err),
+        None => Ok(commit),
+    }
+}
+
+/// Rejects a manifest that this Workflow Task could not have produced, or that replay could not
+/// validate later.
+fn validate_output_manifest(
+    manifest: &ExternalOutputStreamManifest,
+    history_floor_event_id: Option<i64>,
+    run_id: &str,
+) -> Result<()> {
+    let Some(history_floor_event_id) = history_floor_event_id.filter(|id| *id > 0) else {
+        return Err(WFMachinesError::Fatal(
+            "Refusing an external output commit because Core could not identify the exact event \
+             preceding this Workflow Task's scheduled event"
+                .to_string(),
+        ));
+    };
+    if manifest.history_floor_event_id != history_floor_event_id {
+        return Err(WFMachinesError::Fatal(format!(
+            "External output manifest history floor {} does not match this Workflow Task's exact \
+             floor {history_floor_event_id}",
+            manifest.history_floor_event_id
+        )));
+    }
+    if manifest.run_id != run_id {
+        return Err(WFMachinesError::Fatal(format!(
+            "External output manifest names Run {} but this Workflow Task belongs to {run_id}",
+            manifest.run_id
+        )));
+    }
+    if manifest.stage_token.is_empty() {
+        return Err(WFMachinesError::Fatal(
+            "External output manifest carried an empty stage token".to_string(),
+        ));
+    }
+    if manifest.schema_version != 1
+        || manifest.fingerprint_version != 1
+        || manifest.provider_id.is_empty()
+        || manifest.provider_format_version == 0
+        || manifest.topics.is_empty()
+        || manifest.segments.is_empty()
+        || prost::Message::encoded_len(manifest) > MAX_OUTPUT_MANIFEST_BYTES
+    {
+        return Err(WFMachinesError::Fatal(format!(
+            "External output manifest has an unsupported version, missing provider, empty \
+             schedule, or exceeds the {} KiB marker budget",
+            MAX_OUTPUT_MANIFEST_BYTES / 1024
+        )));
+    }
+    let mut topic_names = HashSet::new();
+    let malformed_topic = manifest.topics.iter().any(|topic| {
+        topic.topic.is_empty()
+            || !topic_names.insert(topic.topic.as_str())
+            || topic.record_count == 0
+            || topic.logical_byte_count == 0
+            || topic.logical_fingerprint.len() != 32
+    });
+    let malformed_segment = manifest
+        .segments
+        .iter()
+        .any(|segment| segment.record_counts_by_topic.len() != manifest.topics.len());
+    let counts_disagree = !malformed_segment
+        && manifest
+            .topics
+            .iter()
+            .enumerate()
+            .any(|(topic_index, topic)| {
+                manifest
+                    .segments
+                    .iter()
+                    .map(|segment| u64::from(segment.record_counts_by_topic[topic_index]))
+                    .sum::<u64>()
+                    != u64::from(topic.record_count)
+            });
+    if malformed_topic || malformed_segment || counts_disagree {
+        return Err(WFMachinesError::Fatal(
+            "External output manifest has duplicate or malformed topics, fingerprints, or \
+             activation segment counts"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn preprocess_command_sequence(commands: Vec<WFCommand>) -> (Vec<WFCommand>, Vec<QueryResult>) {
     let mut query_results = vec![];
     let mut terminals = vec![];
@@ -1698,6 +1857,168 @@ mod tests {
         field::{Field, Visit},
         span,
     };
+
+    mod output_commit {
+        use super::super::{take_output_stream_commit, validate_output_manifest};
+        use crate::worker::workflow::{CommandAnnotations, WFCommand, WFCommandVariant};
+        use temporalio_common::protos::coresdk::{
+            external_data::{
+                ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
+                ExternalOutputTopicManifest,
+            },
+            workflow_commands::{StartTimer, WorkflowOutputStreamCommit},
+        };
+
+        const RUN_ID: &str = "run-id";
+        const FLOOR: i64 = 4;
+
+        fn manifest() -> ExternalOutputStreamManifest {
+            ExternalOutputStreamManifest {
+                schema_version: 1,
+                fingerprint_version: 1,
+                stage_token: "token".to_string(),
+                history_floor_event_id: FLOOR,
+                run_id: RUN_ID.to_string(),
+                topics: vec![
+                    ExternalOutputTopicManifest {
+                        topic: "a".to_string(),
+                        record_count: 3,
+                        logical_byte_count: 9,
+                        logical_fingerprint: vec![1; 32],
+                        finished: false,
+                    },
+                    ExternalOutputTopicManifest {
+                        topic: "b".to_string(),
+                        record_count: 1,
+                        logical_byte_count: 2,
+                        logical_fingerprint: vec![2; 32],
+                        finished: true,
+                    },
+                ],
+                segments: vec![
+                    ExternalOutputSegmentManifest {
+                        record_counts_by_topic: vec![2, 0],
+                    },
+                    ExternalOutputSegmentManifest {
+                        record_counts_by_topic: vec![1, 1],
+                    },
+                ],
+                provider_id: "provider".to_string(),
+                provider_format_version: 1,
+            }
+        }
+
+        fn rejection(manifest: ExternalOutputStreamManifest, floor: Option<i64>) -> String {
+            validate_output_manifest(&manifest, floor, RUN_ID)
+                .expect_err("manifest must be rejected")
+                .to_string()
+        }
+
+        fn command(variant: WFCommandVariant) -> WFCommand {
+            WFCommand {
+                variant,
+                annotations: CommandAnnotations::default(),
+            }
+        }
+
+        #[test]
+        fn a_well_formed_manifest_is_accepted() {
+            validate_output_manifest(&manifest(), Some(FLOOR), RUN_ID).unwrap();
+        }
+
+        #[test]
+        fn an_unknown_floor_is_refused_rather_than_guessed() {
+            assert!(rejection(manifest(), None).contains("exact event"));
+            assert!(rejection(manifest(), Some(0)).contains("exact event"));
+        }
+
+        #[test]
+        fn a_different_floor_or_run_is_refused() {
+            assert!(rejection(manifest(), Some(FLOOR + 1)).contains("history floor"));
+            let mut other_run = manifest();
+            other_run.run_id = "other-run".to_string();
+            assert!(rejection(other_run, Some(FLOOR)).contains("names Run"));
+        }
+
+        #[test]
+        fn an_empty_stage_token_is_refused() {
+            let mut m = manifest();
+            m.stage_token.clear();
+            assert!(rejection(m, Some(FLOOR)).contains("empty stage token"));
+        }
+
+        #[test]
+        fn unsupported_versions_and_missing_provider_are_refused() {
+            for edit in [
+                (|m: &mut ExternalOutputStreamManifest| m.schema_version = 2)
+                    as fn(&mut ExternalOutputStreamManifest),
+                |m| m.fingerprint_version = 0,
+                |m| m.provider_id.clear(),
+                |m| m.provider_format_version = 0,
+                |m| m.topics.clear(),
+                |m| m.segments.clear(),
+                |m| m.stage_token = "x".repeat(64 * 1024),
+            ] {
+                let mut m = manifest();
+                edit(&mut m);
+                assert!(rejection(m, Some(FLOOR)).contains("unsupported version"));
+            }
+        }
+
+        #[test]
+        fn malformed_topics_and_segment_counts_are_refused() {
+            for edit in [
+                (|m: &mut ExternalOutputStreamManifest| m.topics[1].topic = "a".to_string())
+                    as fn(&mut ExternalOutputStreamManifest),
+                |m| m.topics[0].topic.clear(),
+                |m| m.topics[0].record_count = 0,
+                |m| m.topics[0].logical_byte_count = 0,
+                |m| m.topics[0].logical_fingerprint.truncate(31),
+                |m| m.segments[0].record_counts_by_topic.truncate(1),
+                |m| m.segments[0].record_counts_by_topic[0] = 5,
+            ] {
+                let mut m = manifest();
+                edit(&mut m);
+                assert!(rejection(m, Some(FLOOR)).contains("malformed topics"));
+            }
+        }
+
+        #[test]
+        fn the_commit_is_taken_out_and_other_commands_keep_their_order() {
+            let mut commands = vec![
+                command(WFCommandVariant::AddTimer(StartTimer {
+                    seq: 1,
+                    ..Default::default()
+                })),
+                command(WFCommandVariant::ExternalOutputStreamCommit(
+                    WorkflowOutputStreamCommit {
+                        manifest: Some(manifest()),
+                    },
+                )),
+                command(WFCommandVariant::AddTimer(StartTimer {
+                    seq: 2,
+                    ..Default::default()
+                })),
+            ];
+            let commit = take_output_stream_commit(&mut commands).unwrap().unwrap();
+            assert_eq!(commit.manifest, Some(manifest()));
+            let seqs: Vec<_> = commands
+                .iter()
+                .map(|c| match &c.variant {
+                    WFCommandVariant::AddTimer(t) => t.seq,
+                    other => panic!("unexpected command left behind: {other}"),
+                })
+                .collect();
+            assert_eq!(seqs, vec![1, 2]);
+        }
+
+        #[test]
+        fn no_commit_leaves_the_commands_untouched() {
+            let mut commands = vec![command(WFCommandVariant::NoCommandsFromLang)];
+            assert!(take_output_stream_commit(&mut commands).unwrap().is_none());
+            assert_eq!(commands.len(), 1);
+        }
+    }
 
     use command_utils::*;
 
