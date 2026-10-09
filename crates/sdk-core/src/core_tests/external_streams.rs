@@ -1,5 +1,6 @@
-//! External stream output commit: the marker a completion writes for staged output, and the
-//! history floor the manifest is checked against.
+//! External stream output commit: the marker a completion writes for staged output, the history
+//! floor the manifest is checked against, and how replay hands the recorded manifest back and
+//! checks a recomputed one against it.
 
 use crate::{
     replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder, canned_histories},
@@ -111,6 +112,19 @@ fn output_then_timer_history() -> (TestHistoryBuilder, ExternalOutputStreamManif
     t.add_timer_fired(timer_started, "1".to_string());
     t.add_workflow_task_scheduled_and_started();
     (t, manifest)
+}
+
+fn replay_outputs(activation: &WorkflowActivation) -> Vec<ExternalOutputStreamManifest> {
+    activation
+        .jobs
+        .iter()
+        .filter_map(|job| match &job.variant {
+            Some(workflow_activation_job::Variant::ReplayExternalStreams(replay)) => {
+                replay.output.clone()
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn has_fire_timer(activation: &WorkflowActivation) -> bool {
@@ -452,6 +466,207 @@ async fn a_marker_in_history_with_a_different_manifest_is_nondeterministic() {
     // Applying the next task reconciles the written marker against History and fails it.
     worker.handle_eviction().await;
     worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn replay_hands_the_recorded_manifest_back_and_writes_nothing() {
+    let (history, manifest) = output_then_timer_history();
+    let replay_markers: RecordedMarkers = Default::default();
+    let worker = worker_recording(
+        history,
+        vec![2.into()],
+        replay_markers.clone(),
+        Default::default(),
+        0,
+    );
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(replay_outputs(&replayed), vec![manifest]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(has_fire_timer(&fired));
+    worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        *replay_markers.lock(),
+        vec![Vec::<ExternalStreamMarkerData>::new()],
+        "the marker found by replay lookahead must not be written again"
+    );
+}
+
+#[tokio::test]
+async fn the_output_marker_survives_a_cache_eviction() {
+    let (history, manifest) = output_then_timer_history();
+    let markers: RecordedMarkers = Default::default();
+    let worker = worker_recording(
+        history,
+        vec![1.into(), ResponseType::AllHistory],
+        markers.clone(),
+        Default::default(),
+        0,
+    );
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(manifest.clone()),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.request_workflow_eviction(&run_id);
+    worker.handle_eviction().await;
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(
+        replay_outputs(&replayed),
+        vec![manifest.clone()],
+        "the rebuilt run must receive the recorded manifest instead of staging again"
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    assert!(has_fire_timer(&fired));
+    worker.complete_execution(&run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let written = markers.lock();
+    assert_eq!(
+        written.as_slice(),
+        &[
+            vec![output_marker(
+                ExternalStreamBoundary::CommandsProduced,
+                manifest
+            )],
+            vec![],
+        ],
+        "only the live task writes the marker; the replayed one does not"
+    );
+}
+
+/// Replays `history` and answers its first activation with `commit`.
+async fn replay_with_commit(
+    history: TestHistoryBuilder,
+    commit: ExternalOutputStreamManifest,
+    num_expected_fails: usize,
+) {
+    let markers: RecordedMarkers = Default::default();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [2], mock_worker_client());
+    mock_cfg.num_expected_fails = num_expected_fails;
+    mock_cfg.expect_fail_wft_matcher =
+        Box::new(|_, cause, _| *cause == WorkflowTaskFailedCause::NonDeterministicError);
+    if num_expected_fails == 0 {
+        let recorded = markers.clone();
+        mock_cfg.completion_mock_fn = Some(Box::new(move |wft| {
+            recorded.lock().push(stream_marker_data(wft));
+            Ok(RespondWorkflowTaskCompletedResponse::default())
+        }));
+    }
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id.clone(),
+            vec![
+                output_commit_command(commit),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    if num_expected_fails == 0 {
+        let fired = worker.poll_workflow_activation().await.unwrap();
+        assert!(has_fire_timer(&fired));
+        worker.complete_execution(&fired.run_id).await;
+        worker.drain_pollers_and_shutdown().await;
+    } else {
+        worker.shutdown().await;
+        worker.finalize_shutdown().await;
+    }
+    assert!(
+        markers.lock().iter().all(Vec::is_empty),
+        "replay never writes an output marker"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_commit_matching_history_is_accepted_without_a_stage_token() {
+    let (history, mut manifest) = output_then_timer_history();
+    manifest.stage_token.clear();
+    replay_with_commit(history, manifest, 0).await;
+}
+
+#[tokio::test]
+async fn a_replayed_commit_that_differs_from_history_is_nondeterministic() {
+    let (history, mut manifest) = output_then_timer_history();
+    manifest.topics[0].record_count = 3;
+    manifest.segments[0].record_counts_by_topic = vec![3];
+    replay_with_commit(history, manifest, 1).await;
+}
+
+#[tokio::test]
+async fn a_replayed_commit_where_history_recorded_none_is_nondeterministic() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    let timer_started = history.add_by_type(EventType::TimerStarted);
+    history.add_timer_fired(timer_started, "1".to_string());
+    history.add_workflow_task_scheduled_and_started();
+
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [2], mock_worker_client());
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.expect_fail_wft_matcher = Box::new(|_, cause, failure| {
+        *cause == WorkflowTaskFailedCause::NonDeterministicError
+            && failure
+                .as_ref()
+                .is_some_and(|f| f.message.contains("recorded none"))
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert!(replay_outputs(&replayed).is_empty());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id.clone(),
+            vec![
+                output_commit_command(output_manifest(&replayed.run_id, 1, "")),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
 }
 
 async fn exercise_speculative_output_redelivery(changed_manifest: bool) {

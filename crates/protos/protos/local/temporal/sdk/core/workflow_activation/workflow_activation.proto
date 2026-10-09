@@ -157,9 +157,10 @@ message WorkflowActivationJob {
 // Carries a recorded external stream marker back to lang during replay.
 //
 // Core issues exactly one of these per marker, in the activation for the Workflow Task that wrote
-// it, found by lookahead. Lang compares the output it recomputes against `output` instead of
-// staging it again, so a publishing Workflow replays without touching the stream store. Fields 1
-// to 3 are left free for the stream input state the same marker will carry.
+// it, found by lookahead. Lang must not stage the output again, so a publishing Workflow replays
+// without touching the stream store. Lang may compare its recomputed output against `output`
+// itself, or send it back as a WorkflowOutputStreamCommit for Core to compare. Fields 1 to 3 are
+// left free for the stream input state the same marker will carry.
 message ReplayExternalStreams {
     coresdk.external_data.ExternalStreamBoundary terminal_boundary = 4;
     // The output manifest recorded in the marker, if this Workflow Task published output.

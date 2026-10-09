@@ -893,6 +893,10 @@ impl ManagedRun {
                 "WorkflowOutputStreamCommit carried no staged output manifest".to_string(),
             ));
         };
+        if self.wfm.machines.replaying {
+            let recorded = self.wfm.machines.take_replayed_output_manifest();
+            return check_replayed_output_manifest(manifest, recorded);
+        }
         validate_output_manifest(
             &manifest,
             self.wfm.machines.current_wft_history_floor_event_id(),
@@ -1465,6 +1469,31 @@ fn validate_output_manifest(
     Ok(())
 }
 
+/// Compares the output lang recomputed while replaying with the manifest History recorded.
+///
+/// The stage token is left out because lang must not stage again on replay, so it has no token to
+/// offer. Everything else is derived deterministically from the Workflow's own output.
+fn check_replayed_output_manifest(
+    mut replayed: ExternalOutputStreamManifest,
+    recorded: Option<ExternalOutputStreamManifest>,
+) -> Result<()> {
+    let Some(mut recorded) = recorded else {
+        return Err(WFMachinesError::Nondeterminism(
+            "Lang committed external output while replaying a Workflow Task that recorded none"
+                .to_string(),
+        ));
+    };
+    replayed.stage_token.clear();
+    recorded.stage_token.clear();
+    if replayed != recorded {
+        return Err(WFMachinesError::Nondeterminism(format!(
+            "External output committed while replaying differs from the manifest recorded in \
+             History: committed {replayed:?}, recorded {recorded:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn preprocess_command_sequence(commands: Vec<WFCommand>) -> (Vec<WFCommand>, Vec<QueryResult>) {
     let mut query_results = vec![];
     let mut terminals = vec![];
@@ -1859,8 +1888,12 @@ mod tests {
     };
 
     mod output_commit {
-        use super::super::{take_output_stream_commit, validate_output_manifest};
-        use crate::worker::workflow::{CommandAnnotations, WFCommand, WFCommandVariant};
+        use super::super::{
+            check_replayed_output_manifest, take_output_stream_commit, validate_output_manifest,
+        };
+        use crate::worker::workflow::{
+            CommandAnnotations, WFCommand, WFCommandVariant, WFMachinesError,
+        };
         use temporalio_common::protos::coresdk::{
             external_data::{
                 ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
@@ -2010,6 +2043,31 @@ mod tests {
                 })
                 .collect();
             assert_eq!(seqs, vec![1, 2]);
+        }
+
+        #[test]
+        fn a_replayed_commit_matches_the_recorded_manifest_whatever_its_token() {
+            let mut replayed = manifest();
+            replayed.stage_token.clear();
+            check_replayed_output_manifest(replayed, Some(manifest())).unwrap();
+        }
+
+        #[test]
+        fn a_replayed_commit_that_differs_from_history_is_nondeterministic() {
+            let mut replayed = manifest();
+            replayed.topics[0].logical_fingerprint = vec![9; 32];
+            assert!(matches!(
+                check_replayed_output_manifest(replayed, Some(manifest())),
+                Err(WFMachinesError::Nondeterminism(message)) if message.contains("differs")
+            ));
+        }
+
+        #[test]
+        fn a_replayed_commit_with_nothing_recorded_is_nondeterministic() {
+            assert!(matches!(
+                check_replayed_output_manifest(manifest(), None),
+                Err(WFMachinesError::Nondeterminism(message)) if message.contains("recorded none")
+            ));
         }
 
         #[test]

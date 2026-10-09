@@ -63,6 +63,8 @@ message WorkflowCommand {
 // Reports that the output batch for this Workflow Task has been durably staged outside History.
 // Core records only this compact manifest, in a `core_external_stream` marker ordered before the
 // completion's other commands, so the batch becomes visible exactly when the task is accepted.
+// While replaying, Core writes nothing and instead requires the manifest to equal the recorded
+// one, ignoring `stage_token`; a mismatch, or a commit where none was recorded, is nondeterminism.
 message WorkflowOutputStreamCommit {
     coresdk.external_data.ExternalOutputStreamManifest manifest = 1;
 }
