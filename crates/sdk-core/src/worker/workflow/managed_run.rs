@@ -1858,6 +1858,168 @@ mod tests {
         span,
     };
 
+    mod output_commit {
+        use super::super::{take_output_stream_commit, validate_output_manifest};
+        use crate::worker::workflow::{CommandAnnotations, WFCommand, WFCommandVariant};
+        use temporalio_common::protos::coresdk::{
+            external_data::{
+                ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
+                ExternalOutputTopicManifest,
+            },
+            workflow_commands::{StartTimer, WorkflowOutputStreamCommit},
+        };
+
+        const RUN_ID: &str = "run-id";
+        const FLOOR: i64 = 4;
+
+        fn manifest() -> ExternalOutputStreamManifest {
+            ExternalOutputStreamManifest {
+                schema_version: 1,
+                fingerprint_version: 1,
+                stage_token: "token".to_string(),
+                history_floor_event_id: FLOOR,
+                run_id: RUN_ID.to_string(),
+                topics: vec![
+                    ExternalOutputTopicManifest {
+                        topic: "a".to_string(),
+                        record_count: 3,
+                        logical_byte_count: 9,
+                        logical_fingerprint: vec![1; 32],
+                        finished: false,
+                    },
+                    ExternalOutputTopicManifest {
+                        topic: "b".to_string(),
+                        record_count: 1,
+                        logical_byte_count: 2,
+                        logical_fingerprint: vec![2; 32],
+                        finished: true,
+                    },
+                ],
+                segments: vec![
+                    ExternalOutputSegmentManifest {
+                        record_counts_by_topic: vec![2, 0],
+                    },
+                    ExternalOutputSegmentManifest {
+                        record_counts_by_topic: vec![1, 1],
+                    },
+                ],
+                provider_id: "provider".to_string(),
+                provider_format_version: 1,
+            }
+        }
+
+        fn rejection(manifest: ExternalOutputStreamManifest, floor: Option<i64>) -> String {
+            validate_output_manifest(&manifest, floor, RUN_ID)
+                .expect_err("manifest must be rejected")
+                .to_string()
+        }
+
+        fn command(variant: WFCommandVariant) -> WFCommand {
+            WFCommand {
+                variant,
+                annotations: CommandAnnotations::default(),
+            }
+        }
+
+        #[test]
+        fn a_well_formed_manifest_is_accepted() {
+            validate_output_manifest(&manifest(), Some(FLOOR), RUN_ID).unwrap();
+        }
+
+        #[test]
+        fn an_unknown_floor_is_refused_rather_than_guessed() {
+            assert!(rejection(manifest(), None).contains("exact event"));
+            assert!(rejection(manifest(), Some(0)).contains("exact event"));
+        }
+
+        #[test]
+        fn a_different_floor_or_run_is_refused() {
+            assert!(rejection(manifest(), Some(FLOOR + 1)).contains("history floor"));
+            let mut other_run = manifest();
+            other_run.run_id = "other-run".to_string();
+            assert!(rejection(other_run, Some(FLOOR)).contains("names Run"));
+        }
+
+        #[test]
+        fn an_empty_stage_token_is_refused() {
+            let mut m = manifest();
+            m.stage_token.clear();
+            assert!(rejection(m, Some(FLOOR)).contains("empty stage token"));
+        }
+
+        #[test]
+        fn unsupported_versions_and_missing_provider_are_refused() {
+            for edit in [
+                (|m: &mut ExternalOutputStreamManifest| m.schema_version = 2)
+                    as fn(&mut ExternalOutputStreamManifest),
+                |m| m.fingerprint_version = 0,
+                |m| m.provider_id.clear(),
+                |m| m.provider_format_version = 0,
+                |m| m.topics.clear(),
+                |m| m.segments.clear(),
+                |m| m.stage_token = "x".repeat(64 * 1024),
+            ] {
+                let mut m = manifest();
+                edit(&mut m);
+                assert!(rejection(m, Some(FLOOR)).contains("unsupported version"));
+            }
+        }
+
+        #[test]
+        fn malformed_topics_and_segment_counts_are_refused() {
+            for edit in [
+                (|m: &mut ExternalOutputStreamManifest| m.topics[1].topic = "a".to_string())
+                    as fn(&mut ExternalOutputStreamManifest),
+                |m| m.topics[0].topic.clear(),
+                |m| m.topics[0].record_count = 0,
+                |m| m.topics[0].logical_byte_count = 0,
+                |m| m.topics[0].logical_fingerprint.truncate(31),
+                |m| m.segments[0].record_counts_by_topic.truncate(1),
+                |m| m.segments[0].record_counts_by_topic[0] = 5,
+            ] {
+                let mut m = manifest();
+                edit(&mut m);
+                assert!(rejection(m, Some(FLOOR)).contains("malformed topics"));
+            }
+        }
+
+        #[test]
+        fn the_commit_is_taken_out_and_other_commands_keep_their_order() {
+            let mut commands = vec![
+                command(WFCommandVariant::AddTimer(StartTimer {
+                    seq: 1,
+                    ..Default::default()
+                })),
+                command(WFCommandVariant::ExternalOutputStreamCommit(
+                    WorkflowOutputStreamCommit {
+                        manifest: Some(manifest()),
+                    },
+                )),
+                command(WFCommandVariant::AddTimer(StartTimer {
+                    seq: 2,
+                    ..Default::default()
+                })),
+            ];
+            let commit = take_output_stream_commit(&mut commands).unwrap().unwrap();
+            assert_eq!(commit.manifest, Some(manifest()));
+            let seqs: Vec<_> = commands
+                .iter()
+                .map(|c| match &c.variant {
+                    WFCommandVariant::AddTimer(t) => t.seq,
+                    other => panic!("unexpected command left behind: {other}"),
+                })
+                .collect();
+            assert_eq!(seqs, vec![1, 2]);
+        }
+
+        #[test]
+        fn no_commit_leaves_the_commands_untouched() {
+            let mut commands = vec![command(WFCommandVariant::NoCommandsFromLang)];
+            assert!(take_output_stream_commit(&mut commands).unwrap().is_none());
+            assert_eq!(commands.len(), 1);
+        }
+    }
+
     use command_utils::*;
 
     #[derive(Default)]
