@@ -3229,6 +3229,7 @@ mod tests {
 
             let init = live.get_next_activation().unwrap();
             live_activations.push(job_names(&init));
+            let mut live_floors = vec![init.history_floor_event_id];
             commit_live(&mut live, first.clone());
             live.push_commands_and_iterate(vec![schedule_la_1()])
                 .unwrap();
@@ -3256,6 +3257,7 @@ mod tests {
                 heartbeat_task
             };
             live_activations.push(job_names(&resolved));
+            live_floors.push(resolved.history_floor_event_id);
             commit_live(&mut live, second.clone());
             live.push_commands_and_iterate(vec![complete_workflow()])
                 .unwrap();
@@ -3290,11 +3292,13 @@ mod tests {
             let mut replay_activations = vec![];
             let mut replayed_manifests = vec![];
             let mut replay_jobs = vec![];
+            let mut replay_floors = vec![];
             loop {
                 let activation = replay.get_next_activation().unwrap();
                 if activation.jobs.is_empty() {
                     break;
                 }
+                replay_floors.push(activation.history_floor_event_id);
                 let lang_jobs: Vec<_> = job_names(&WorkflowActivation {
                     jobs: activation
                         .jobs
@@ -3331,6 +3335,8 @@ mod tests {
                 replay_activations.push(lang_jobs);
             }
             assert_eq!(replay_activations, live_activations);
+            // The replay check compares the floor, so a heartbeat chain must report the same one.
+            assert_eq!(replay_floors, live_floors);
             assert_eq!(
                 replay_jobs,
                 vec![vec!["before".to_owned()], vec!["after".to_owned()]],

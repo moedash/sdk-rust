@@ -264,6 +264,16 @@ impl TryFrom<HistEventData> for ExternalStreamMachineEvents {
     }
 }
 
+/// Whether `e` is a `MarkerRecorded` event with our marker name, whatever its details hold.
+pub(super) fn is_stream_marker(e: &HistoryEvent) -> bool {
+    e.event_type() == EventType::MarkerRecorded
+        && matches!(
+            &e.attributes,
+            Some(history_event::Attributes::MarkerRecordedEventAttributes(attrs))
+                if attrs.marker_name == EXTERNAL_STREAM_MARKER_NAME
+        )
+}
+
 /// The envelope inside a `MarkerRecorded` event, if it is one of ours.
 pub(super) fn extract_stream_marker(e: &HistoryEvent) -> Option<ExternalStreamMarkerData> {
     if e.event_type() != EventType::MarkerRecorded {

@@ -32,7 +32,9 @@ use crate::{
                 HistEventData,
                 activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
-                external_stream_state_machine::{ExternalStreamMachine, extract_stream_marker},
+                external_stream_state_machine::{
+                    ExternalStreamMachine, extract_stream_marker, is_stream_marker,
+                },
                 modify_workflow_properties_state_machine::modify_workflow_properties,
                 nexus_operation_state_machine::NexusOperationMachine,
                 update_state_machine::UpdateMachine,
@@ -896,10 +898,14 @@ impl WorkflowMachines {
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
-            } else if let Some(stream_dat) = extract_stream_marker(e) {
+            } else if is_stream_marker(e) {
                 // The marker is written by the task's completion, so it follows the task in
                 // History. Finding it here hands lang the recorded output in the same activation
-                // that produced it live.
+                // that produced it live. Our name with details that don't decode is a broken
+                // History, and matching it as a foreign marker later would hide that.
+                let Some(stream_dat) = extract_stream_marker(e) else {
+                    return Err(fatal!("External stream marker was unparsable: {e:?}"));
+                };
                 delayed_actions.push(DelayedAction::ExternalStreamMarker(Box::new(stream_dat)));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
