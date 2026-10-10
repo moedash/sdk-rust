@@ -3,6 +3,7 @@
 //! checks a recomputed one against it.
 
 use crate::{
+    TaskToken,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers, mock_worker,
@@ -35,11 +36,13 @@ use temporalio_common::{
             command::v1::{Command, command},
             common::v1::Payload,
             enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
+            failure::v1::Failure,
             workflowservice::v1::RespondWorkflowTaskCompletedResponse,
         },
     },
     worker::WorkerTaskTypes,
 };
+use tokio::sync::Notify;
 
 /// Every completion's external stream markers, in the order the completions were reported.
 type RecordedMarkers = Arc<Mutex<Vec<Vec<ExternalStreamMarkerData>>>>;
@@ -701,33 +704,56 @@ async fn a_replayed_commit_where_history_recorded_none_is_nondeterministic() {
     worker.finalize_shutdown().await;
 }
 
+/// The predicate a mock applies to every Workflow Task failure it is asked to report.
+type FailMatcher =
+    Box<dyn Fn(&TaskToken, &WorkflowTaskFailedCause, &Option<Failure>) -> bool + Send>;
+
+/// Accepts only a nondeterminism failure naming `message`, and signals `failed` when one comes.
+fn nondeterminism_matcher(message: &'static str, failed: Arc<Notify>) -> FailMatcher {
+    Box::new(move |_, cause, failure| {
+        let matches = *cause == WorkflowTaskFailedCause::NonDeterministicError
+            && failure
+                .as_ref()
+                .is_some_and(|f| f.message.contains(message));
+        if matches {
+            failed.notify_one();
+        }
+        matches
+    })
+}
+
+/// Waits a bounded time for the expected Workflow Task failure. Without it, a test whose failure
+/// never comes waits forever in shutdown instead of failing.
+async fn failed_within_deadline(failed: &Notify) {
+    tokio::time::timeout(Duration::from_secs(10), failed.notified())
+        .await
+        .expect("the expected Workflow Task failure never came");
+}
+
 /// A worker that expects exactly one Workflow Task failure: nondeterminism naming `message`.
 fn worker_expecting_nondeterminism(
     history: TestHistoryBuilder,
     batches: Vec<ResponseType>,
     message: &'static str,
-) -> crate::Worker {
+) -> (crate::Worker, Arc<Notify>) {
+    let failed = Arc::new(Notify::new());
     let mut mock_cfg =
         MockPollCfg::from_resp_batches("fakeid", history, batches, mock_worker_client());
     mock_cfg.num_expected_fails = 1;
-    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
-        *cause == WorkflowTaskFailedCause::NonDeterministicError
-            && failure
-                .as_ref()
-                .is_some_and(|f| f.message.contains(message))
-    });
+    mock_cfg.expect_fail_wft_matcher = nondeterminism_matcher(message, failed.clone());
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
-    mock_worker(mock)
+    (mock_worker(mock), failed)
 }
 
 #[tokio::test]
 async fn a_replay_that_commits_less_than_history_fails_when_going_live() {
     let (history, manifest) = output_then_timer_history();
-    let worker = worker_expecting_nondeterminism(history, vec![2.into()], "did not commit");
+    let (worker, failed) =
+        worker_expecting_nondeterminism(history, vec![2.into()], "did not commit");
 
     let replayed = worker.poll_workflow_activation().await.unwrap();
     assert!(replayed.is_replaying);
@@ -740,6 +766,7 @@ async fn a_replay_that_commits_less_than_history_fails_when_going_live() {
         ))
         .await
         .unwrap();
+    failed_within_deadline(&failed).await;
     worker.shutdown().await;
     worker.finalize_shutdown().await;
 }
@@ -751,7 +778,8 @@ async fn a_replay_that_commits_less_than_history_fails_before_the_next_replayed_
     let second_timer = history.add_by_type(EventType::TimerStarted);
     history.add_timer_fired(second_timer, "2".to_string());
     history.add_workflow_task_scheduled_and_started();
-    let worker = worker_expecting_nondeterminism(history, vec![3.into()], "did not commit");
+    let (worker, failed) =
+        worker_expecting_nondeterminism(history, vec![3.into()], "did not commit");
 
     let replayed = worker.poll_workflow_activation().await.unwrap();
     assert!(replayed.is_replaying);
@@ -763,6 +791,7 @@ async fn a_replay_that_commits_less_than_history_fails_before_the_next_replayed_
         ))
         .await
         .unwrap();
+    failed_within_deadline(&failed).await;
     worker.shutdown().await;
     worker.finalize_shutdown().await;
 }
@@ -778,7 +807,7 @@ async fn a_replay_that_commits_less_in_the_final_task_of_a_closed_history_fails(
         manifest.clone(),
     ));
     history.add_workflow_execution_completed();
-    let worker =
+    let (worker, failed) =
         worker_expecting_nondeterminism(history, vec![ResponseType::AllHistory], "did not commit");
 
     let replayed = worker.poll_workflow_activation().await.unwrap();
@@ -791,6 +820,7 @@ async fn a_replay_that_commits_less_in_the_final_task_of_a_closed_history_fails(
         ))
         .await
         .unwrap();
+    failed_within_deadline(&failed).await;
     worker.shutdown().await;
     worker.finalize_shutdown().await;
 }
@@ -804,7 +834,8 @@ fn local_activity_worker(
     batches: Vec<ResponseType>,
     completions: RecordedCommands,
     num_expected_fails: usize,
-) -> crate::Worker {
+) -> (crate::Worker, Arc<Notify>) {
+    let failed = Arc::new(Notify::new());
     let mut mock_cfg =
         MockPollCfg::from_resp_batches("fakeid", history, batches, mock_worker_client());
     mock_cfg.num_expected_fails = num_expected_fails;
@@ -814,12 +845,7 @@ fn local_activity_worker(
             Ok(RespondWorkflowTaskCompletedResponse::default())
         }));
     } else {
-        mock_cfg.expect_fail_wft_matcher = Box::new(|_, cause, failure| {
-            *cause == WorkflowTaskFailedCause::NonDeterministicError
-                && failure
-                    .as_ref()
-                    .is_some_and(|f| f.message.contains("did not commit"))
-        });
+        mock_cfg.expect_fail_wft_matcher = nondeterminism_matcher("did not commit", failed.clone());
     }
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
@@ -829,7 +855,7 @@ fn local_activity_worker(
         };
         w.max_cached_workflows = 1;
     });
-    mock_worker(mock)
+    (mock_worker(mock), failed)
 }
 
 fn schedule_local_activity(seq: u32) -> workflow_command::Variant {
@@ -937,7 +963,8 @@ fn two_commits_around_a_local_activity_history()
 async fn commits_around_a_local_activity_write_one_marker_each_in_order() {
     let (history, manifests) = two_commits_around_a_local_activity_history();
     let completions: RecordedCommands = Default::default();
-    let worker = local_activity_worker(history, vec![1.into(), 2.into()], completions.clone(), 0);
+    let (worker, _) =
+        local_activity_worker(history, vec![1.into(), 2.into()], completions.clone(), 0);
 
     let first = worker.poll_workflow_activation().await.unwrap();
     let run_id = first.run_id.clone();
@@ -1005,7 +1032,7 @@ async fn commits_around_a_local_activity_write_one_marker_each_in_order() {
 async fn replay_splits_commits_around_a_local_activity_into_the_live_activations() {
     let (history, manifests) = two_commits_around_a_local_activity_history();
     let completions: RecordedCommands = Default::default();
-    let worker = local_activity_worker(history, vec![2.into()], completions.clone(), 0);
+    let (worker, _) = local_activity_worker(history, vec![2.into()], completions.clone(), 0);
 
     let first = worker.poll_workflow_activation().await.unwrap();
     let run_id = first.run_id.clone();
@@ -1057,7 +1084,7 @@ async fn replay_splits_commits_around_a_local_activity_into_the_live_activations
 #[tokio::test]
 async fn a_replay_that_drops_the_commit_after_a_local_activity_is_nondeterministic() {
     let (history, manifests) = two_commits_around_a_local_activity_history();
-    let worker = local_activity_worker(history, vec![2.into()], Default::default(), 1);
+    let (worker, failed) = local_activity_worker(history, vec![2.into()], Default::default(), 1);
 
     let first = worker.poll_workflow_activation().await.unwrap();
     let run_id = first.run_id.clone();
@@ -1081,6 +1108,7 @@ async fn a_replay_that_drops_the_commit_after_a_local_activity_is_nondeterminist
         ))
         .await
         .unwrap();
+    failed_within_deadline(&failed).await;
     worker.shutdown().await;
     worker.finalize_shutdown().await;
 }
@@ -1089,7 +1117,7 @@ async fn a_replay_that_drops_the_commit_after_a_local_activity_is_nondeterminist
 async fn commits_around_a_local_activity_replay_then_go_live_in_the_next_task() {
     let (history, manifests) = two_commits_around_a_local_activity_history();
     let completions: RecordedCommands = Default::default();
-    let worker = local_activity_worker(history, vec![2.into()], completions.clone(), 0);
+    let (worker, _) = local_activity_worker(history, vec![2.into()], completions.clone(), 0);
 
     let first = worker.poll_workflow_activation().await.unwrap();
     let run_id = first.run_id.clone();
@@ -1196,7 +1224,7 @@ async fn replay_keeps_each_local_activity_result_and_its_commit_in_the_live_acti
     history.add_timer_fired(timer_started, "1".to_string());
     history.add_workflow_task_scheduled_and_started();
 
-    let worker = local_activity_worker(history, vec![2.into()], Default::default(), 0);
+    let (worker, _) = local_activity_worker(history, vec![2.into()], Default::default(), 0);
     let activation = worker.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id.clone();
     assert_eq!(replay_outputs(&activation), manifests);
