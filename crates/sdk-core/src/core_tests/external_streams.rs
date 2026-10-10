@@ -704,11 +704,12 @@ async fn a_replayed_commit_where_history_recorded_none_is_nondeterministic() {
     worker.finalize_shutdown().await;
 }
 
+/// The predicate a mock applies to every Workflow Task failure it is asked to report.
+type FailMatcher =
+    Box<dyn Fn(&TaskToken, &WorkflowTaskFailedCause, &Option<Failure>) -> bool + Send>;
+
 /// Accepts only a nondeterminism failure naming `message`, and signals `failed` when one comes.
-fn nondeterminism_matcher(
-    message: &'static str,
-    failed: Arc<Notify>,
-) -> Box<dyn Fn(&TaskToken, &WorkflowTaskFailedCause, &Option<Failure>) -> bool + Send> {
+fn nondeterminism_matcher(message: &'static str, failed: Arc<Notify>) -> FailMatcher {
     Box::new(move |_, cause, failure| {
         let matches = *cause == WorkflowTaskFailedCause::NonDeterministicError
             && failure
