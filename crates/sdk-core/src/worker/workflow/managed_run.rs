@@ -1415,18 +1415,34 @@ fn validate_output_manifest(
             "External output manifest carried an empty stage token".to_string(),
         ));
     }
-    if manifest.schema_version != 1
-        || manifest.fingerprint_version != 1
-        || manifest.provider_id.is_empty()
-        || manifest.provider_format_version == 0
-        || manifest.topics.is_empty()
-        || manifest.segments.is_empty()
-        || prost::Message::encoded_len(manifest) > MAX_OUTPUT_MANIFEST_BYTES
-    {
-        return Err(WFMachinesError::Fatal(format!(
-            "External output manifest has an unsupported version, missing provider, empty \
-             schedule, or exceeds the {} KiB marker budget",
+    // The task fails on every retry, so the message has to say which field to fix.
+    let encoded_len = prost::Message::encoded_len(manifest);
+    let unsupported = if manifest.schema_version != 1 {
+        Some(format!("schema version {}", manifest.schema_version))
+    } else if manifest.fingerprint_version != 1 {
+        Some(format!(
+            "fingerprint version {}",
+            manifest.fingerprint_version
+        ))
+    } else if manifest.provider_id.is_empty() {
+        Some("no provider id".to_string())
+    } else if manifest.provider_format_version == 0 {
+        Some("provider format version 0".to_string())
+    } else if manifest.topics.is_empty() {
+        Some("no topics".to_string())
+    } else if manifest.segments.is_empty() {
+        Some("no segments".to_string())
+    } else if encoded_len > MAX_OUTPUT_MANIFEST_BYTES {
+        Some(format!(
+            "encodes to {encoded_len} bytes, over the {} KiB marker budget",
             MAX_OUTPUT_MANIFEST_BYTES / 1024
+        ))
+    } else {
+        None
+    };
+    if let Some(reason) = unsupported {
+        return Err(WFMachinesError::Fatal(format!(
+            "Unsupported external output manifest ({reason})"
         )));
     }
     let mut topic_names = HashSet::new();
@@ -1985,20 +2001,27 @@ mod tests {
         }
 
         #[test]
-        fn unsupported_versions_and_missing_provider_are_refused() {
-            for edit in [
-                (|m: &mut ExternalOutputStreamManifest| m.schema_version = 2)
-                    as fn(&mut ExternalOutputStreamManifest),
-                |m| m.fingerprint_version = 0,
-                |m| m.provider_id.clear(),
-                |m| m.provider_format_version = 0,
-                |m| m.topics.clear(),
-                |m| m.segments.clear(),
-                |m| m.stage_token = "x".repeat(64 * 1024),
+        fn each_unsupported_field_is_refused_with_its_own_message() {
+            for (edit, expected) in [
+                (
+                    (|m: &mut ExternalOutputStreamManifest| m.schema_version = 2)
+                        as fn(&mut ExternalOutputStreamManifest),
+                    "schema version 2",
+                ),
+                (|m| m.fingerprint_version = 0, "fingerprint version 0"),
+                (|m| m.provider_id.clear(), "no provider id"),
+                (
+                    |m| m.provider_format_version = 0,
+                    "provider format version 0",
+                ),
+                (|m| m.topics.clear(), "no topics"),
+                (|m| m.segments.clear(), "no segments"),
+                (|m| m.stage_token = "x".repeat(64 * 1024), "encodes to 65"),
             ] {
                 let mut m = manifest();
                 edit(&mut m);
-                assert!(rejection(m, Some(FLOOR)).contains("unsupported version"));
+                let message = rejection(m, Some(FLOOR));
+                assert!(message.contains(expected), "{expected}: {message}");
             }
         }
 

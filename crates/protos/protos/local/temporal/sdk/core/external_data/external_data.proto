@@ -85,11 +85,20 @@ message ExternalOutputStreamManifest {
 }
 
 // Logical, pre-codec identity of one topic sub-batch.
+//
+// Lang computes these over the topic's records in publish order, as the payload converter made
+// them and before any payload codec, so replay can compute them again. Lang leaves out of each
+// record anything that a reset changes, such as the run that published it. Core checks only that
+// the fingerprint is 32 bytes, and that replay gives the same values.
 message ExternalOutputTopicManifest {
   string topic = 1;
   uint32 record_count = 2;
+  // The sum of the records' serialized sizes, measured the same way as the fingerprint.
   uint64 logical_byte_count = 3;
+  // For fingerprint_version 1, the SHA-256 over each record as its length in 8 bytes big-endian,
+  // then its deterministic protobuf serialization.
   bytes logical_fingerprint = 4;
+  // True when the batch holds a FINISH record for this topic.
   bool finished = 5;
 }
 

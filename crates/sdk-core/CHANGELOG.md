@@ -40,8 +40,10 @@ relevant information.
   visible only when the workflow task is accepted. Activations now carry
   `history_floor_event_id`, which the manifest must match. On replay, Core hands the recorded
   manifest back in a `ReplayExternalStreams` job. Lang must commit each recorded manifest again
-  while replaying, and each commit must match it (the stage token and run id aside), or the task
-  fails as nondeterministic.
+  while replaying, and each commit must match it (the stage token, run id and provider id
+  aside), or the task fails as nondeterministic. A workflow that wrote this marker can only move
+  forward. A Worker on an older Core, or one whose lang does not commit the output again on
+  replay, fails that workflow's next task, so don't roll such a fleet back.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom

@@ -107,8 +107,9 @@ pub(crate) struct WorkflowMachines {
     replayed_output_manifests: VecDeque<ExternalOutputStreamManifest>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
-    /// The exact predecessor of the current WorkflowTaskScheduled event in the ordered History
-    /// view. Output staging must fail rather than guess when this is unavailable.
+    /// The event before the current WorkflowTaskScheduled event, which is always its id minus
+    /// one, since History is applied in order. `None` only before the first task is scheduled
+    /// and after a speculative task is dropped, and output staging must fail then.
     current_wft_history_floor_event_id: Option<i64>,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
@@ -517,8 +518,10 @@ impl WorkflowMachines {
     /// Writes one external stream marker for an output commit lang sent.
     ///
     /// Must be called before lang's own commands for the same completion are pushed, so the
-    /// marker precedes every command in History and replay delivers the recorded output before
-    /// any command that followed it is matched.
+    /// marker precedes the other commands of that completion, a terminal command included, and
+    /// replay delivers the recorded output before any command that followed it is matched.
+    /// Commands from earlier activations of the same Workflow Task are already queued and come
+    /// first.
     pub(crate) fn emit_external_stream_marker(
         &mut self,
         data: ExternalStreamMarkerData,
