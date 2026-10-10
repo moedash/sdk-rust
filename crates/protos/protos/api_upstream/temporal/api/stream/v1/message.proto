@@ -32,7 +32,8 @@ message StreamReference {
 message StreamCallbackInfo {
     // The request ID the callback was attached with.
     string request_id = 1;
-    // The callback, without its header, since the header holds the caller's credentials.
+    // The callback. Its header keeps its keys, but every value is empty, since the values hold
+    // the caller's credentials.
     temporal.api.common.v1.Callback callback = 2;
     // The state of the callback's completion delivery.
     temporal.api.enums.v1.CallbackState state = 3;
