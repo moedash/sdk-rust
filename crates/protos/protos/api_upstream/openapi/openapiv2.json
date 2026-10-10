@@ -17989,7 +17989,7 @@
         },
         "position": {
           "type": "string",
-          "description": "Where the operation's output stands after the change this progress reports, in the\nhandler's terms, such as a stream cursor. Opaque to the server."
+          "description": "Where the operation's output stands after the change this progress reports, in the\nhandler's terms, such as a stream cursor. Opaque to the server, which rejects a position\nlonger than 1 KiB of UTF-8."
         },
         "counter": {
           "type": "string",

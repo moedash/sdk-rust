@@ -168,6 +168,8 @@ interface workflow-service {
     callback: option<callback-nexus>,
     /// @nexus.omit
     identity: placeholder,
+    operation-token: string,
+    start-time: option<timestamp>,
   }
 
   /// @nexus.proto "temporal.api.workflowservice.v1.AttachStreamCallbackResponse"
@@ -221,4 +223,9 @@ interface workflow-service {
   notify-stream: func(
     request: notify-stream-request,
   ) -> notify-stream-response;
+  /// @nexus.proto "google.protobuf.Timestamp"
+  record timestamp {
+    seconds: option<s64>,
+    nanos: option<s32>,
+  }
 }
