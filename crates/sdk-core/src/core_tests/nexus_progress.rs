@@ -423,11 +423,15 @@ async fn replay_local_activity_heartbeat(progress_on_heartbeat: bool) -> Vec<Vec
     seen
 }
 
-/// DD-52: the server keeps progress pending through a Workflow Task created by a heartbeat, so the
-/// heartbeat chain replays as one sequence and the activity result and the progress reach lang in
-/// the activations they had live.
+/// Pins the server rule this replay depends on (DD-52): the server never puts progress on a
+/// Workflow Task created by a local activity heartbeat. A history that keeps that rule replays in
+/// the activations the run had live. A history that breaks it hands lang the progress together
+/// with the activity result, which the live run never did. Core's own split at a task with
+/// progress is covered by `progress_reaches_lang_in_the_same_activations_on_replay` and
+/// `a_task_scheduled_with_nexus_progress_ends_a_heartbeat_chain`; this test cannot catch a Core
+/// change, only a change to the rule.
 #[tokio::test]
-async fn progress_after_a_local_activity_heartbeat_replays_as_it_ran_live() {
+async fn a_history_with_no_progress_on_heartbeat_tasks_replays_as_it_ran_live() {
     let live = vec![
         vec!["InitializeWorkflow".to_string()],
         vec!["Start(1)".to_string()],
@@ -437,10 +441,21 @@ async fn progress_after_a_local_activity_heartbeat_replays_as_it_ran_live() {
     let replayed = replay_local_activity_heartbeat(false).await;
     assert_eq!(replayed, live);
 
-    // Progress on the heartbeat task's scheduled event would split the chain, and lang would see
-    // that progress in an activation the live run never had.
+    // Progress on the heartbeat task's scheduled event splits the chain there, so the progress
+    // reaches lang in the activation that carries the activity result.
     let violating = replay_local_activity_heartbeat(true).await;
-    assert_ne!(violating, replayed);
+    assert_eq!(
+        violating,
+        vec![
+            vec!["InitializeWorkflow".to_string()],
+            vec!["Start(1)".to_string()],
+            vec![
+                "Progress(1, 1)".to_string(),
+                "ResolveActivity(1)".to_string()
+            ],
+            vec!["FireTimer(1)".to_string(), "Progress(1, 2)".to_string()],
+        ]
+    );
 }
 
 /// A task scheduled only to carry progress lang already has (DD-55's follow-up can repeat it),
