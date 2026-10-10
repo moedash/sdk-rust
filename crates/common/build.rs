@@ -761,12 +761,12 @@ const BLOB_FIELDS: &[&str] = &[
     "temporal.api.protocol.v1.Message.body", // whole Any body; see EXTRA_WHOLE_MESSAGE_LEAVES
     "temporal.api.query.v1.WorkflowQuery.query_args",
     "temporal.api.workflow.v1.NewWorkflowExecutionInfo.input",
+    "temporal.api.workflowservice.v1.NotifyStreamRequest.close_result",
     "temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatByIdRequest.details",
     "temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatRequest.details",
     "temporal.api.workflowservice.v1.RespondActivityTaskCanceledByIdRequest.details",
     "temporal.api.workflowservice.v1.RespondActivityTaskCanceledRequest.details",
     "temporal.api.workflowservice.v1.RespondActivityTaskCompletedByIdRequest.result",
-    "temporal.api.workflowservice.v1.NotifyStreamRequest.close_result", // becomes the stream's result
     "temporal.api.workflowservice.v1.RespondActivityTaskCompletedRequest.result",
     "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.input",
     "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.signal_input",
