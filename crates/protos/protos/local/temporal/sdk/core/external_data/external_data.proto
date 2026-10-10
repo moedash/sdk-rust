@@ -79,7 +79,8 @@ message ExternalOutputStreamManifest {
   // One entry per activation segment, including segments which published no output.
   repeated ExternalOutputSegmentManifest segments = 7;
   // Stable configured provider binding. Reconciliation refuses to interpret the batch through a
-  // different provider or provider wire format.
+  // different provider or provider wire format. Replay compares the format but not the id, since
+  // a provider can be renamed without changing the output.
   string provider_id = 8;
   uint32 provider_format_version = 9;
 }

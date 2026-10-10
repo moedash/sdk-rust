@@ -1496,9 +1496,13 @@ fn check_replayed_output_manifest(
                 .to_string(),
         ));
     };
+    // Only the logical output must replay the same. A reset run replays markers that name its
+    // base run, a stage token is new on every attempt, and a provider can be renamed or swapped
+    // for a Replayer without changing what the Workflow published.
     for manifest in [&mut replayed, &mut recorded] {
         manifest.stage_token.clear();
         manifest.run_id.clear();
+        manifest.provider_id.clear();
     }
     if replayed != recorded {
         return Err(WFMachinesError::Nondeterminism(format!(
@@ -2084,6 +2088,23 @@ mod tests {
             let mut recorded = manifest();
             recorded.run_id = "reset-base-run".to_string();
             check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
+        }
+
+        #[test]
+        fn a_replayed_commit_matches_a_manifest_recorded_under_another_provider_name() {
+            let mut recorded = manifest();
+            recorded.provider_id = "renamed-provider".to_string();
+            check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
+        }
+
+        #[test]
+        fn a_replayed_commit_in_another_provider_format_is_nondeterministic() {
+            let mut recorded = manifest();
+            recorded.provider_format_version = 2;
+            assert!(matches!(
+                check_replayed_output_manifest(manifest(), Some(recorded)),
+                Err(WFMachinesError::Nondeterminism(message)) if message.contains("differs")
+            ));
         }
 
         #[test]
