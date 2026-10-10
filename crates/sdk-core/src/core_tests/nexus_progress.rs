@@ -13,11 +13,13 @@ use std::time::Duration;
 use temporalio_common::{
     protos::{
         coresdk::{
+            nexus::NexusOperationCancellationType,
             workflow_activation::{
                 ResolveNexusOperationProgress, WorkflowActivation, workflow_activation_job,
             },
             workflow_commands::{
-                ActivityCancellationType, CompleteWorkflowExecution, ScheduleNexusOperation,
+                ActivityCancellationType, CompleteWorkflowExecution, RequestCancelNexusOperation,
+                ScheduleNexusOperation,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
@@ -25,6 +27,7 @@ use temporalio_common::{
             common::v1::Payload,
             enums::v1::EventType,
             history::v1::{
+                NexusOperationCancelRequestedEventAttributes,
                 NexusOperationCompletedEventAttributes, NexusOperationScheduledEventAttributes,
                 NexusOperationStartedEventAttributes,
             },
@@ -438,4 +441,162 @@ async fn progress_after_a_local_activity_heartbeat_replays_as_it_ran_live() {
     // that progress in an activation the live run never had.
     let violating = replay_local_activity_heartbeat(true).await;
     assert_ne!(violating, replayed);
+}
+
+/// A task scheduled only to carry progress lang already has (DD-55's follow-up can repeat it),
+/// then a timer's task. The repeated progress gives the first task no jobs.
+fn stale_progress_only_task() -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled = add_operation_scheduled(&mut t);
+    let timer = t.add_by_type(EventType::TimerStarted);
+    add_operation_started(&mut t, scheduled);
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 5)]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 5)]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    t.add_timer_fired(timer, "1".to_string());
+    t.add_full_wf_task();
+    t
+}
+
+async fn run_stale_progress_only_task(batches: Vec<ResponseType>) -> Vec<Vec<String>> {
+    let worker = worker(stale_progress_only_task(), batches);
+    let mut seen = vec![];
+    let init = worker.poll_workflow_activation().await.unwrap();
+    let run_id = init.run_id.clone();
+    seen.push(job_names(&init));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                schedule_operation(1).into(),
+                start_timer_cmd(1, Duration::from_secs(60)),
+            ],
+        ))
+        .await
+        .unwrap();
+    loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        let jobs = job_names(&next);
+        seen.push(jobs.clone());
+        if jobs.iter().any(|j| j.starts_with("FireTimer")) {
+            complete(&worker, &run_id, vec![CompleteWorkflowExecution::default()]).await;
+            break;
+        }
+        complete(&worker, &run_id, Vec::<ScheduleNexusOperation>::new()).await;
+    }
+    worker.drain_pollers_and_shutdown().await;
+    seen
+}
+
+/// Live, the task with only stale progress has no jobs, so Core completes it without lang. On
+/// replay the same task yields no activation either, so lang sees the same activations.
+#[tokio::test]
+async fn a_stale_progress_only_task_autocompletes_live_and_replays_without_an_activation() {
+    let expected = vec![
+        vec!["InitializeWorkflow".to_string()],
+        vec!["Start(1)".to_string(), "Progress(1, 5)".to_string()],
+        vec!["FireTimer(1)".to_string()],
+    ];
+    let live = run_stale_progress_only_task(vec![1.into(), 2.into(), 3.into(), 4.into()]).await;
+    assert_eq!(live, expected);
+    let replayed = run_stale_progress_only_task(vec![ResponseType::AllHistory]).await;
+    assert_eq!(replayed, expected);
+}
+
+/// Lang cancels a started operation, then a later task carries progress for it, beside a timer
+/// so the task has an activation to look at.
+fn progress_after_a_cancel(cancel_type: NexusOperationCancellationType) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled = add_operation_scheduled(&mut t);
+    add_operation_started(&mut t, scheduled);
+    t.add_full_wf_task();
+    // Commands land in the order lang sent them: the cancel request, then the timer.
+    if cancel_type == NexusOperationCancellationType::TryCancel {
+        t.add(NexusOperationCancelRequestedEventAttributes {
+            scheduled_event_id: scheduled,
+            ..Default::default()
+        });
+    }
+    let timer = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer, "1".to_string());
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 1)]);
+    t.add_workflow_task_started();
+    t
+}
+
+async fn run_progress_after_a_cancel(
+    cancel_type: NexusOperationCancellationType,
+    batches: Vec<ResponseType>,
+) -> Vec<Vec<String>> {
+    let worker = worker(progress_after_a_cancel(cancel_type), batches);
+    let mut seen = vec![];
+    let init = worker.poll_workflow_activation().await.unwrap();
+    let run_id = init.run_id.clone();
+    seen.push(job_names(&init));
+    complete(
+        &worker,
+        &run_id,
+        vec![ScheduleNexusOperation {
+            cancellation_type: cancel_type as i32,
+            ..schedule_operation(1)
+        }],
+    )
+    .await;
+    let started = worker.poll_workflow_activation().await.unwrap();
+    seen.push(job_names(&started));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                RequestCancelNexusOperation { seq: 1 }.into(),
+                start_timer_cmd(1, Duration::from_secs(60)),
+            ],
+        ))
+        .await
+        .unwrap();
+    loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        let jobs = job_names(&next);
+        seen.push(jobs.clone());
+        if jobs.iter().any(|j| j.starts_with("FireTimer")) {
+            complete(&worker, &run_id, vec![CompleteWorkflowExecution::default()]).await;
+            break;
+        }
+        complete(&worker, &run_id, Vec::<ScheduleNexusOperation>::new()).await;
+    }
+    worker.drain_pollers_and_shutdown().await;
+    seen
+}
+
+/// Once lang cancels with `TryCancel` or `Abandon`, the operation is resolved for lang, so later
+/// progress for it is dropped, live and on replay.
+#[tokio::test]
+async fn progress_after_a_cancelled_operation_is_dropped() {
+    for cancel_type in [
+        NexusOperationCancellationType::TryCancel,
+        NexusOperationCancellationType::Abandon,
+    ] {
+        let live =
+            run_progress_after_a_cancel(cancel_type, vec![1.into(), 2.into(), 3.into()]).await;
+        let replayed =
+            run_progress_after_a_cancel(cancel_type, vec![ResponseType::AllHistory]).await;
+        assert_eq!(live, replayed, "{cancel_type:?}");
+        assert!(
+            live.iter()
+                .flatten()
+                .all(|job| !job.starts_with("Progress")),
+            "{cancel_type:?}: {live:?}"
+        );
+        assert!(
+            live.iter().flatten().any(|job| job == "Resolve(1)"),
+            "{cancel_type:?}: {live:?}"
+        );
+    }
 }
