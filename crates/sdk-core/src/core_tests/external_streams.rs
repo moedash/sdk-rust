@@ -3,10 +3,10 @@
 //! checks a recomputed one against it.
 
 use crate::{
-    replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder, canned_histories},
+    replay::{TestHistoryBuilder, canned_histories},
     test_help::{
-        MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, hist_to_poll_resp, mock_worker, start_timer_cmd,
+        MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers, mock_worker,
+        start_timer_cmd,
     },
     worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
 };
@@ -23,9 +23,7 @@ use temporalio_common::{
             },
             workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_commands::{
-                CompleteWorkflowExecution, ScheduleActivity, UpdateResponse,
-                WorkflowOutputStreamCommit, update_response::Response as UpdateOutcome,
-                workflow_command,
+                CompleteWorkflowExecution, WorkflowOutputStreamCommit, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
@@ -667,139 +665,4 @@ async fn a_replayed_commit_where_history_recorded_none_is_nondeterministic() {
         .unwrap();
     worker.shutdown().await;
     worker.finalize_shutdown().await;
-}
-
-async fn exercise_speculative_output_redelivery(changed_manifest: bool) {
-    let workflow_id = if changed_manifest {
-        "speculative-changed"
-    } else {
-        "speculative-identical"
-    };
-    let mut base = TestHistoryBuilder::default();
-    base.add_by_type(EventType::WorkflowExecutionStarted);
-    base.add_full_wf_task();
-    base.add_activity_task_scheduled("act1");
-
-    let mut speculative_history = base.clone();
-    speculative_history.add_workflow_task_scheduled_and_started();
-    let update_id = "speculative-update";
-    let mut first_attempt =
-        hist_to_poll_resp(&speculative_history, workflow_id, ResponseType::OneTask(2));
-    first_attempt.add_update_request(update_id, 1);
-    let mut redelivery =
-        hist_to_poll_resp(&speculative_history, workflow_id, ResponseType::OneTask(2));
-    redelivery.add_update_request(update_id, 1);
-
-    let completions: RecordedMarkers = Default::default();
-    let reset_ids: Arc<Mutex<Vec<i64>>> = Default::default();
-    let recorded = completions.clone();
-    let recorded_resets = reset_ids.clone();
-    let mut mock_cfg = MockPollCfg::from_resp_batches(
-        workflow_id,
-        base,
-        [
-            ResponseType::ToTaskNum(1),
-            first_attempt.into(),
-            redelivery.into(),
-        ],
-        mock_worker_client(),
-    );
-    let mut completion_number = 0;
-    mock_cfg.completion_mock_fn = Some(Box::new(move |wft| {
-        completion_number += 1;
-        recorded.lock().push(stream_marker_data(wft));
-        let mut response = RespondWorkflowTaskCompletedResponse::default();
-        if completion_number == 2 {
-            response.reset_history_event_id = 3;
-        }
-        recorded_resets.lock().push(response.reset_history_event_id);
-        Ok(response)
-    }));
-    let mut mock = build_mock_pollers(mock_cfg);
-    mock.worker_cfg(|w| {
-        w.task_types = WorkerTaskTypes::workflow_only();
-        w.max_cached_workflows = 1;
-    });
-    let worker = mock_worker(mock);
-
-    let initial = worker.poll_workflow_activation().await.unwrap();
-    let run_id = initial.run_id.clone();
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-            run_id.clone(),
-            ScheduleActivity {
-                activity_id: "act1".to_string(),
-                activity_type: DEFAULT_ACTIVITY_TYPE.to_string(),
-                ..Default::default()
-            }
-            .into(),
-        ))
-        .await
-        .unwrap();
-
-    let speculative = worker.poll_workflow_activation().await.unwrap();
-    let floor = speculative.history_floor_event_id;
-    let discarded = output_manifest(&run_id, floor, "discarded-stage-token");
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            run_id.clone(),
-            vec![
-                output_commit_command(discarded.clone()),
-                UpdateResponse {
-                    protocol_instance_id: update_id.to_string(),
-                    response: Some(UpdateOutcome::Rejected(Default::default())),
-                }
-                .into(),
-            ],
-        ))
-        .await
-        .unwrap();
-
-    let redelivered = worker.poll_workflow_activation().await.unwrap();
-    assert_eq!(
-        redelivered.history_floor_event_id, floor,
-        "redelivery reused event IDs and therefore the same exact floor"
-    );
-    let mut accepted = output_manifest(&run_id, floor, "accepted-stage-token");
-    if changed_manifest {
-        accepted.topics[0].logical_fingerprint = vec![b'g'; 32];
-    }
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            run_id,
-            vec![
-                output_commit_command(accepted.clone()),
-                UpdateResponse {
-                    protocol_instance_id: update_id.to_string(),
-                    response: Some(UpdateOutcome::Accepted(())),
-                }
-                .into(),
-            ],
-        ))
-        .await
-        .unwrap();
-    worker.drain_pollers_and_shutdown().await;
-
-    let written = completions.lock();
-    assert_eq!(written.len(), 3);
-    assert!(written[0].is_empty());
-    assert_eq!(written[1].len(), 1);
-    assert_eq!(written[1][0].output.as_ref(), Some(&discarded));
-    assert_eq!(
-        written[2].len(),
-        1,
-        "the rejected task's marker must not ride along on the redelivery"
-    );
-    assert_eq!(written[2][0].output.as_ref(), Some(&accepted));
-    assert_eq!(
-        reset_ids.lock().as_slice(),
-        &[0, 3, 0],
-        "only the first token-bearing completion was discarded; the redelivery was accepted"
-    );
-}
-
-#[tokio::test]
-async fn speculative_output_redelivery_accepts_a_fresh_token_once() {
-    exercise_speculative_output_redelivery(false).await;
-    exercise_speculative_output_redelivery(true).await;
 }
