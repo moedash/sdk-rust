@@ -47,6 +47,10 @@ relevant information.
   highest counter the server folded onto the task's scheduled event. Replay delivers the same jobs
   in the same activations. Progress for an operation that is unknown, not started, already
   resolved, or below a counter already delivered is dropped.
+  while replaying, and each commit must match it (the stage token, run id and provider id
+  aside), or the task fails as nondeterministic. A workflow that wrote this marker can only move
+  forward. A Worker on an older Core, or one whose lang does not commit the output again on
+  replay, fails that workflow's next task, so don't roll such a fleet back.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
