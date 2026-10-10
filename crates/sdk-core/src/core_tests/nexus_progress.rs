@@ -1,6 +1,10 @@
 //! Nexus operation progress: the server folds it onto a Workflow Task's scheduled event, and Core
 //! hands it to lang as one job per started operation per task, live and on replay alike.
 
+use super::external_streams::{
+    RecordedMarkers, output_commit_command, output_manifest, output_marker, replay_outputs,
+    unstaged, worker_recording,
+};
 use crate::{
     replay::TestHistoryBuilder,
     test_help::{
@@ -13,6 +17,7 @@ use std::time::Duration;
 use temporalio_common::{
     protos::{
         coresdk::{
+            external_data::{ExternalOutputStreamManifest, ExternalStreamBoundary},
             nexus::NexusOperationCancellationType,
             workflow_activation::{
                 ResolveNexusOperationProgress, WorkflowActivation, workflow_activation_job,
@@ -614,4 +619,145 @@ async fn progress_after_a_cancelled_operation_is_dropped() {
             "{cancel_type:?}: {live:?}"
         );
     }
+}
+
+/// A started operation, then three tasks scheduled only for progress. The first completes with no
+/// commands, which is the shape of a heartbeat, and the second commits output and nothing else.
+/// The heartbeat split must end a sequence before the second task, and the replay lookahead must
+/// hand its marker back in that task's activation, so both have to agree on where it starts.
+fn progress_task_that_commits_output() -> (
+    TestHistoryBuilder,
+    [NexusOperationProgress; 3],
+    ExternalOutputStreamManifest,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled = add_operation_scheduled(&mut t);
+    add_operation_started(&mut t, scheduled);
+    t.add_full_wf_task();
+    let quiet = progress(scheduled, 1);
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![quiet.clone()]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    let floor = t.current_event_id();
+    let manifest = output_manifest(t.get_orig_run_id(), floor, "progress-task-token");
+    let committing = progress(scheduled, 2);
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![committing.clone()]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    t.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::TaskCompleted,
+        manifest.clone(),
+    ));
+    let last = progress(scheduled, 3);
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![last.clone()]);
+    t.add_workflow_task_started();
+    (t, [quiet, committing, last], manifest)
+}
+
+/// Drives `progress_task_that_commits_output`, returning each activation's job names and floor,
+/// the markers each completion wrote, and the manifest the history recorded.
+async fn run_progress_task_that_commits_output(
+    batches: Vec<ResponseType>,
+    replaying: bool,
+) -> (
+    Vec<(Vec<String>, i64)>,
+    RecordedMarkers,
+    ExternalOutputStreamManifest,
+) {
+    let (history, [quiet, committing_progress, last_progress], manifest) =
+        progress_task_that_commits_output();
+    let markers: RecordedMarkers = Default::default();
+    let worker = worker_recording(history, batches, markers.clone(), Default::default(), 0);
+    let mut seen = vec![];
+
+    let init = worker.poll_workflow_activation().await.unwrap();
+    let run_id = init.run_id.clone();
+    seen.push((job_names(&init), init.history_floor_event_id));
+    complete(&worker, &run_id, vec![schedule_operation(1)]).await;
+
+    let started = worker.poll_workflow_activation().await.unwrap();
+    seen.push((job_names(&started), started.history_floor_event_id));
+    complete(&worker, &run_id, Vec::<ScheduleNexusOperation>::new()).await;
+
+    let quiet_task = worker.poll_workflow_activation().await.unwrap();
+    seen.push((job_names(&quiet_task), quiet_task.history_floor_event_id));
+    assert_eq!(progress_jobs(&quiet_task), vec![job_for(1, &quiet)]);
+    assert!(replay_outputs(&quiet_task).is_empty());
+    complete(&worker, &run_id, Vec::<ScheduleNexusOperation>::new()).await;
+
+    let committing = worker.poll_workflow_activation().await.unwrap();
+    seen.push((job_names(&committing), committing.history_floor_event_id));
+    assert_eq!(committing.is_replaying, replaying);
+    assert_eq!(
+        progress_jobs(&committing),
+        vec![job_for(1, &committing_progress)]
+    );
+    assert_eq!(
+        committing.history_floor_event_id, manifest.history_floor_event_id,
+        "the floor lang stamps must be the one history recorded"
+    );
+    let commit = if replaying {
+        assert_eq!(
+            replay_outputs(&committing),
+            vec![manifest.clone()],
+            "the recorded manifest comes back with the progress it was committed with"
+        );
+        unstaged(manifest.clone())
+    } else {
+        assert!(replay_outputs(&committing).is_empty());
+        manifest.clone()
+    };
+    complete(&worker, &run_id, vec![output_commit_command(commit)]).await;
+
+    let last = worker.poll_workflow_activation().await.unwrap();
+    seen.push((job_names(&last), last.history_floor_event_id));
+    assert!(!last.is_replaying);
+    assert_eq!(progress_jobs(&last), vec![job_for(1, &last_progress)]);
+    complete(&worker, &run_id, vec![CompleteWorkflowExecution::default()]).await;
+    worker.drain_pollers_and_shutdown().await;
+    (seen, markers, manifest)
+}
+
+#[tokio::test]
+async fn a_progress_task_that_commits_output_replays_in_the_activations_it_ran_live() {
+    let (live, live_markers, manifest) = run_progress_task_that_commits_output(
+        vec![1.into(), 2.into(), 3.into(), 4.into(), 5.into()],
+        false,
+    )
+    .await;
+    let (replayed, replay_markers, _) =
+        run_progress_task_that_commits_output(vec![5.into()], true).await;
+
+    let without_replayed_output = |seen: &[(Vec<String>, i64)]| {
+        seen.iter()
+            .map(|(jobs, floor)| {
+                let jobs = jobs
+                    .iter()
+                    .filter(|job| !job.starts_with("ReplayExternalStreams"))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (jobs, *floor)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(live, without_replayed_output(&replayed));
+    assert_eq!(
+        *live_markers.lock(),
+        vec![
+            vec![],
+            vec![],
+            vec![],
+            vec![output_marker(
+                ExternalStreamBoundary::TaskCompleted,
+                manifest
+            )],
+            vec![],
+        ]
+    );
+    assert!(
+        replay_markers.lock().iter().all(Vec::is_empty),
+        "replay never writes an output marker"
+    );
 }
