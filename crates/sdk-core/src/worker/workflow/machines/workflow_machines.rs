@@ -522,6 +522,11 @@ impl WorkflowMachines {
                 continue;
             };
             let Some(seq) = machine.accept_progress(progress.counter) else {
+                debug!(
+                    scheduled_event_id,
+                    counter = progress.counter,
+                    "Dropping progress for an operation that is not started or is stale"
+                );
                 continue;
             };
             self.drive_me.send_job(
