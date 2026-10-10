@@ -1271,3 +1271,60 @@ async fn replay_keeps_each_local_activity_result_and_its_commit_in_the_live_acti
     worker.complete_execution(&run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
+
+/// A marker with our name whose details do not decode is a broken History, not someone else's
+/// marker, so replay must say so instead of failing later on an unmatched marker.
+#[tokio::test]
+async fn an_external_stream_marker_that_does_not_decode_fails_the_task() {
+    use temporalio_common::protos::temporal::api::{
+        common::v1::Payloads, history::v1::MarkerRecordedEventAttributes,
+    };
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add(MarkerRecordedEventAttributes {
+        marker_name: EXTERNAL_STREAM_MARKER_NAME.to_string(),
+        details: [(
+            "external_stream".to_string(),
+            Payloads {
+                payloads: vec![Payload {
+                    data: vec![0xff, 0xff, 0xff],
+                    ..Default::default()
+                }],
+            },
+        )]
+        .into(),
+        ..Default::default()
+    });
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+
+    let failed = Arc::new(Notify::new());
+    let notify = failed.clone();
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        t,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, _, failure| {
+        let matches = failure
+            .as_ref()
+            .is_some_and(|f| f.message.contains("External stream marker was unparsable"));
+        if matches {
+            notify.notify_one();
+        }
+        matches
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let _ = worker.poll_workflow_activation().await;
+    failed_within_deadline(&failed).await;
+    worker.drain_pollers_and_shutdown().await;
+}

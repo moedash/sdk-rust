@@ -1415,18 +1415,34 @@ fn validate_output_manifest(
             "External output manifest carried an empty stage token".to_string(),
         ));
     }
-    if manifest.schema_version != 1
-        || manifest.fingerprint_version != 1
-        || manifest.provider_id.is_empty()
-        || manifest.provider_format_version == 0
-        || manifest.topics.is_empty()
-        || manifest.segments.is_empty()
-        || prost::Message::encoded_len(manifest) > MAX_OUTPUT_MANIFEST_BYTES
-    {
-        return Err(WFMachinesError::Fatal(format!(
-            "External output manifest has an unsupported version, missing provider, empty \
-             schedule, or exceeds the {} KiB marker budget",
+    // The task fails on every retry, so the message has to say which field to fix.
+    let encoded_len = prost::Message::encoded_len(manifest);
+    let unsupported = if manifest.schema_version != 1 {
+        Some(format!("schema version {}", manifest.schema_version))
+    } else if manifest.fingerprint_version != 1 {
+        Some(format!(
+            "fingerprint version {}",
+            manifest.fingerprint_version
+        ))
+    } else if manifest.provider_id.is_empty() {
+        Some("no provider id".to_string())
+    } else if manifest.provider_format_version == 0 {
+        Some("provider format version 0".to_string())
+    } else if manifest.topics.is_empty() {
+        Some("no topics".to_string())
+    } else if manifest.segments.is_empty() {
+        Some("no segments".to_string())
+    } else if encoded_len > MAX_OUTPUT_MANIFEST_BYTES {
+        Some(format!(
+            "encodes to {encoded_len} bytes, over the {} KiB marker budget",
             MAX_OUTPUT_MANIFEST_BYTES / 1024
+        ))
+    } else {
+        None
+    };
+    if let Some(reason) = unsupported {
+        return Err(WFMachinesError::Fatal(format!(
+            "Unsupported external output manifest ({reason})"
         )));
     }
     let mut topic_names = HashSet::new();
@@ -1480,9 +1496,13 @@ fn check_replayed_output_manifest(
                 .to_string(),
         ));
     };
+    // Only the logical output must replay the same. A reset run replays markers that name its
+    // base run, a stage token is new on every attempt, and a provider can be renamed or swapped
+    // for a Replayer without changing what the Workflow published.
     for manifest in [&mut replayed, &mut recorded] {
         manifest.stage_token.clear();
         manifest.run_id.clear();
+        manifest.provider_id.clear();
     }
     if replayed != recorded {
         return Err(WFMachinesError::Nondeterminism(format!(
@@ -1985,20 +2005,27 @@ mod tests {
         }
 
         #[test]
-        fn unsupported_versions_and_missing_provider_are_refused() {
-            for edit in [
-                (|m: &mut ExternalOutputStreamManifest| m.schema_version = 2)
-                    as fn(&mut ExternalOutputStreamManifest),
-                |m| m.fingerprint_version = 0,
-                |m| m.provider_id.clear(),
-                |m| m.provider_format_version = 0,
-                |m| m.topics.clear(),
-                |m| m.segments.clear(),
-                |m| m.stage_token = "x".repeat(64 * 1024),
+        fn each_unsupported_field_is_refused_with_its_own_message() {
+            for (edit, expected) in [
+                (
+                    (|m: &mut ExternalOutputStreamManifest| m.schema_version = 2)
+                        as fn(&mut ExternalOutputStreamManifest),
+                    "schema version 2",
+                ),
+                (|m| m.fingerprint_version = 0, "fingerprint version 0"),
+                (|m| m.provider_id.clear(), "no provider id"),
+                (
+                    |m| m.provider_format_version = 0,
+                    "provider format version 0",
+                ),
+                (|m| m.topics.clear(), "no topics"),
+                (|m| m.segments.clear(), "no segments"),
+                (|m| m.stage_token = "x".repeat(64 * 1024), "encodes to 65"),
             ] {
                 let mut m = manifest();
                 edit(&mut m);
-                assert!(rejection(m, Some(FLOOR)).contains("unsupported version"));
+                let message = rejection(m, Some(FLOOR));
+                assert!(message.contains(expected), "{expected}: {message}");
             }
         }
 
@@ -2061,6 +2088,23 @@ mod tests {
             let mut recorded = manifest();
             recorded.run_id = "reset-base-run".to_string();
             check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
+        }
+
+        #[test]
+        fn a_replayed_commit_matches_a_manifest_recorded_under_another_provider_name() {
+            let mut recorded = manifest();
+            recorded.provider_id = "renamed-provider".to_string();
+            check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
+        }
+
+        #[test]
+        fn a_replayed_commit_in_another_provider_format_is_nondeterministic() {
+            let mut recorded = manifest();
+            recorded.provider_format_version = 2;
+            assert!(matches!(
+                check_replayed_output_manifest(manifest(), Some(recorded)),
+                Err(WFMachinesError::Nondeterminism(message)) if message.contains("differs")
+            ));
         }
 
         #[test]
@@ -3185,6 +3229,7 @@ mod tests {
 
             let init = live.get_next_activation().unwrap();
             live_activations.push(job_names(&init));
+            let mut live_floors = vec![init.history_floor_event_id];
             commit_live(&mut live, first.clone());
             live.push_commands_and_iterate(vec![schedule_la_1()])
                 .unwrap();
@@ -3212,6 +3257,7 @@ mod tests {
                 heartbeat_task
             };
             live_activations.push(job_names(&resolved));
+            live_floors.push(resolved.history_floor_event_id);
             commit_live(&mut live, second.clone());
             live.push_commands_and_iterate(vec![complete_workflow()])
                 .unwrap();
@@ -3246,11 +3292,13 @@ mod tests {
             let mut replay_activations = vec![];
             let mut replayed_manifests = vec![];
             let mut replay_jobs = vec![];
+            let mut replay_floors = vec![];
             loop {
                 let activation = replay.get_next_activation().unwrap();
                 if activation.jobs.is_empty() {
                     break;
                 }
+                replay_floors.push(activation.history_floor_event_id);
                 let lang_jobs: Vec<_> = job_names(&WorkflowActivation {
                     jobs: activation
                         .jobs
@@ -3287,6 +3335,8 @@ mod tests {
                 replay_activations.push(lang_jobs);
             }
             assert_eq!(replay_activations, live_activations);
+            // The replay check compares the floor, so a heartbeat chain must report the same one.
+            assert_eq!(replay_floors, live_floors);
             assert_eq!(
                 replay_jobs,
                 vec![vec!["before".to_owned()], vec!["after".to_owned()]],
