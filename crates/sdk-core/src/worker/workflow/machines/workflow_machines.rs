@@ -515,9 +515,7 @@ impl WorkflowMachines {
             Default::default(),
             CommandIdKind::CoreInternal,
         );
-        // Lang's iteration has already prepared its commands by the time Core generates this one,
-        // so without preparing again the marker would never leave the current task's queue.
-        self.prepare_commands()
+        Ok(())
     }
 
     pub(crate) fn has_pending_jobs(&self) -> bool {

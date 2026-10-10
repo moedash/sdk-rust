@@ -1351,11 +1351,6 @@ impl ManagedRun {
     }
 }
 
-// Construct a new command sequence with query responses removed, and any
-// terminal responses removed, except for the first terminal response, which is
-// placed at the end. Return new command sequence and query commands. Note that
-// multiple coroutines may have generated a terminal command, leading to
-// multiple terminal commands in the input to this function.
 /// The marker version Core writes. Readers must accept every version up to this one.
 const EXTERNAL_STREAM_MARKER_SCHEMA_VERSION: u32 = 1;
 /// Keeps one output proof well inside the server's per-event payload limits.
@@ -1465,6 +1460,11 @@ fn validate_output_manifest(
     Ok(())
 }
 
+// Construct a new command sequence with query responses removed, and any
+// terminal responses removed, except for the first terminal response, which is
+// placed at the end. Return new command sequence and query commands. Note that
+// multiple coroutines may have generated a terminal command, leading to
+// multiple terminal commands in the input to this function.
 fn preprocess_command_sequence(commands: Vec<WFCommand>) -> (Vec<WFCommand>, Vec<QueryResult>) {
     let mut query_results = vec![];
     let mut terminals = vec![];
