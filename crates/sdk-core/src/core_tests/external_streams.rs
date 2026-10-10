@@ -712,7 +712,9 @@ fn worker_expecting_nondeterminism(
     mock_cfg.num_expected_fails = 1;
     mock_cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
         *cause == WorkflowTaskFailedCause::NonDeterministicError
-            && failure.as_ref().is_some_and(|f| f.message.contains(message))
+            && failure
+                .as_ref()
+                .is_some_and(|f| f.message.contains(message))
     });
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
