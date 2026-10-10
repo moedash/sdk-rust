@@ -619,6 +619,24 @@ async fn a_replayed_commit_matching_history_is_accepted_without_a_stage_token() 
 }
 
 #[tokio::test]
+async fn a_replayed_commit_matches_a_marker_a_reset_copied_from_the_base_run() {
+    // A reset forks the base run's History, so its markers keep naming the base run while lang
+    // recomputes the manifest with the new run's id.
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let replayed = output_manifest(history.get_orig_run_id(), 1, "");
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        output_manifest("reset-base-run", 1, "base-run-stage-token"),
+    ));
+    let timer_started = history.add_by_type(EventType::TimerStarted);
+    history.add_timer_fired(timer_started, "1".to_string());
+    history.add_workflow_task_scheduled_and_started();
+    replay_with_commit(history, replayed, 0).await;
+}
+
+#[tokio::test]
 async fn a_replayed_commit_that_differs_from_history_is_nondeterministic() {
     let (history, mut manifest) = output_then_timer_history();
     manifest.topics[0].record_count = 3;

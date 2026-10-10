@@ -40,7 +40,7 @@ relevant information.
   visible only when the workflow task is accepted. Activations now carry
   `history_floor_event_id`, which the manifest must match. On replay, Core hands the recorded
   manifest back in a `ReplayExternalStreams` job, and a commit sent while replaying must match
-  it (the stage token aside) or the task fails as nondeterministic.
+  it (the stage token and run id aside) or the task fails as nondeterministic.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom

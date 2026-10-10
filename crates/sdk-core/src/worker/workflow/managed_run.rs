@@ -1467,7 +1467,9 @@ fn validate_output_manifest(
 /// Compares the output lang recomputed while replaying with the manifest History recorded.
 ///
 /// The stage token is left out because lang must not stage again on replay, so it has no token to
-/// offer. Everything else is derived deterministically from the Workflow's own output.
+/// offer. The run id is left out because a reset forks the base run's History, so the new run
+/// replays markers that name the base run. Everything else is derived deterministically from the
+/// Workflow's own output.
 fn check_replayed_output_manifest(
     mut replayed: ExternalOutputStreamManifest,
     recorded: Option<ExternalOutputStreamManifest>,
@@ -1478,8 +1480,10 @@ fn check_replayed_output_manifest(
                 .to_string(),
         ));
     };
-    replayed.stage_token.clear();
-    recorded.stage_token.clear();
+    for manifest in [&mut replayed, &mut recorded] {
+        manifest.stage_token.clear();
+        manifest.run_id.clear();
+    }
     if replayed != recorded {
         return Err(WFMachinesError::Nondeterminism(format!(
             "External output committed while replaying differs from the manifest recorded in \
@@ -2050,6 +2054,13 @@ mod tests {
             let mut replayed = manifest();
             replayed.stage_token.clear();
             check_replayed_output_manifest(replayed, Some(manifest())).unwrap();
+        }
+
+        #[test]
+        fn a_replayed_commit_matches_a_manifest_recorded_by_another_run() {
+            let mut recorded = manifest();
+            recorded.run_id = "reset-base-run".to_string();
+            check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
         }
 
         #[test]
