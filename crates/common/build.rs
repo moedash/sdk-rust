@@ -766,6 +766,7 @@ const BLOB_FIELDS: &[&str] = &[
     "temporal.api.workflowservice.v1.RespondActivityTaskCanceledByIdRequest.details",
     "temporal.api.workflowservice.v1.RespondActivityTaskCanceledRequest.details",
     "temporal.api.workflowservice.v1.RespondActivityTaskCompletedByIdRequest.result",
+    "temporal.api.workflowservice.v1.NotifyStreamRequest.close_result", // becomes the stream's result
     "temporal.api.workflowservice.v1.RespondActivityTaskCompletedRequest.result",
     "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.input",
     "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.signal_input",

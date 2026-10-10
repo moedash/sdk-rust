@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package temporal.api.stream.v1;
+
+option go_package = "go.temporal.io/api/stream/v1;stream";
+option java_package = "io.temporal.api.stream.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::Stream::V1";
+option csharp_namespace = "Temporalio.Api.Stream.V1";
+
+import "google/protobuf/timestamp.proto";
+import "temporal/api/common/v1/message.proto";
+import "temporal/api/enums/v1/common.proto";
+import "temporal/api/enums/v1/stream.proto";
+import "temporal/api/failure/v1/message.proto";
+
+// Names one stream within a namespace: its owner and its topic.
+message StreamReference {
+    temporal.api.enums.v1.StreamOwnerKind owner_kind = 1;
+    // The owning Workflow, for `STREAM_OWNER_KIND_WORKFLOW`.
+    string workflow_id = 2;
+    // Pins the stream to one run of the owning Workflow. Empty follows the run chain. A stream
+    // notifier is keyed without it, so one notifier serves the stream across runs.
+    string run_id = 3;
+    // The stream's topic within its owner.
+    string topic = 4;
+}
+
+// A callback attached to a stream notifier, as DescribeStreamNotifier reports it.
+message StreamCallbackInfo {
+    // The request ID the callback was attached with.
+    string request_id = 1;
+    temporal.api.common.v1.Callback callback = 2;
+    // The state of the callback's completion delivery.
+    temporal.api.enums.v1.CallbackState state = 3;
+    // The highest counter delivered to the callback as progress.
+    int64 delivered_counter = 4;
+    // Whether the receiver refused progress, so the callback only gets the completion.
+    bool progress_disabled = 5;
+    // The number of attempts made for the delivery in flight, starting at 1.
+    int32 attempt = 6;
+    // The time the last attempt completed.
+    google.protobuf.Timestamp last_attempt_complete_time = 7;
+    // The failure of the last attempt, if it failed.
+    temporal.api.failure.v1.Failure last_attempt_failure = 8;
+}
