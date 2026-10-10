@@ -6,7 +6,7 @@ use crate::{
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers, mock_worker,
-        start_timer_cmd,
+        schedule_local_activity_cmd, start_timer_cmd,
     },
     worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
 };
@@ -14,8 +14,11 @@ use parking_lot::Mutex;
 use std::{sync::Arc, time::Duration};
 use temporalio_common::{
     protos::{
-        constants::EXTERNAL_STREAM_MARKER_NAME,
+        constants::{EXTERNAL_STREAM_MARKER_NAME, LOCAL_ACTIVITY_MARKER_NAME},
         coresdk::{
+            ActivityTaskCompletion,
+            activity_result::ActivityExecutionResult,
+            common::extract_local_activity_marker_data,
             external_data::{
                 ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
                 ExternalOutputTopicManifest, ExternalStreamBoundary, ExternalStreamMarkerData,
@@ -23,12 +26,14 @@ use temporalio_common::{
             },
             workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_commands::{
-                CompleteWorkflowExecution, WorkflowOutputStreamCommit, workflow_command,
+                ActivityCancellationType, CompleteWorkflowExecution, WorkflowOutputStreamCommit,
+                workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            command::v1::command,
+            command::v1::{Command, command},
+            common::v1::Payload,
             enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
             workflowservice::v1::RespondWorkflowTaskCompletedResponse,
         },
@@ -786,4 +791,451 @@ async fn a_replay_that_commits_less_in_the_final_task_of_a_closed_history_fails(
         .unwrap();
     worker.shutdown().await;
     worker.finalize_shutdown().await;
+}
+
+/// Every completion's commands, in the order the completions were reported.
+type RecordedCommands = Arc<Mutex<Vec<Vec<Command>>>>;
+
+/// A worker that runs local activities and records the commands of every completion.
+fn local_activity_worker(
+    history: TestHistoryBuilder,
+    batches: Vec<ResponseType>,
+    completions: RecordedCommands,
+    num_expected_fails: usize,
+) -> crate::Worker {
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, batches, mock_worker_client());
+    mock_cfg.num_expected_fails = num_expected_fails;
+    if num_expected_fails == 0 {
+        mock_cfg.completion_mock_fn = Some(Box::new(move |wft| {
+            completions.lock().push(wft.commands.clone());
+            Ok(RespondWorkflowTaskCompletedResponse::default())
+        }));
+    } else {
+        mock_cfg.expect_fail_wft_matcher = Box::new(|_, cause, failure| {
+            *cause == WorkflowTaskFailedCause::NonDeterministicError
+                && failure
+                    .as_ref()
+                    .is_some_and(|f| f.message.contains("did not commit"))
+        });
+    }
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes {
+            enable_local_activities: true,
+            ..WorkerTaskTypes::workflow_only()
+        };
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+fn schedule_local_activity(seq: u32) -> workflow_command::Variant {
+    schedule_local_activity_cmd(
+        seq,
+        &seq.to_string(),
+        ActivityCancellationType::TryCancel,
+        Duration::from_secs(10),
+    )
+}
+
+fn local_activity_result() -> Payload {
+    Payload {
+        data: b"done".to_vec(),
+        ..Default::default()
+    }
+}
+
+/// Runs the local activity lang just scheduled and returns the activation that resolves it.
+async fn run_local_activity(worker: &crate::Worker) -> WorkflowActivation {
+    let task = worker.poll_activity_task().await.unwrap();
+    worker
+        .complete_activity_task(ActivityTaskCompletion {
+            task_token: task.task_token,
+            result: Some(ActivityExecutionResult::ok(local_activity_result())),
+        })
+        .await
+        .unwrap();
+    worker.poll_workflow_activation().await.unwrap()
+}
+
+fn only_resolves_local_activity(activation: &WorkflowActivation, seq: u32) -> bool {
+    matches!(
+        activation.jobs.as_slice(),
+        [job] if matches!(
+            &job.variant,
+            Some(workflow_activation_job::Variant::ResolveActivity(r)) if r.seq == seq
+        )
+    )
+}
+
+fn stream_markers_in(commands: &[Command]) -> Vec<ExternalStreamMarkerData> {
+    commands
+        .iter()
+        .filter_map(|c| match &c.attributes {
+            Some(command::Attributes::RecordMarkerCommandAttributes(m))
+                if m.marker_name == EXTERNAL_STREAM_MARKER_NAME =>
+            {
+                extract_external_stream_marker_data(&m.details)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The activation index each local activity marker in `commands` recorded.
+fn local_activity_activation_indexes(commands: &[Command]) -> Vec<Option<u64>> {
+    commands
+        .iter()
+        .filter_map(|c| match &c.attributes {
+            Some(command::Attributes::RecordMarkerCommandAttributes(m))
+                if m.marker_name == LOCAL_ACTIVITY_MARKER_NAME =>
+            {
+                extract_local_activity_marker_data(&m.details).map(|d| d.activation_index)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Two output manifests with the same floor and run, told apart by their topic.
+fn two_manifests(run_id: &str, floor: i64) -> [ExternalOutputStreamManifest; 2] {
+    let first = output_manifest(run_id, floor, "first-token");
+    let mut second = output_manifest(run_id, floor, "second-token");
+    second.topics[0].topic = "progress".to_string();
+    [first, second]
+}
+
+/// What a first task that commits, runs a local activity, then commits again and starts a timer
+/// leaves in History, followed by the timer firing and the next task.
+fn two_commits_around_a_local_activity_history()
+-> (TestHistoryBuilder, [ExternalOutputStreamManifest; 2]) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    let manifests = two_manifests(t.get_orig_run_id(), 1);
+    t.add_full_wf_task();
+    t.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifests[0].clone(),
+    ));
+    t.add_local_activity_marker(1, "1", Some(local_activity_result()), None, |d| {
+        d.activation_index = Some(1)
+    });
+    t.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifests[1].clone(),
+    ));
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    (t, manifests)
+}
+
+#[tokio::test]
+async fn commits_around_a_local_activity_write_one_marker_each_in_order() {
+    let (history, manifests) = two_commits_around_a_local_activity_history();
+    let completions: RecordedCommands = Default::default();
+    let worker = local_activity_worker(history, vec![1.into(), 2.into()], completions.clone(), 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(manifests[0].clone()),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = run_local_activity(&worker).await;
+    assert!(only_resolves_local_activity(&resolved, 1));
+    assert_eq!(
+        resolved.history_floor_event_id, first.history_floor_event_id,
+        "both activations belong to the same Workflow Task"
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(manifests[1].clone()),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    // The next task's History holds the markers written above, and Core matches them in order.
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(has_fire_timer(&fired));
+    worker.complete_execution(&run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let completions = completions.lock();
+    let first_task = &completions[0];
+    assert_eq!(
+        first_task
+            .iter()
+            .map(|c| c.command_type())
+            .collect::<Vec<_>>(),
+        vec![
+            CommandType::RecordMarker,
+            CommandType::RecordMarker,
+            CommandType::RecordMarker,
+            CommandType::StartTimer,
+        ]
+    );
+    assert_eq!(
+        stream_markers_in(first_task),
+        manifests
+            .iter()
+            .map(|m| output_marker(ExternalStreamBoundary::CommandsProduced, m.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        local_activity_activation_indexes(first_task),
+        vec![Some(1)],
+        "the local activity resolved in the task's second activation"
+    );
+}
+
+#[tokio::test]
+async fn replay_splits_commits_around_a_local_activity_into_the_live_activations() {
+    let (history, manifests) = two_commits_around_a_local_activity_history();
+    let completions: RecordedCommands = Default::default();
+    let worker = local_activity_worker(history, vec![2.into()], completions.clone(), 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    assert!(first.is_replaying);
+    assert_eq!(
+        replay_outputs(&first),
+        manifests.to_vec(),
+        "every manifest of the task arrives in its first activation, in History order"
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(unstaged(manifests[0].clone())),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    // The recorded result resolves the activity in its own activation, as it did live.
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert!(resolved.is_replaying);
+    assert!(only_resolves_local_activity(&resolved, 1));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(unstaged(manifests[1].clone())),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    assert!(has_fire_timer(&fired));
+    worker.complete_execution(&run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert!(
+        completions
+            .lock()
+            .iter()
+            .all(|commands| stream_markers_in(commands).is_empty()),
+        "replay never writes an output marker"
+    );
+}
+
+#[tokio::test]
+async fn a_replay_that_drops_the_commit_after_a_local_activity_is_nondeterministic() {
+    let (history, manifests) = two_commits_around_a_local_activity_history();
+    let worker = local_activity_worker(history, vec![2.into()], Default::default(), 1);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(unstaged(manifests[0].clone())),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert!(only_resolves_local_activity(&resolved, 1));
+    // The Workflow no longer publishes after the activity.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn commits_around_a_local_activity_replay_then_go_live_in_the_next_task() {
+    let (history, manifests) = two_commits_around_a_local_activity_history();
+    let completions: RecordedCommands = Default::default();
+    let worker = local_activity_worker(history, vec![2.into()], completions.clone(), 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(unstaged(manifests[0].clone())),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert!(only_resolves_local_activity(&resolved, 1));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(unstaged(manifests[1].clone())),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    // The first live task publishes around a local activity of its own.
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    assert!(has_fire_timer(&fired));
+    assert!(replay_outputs(&fired).is_empty());
+    let live = two_manifests(&run_id, fired.history_floor_event_id);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(live[0].clone()),
+                schedule_local_activity(2),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = run_local_activity(&worker).await;
+    assert!(!resolved.is_replaying);
+    assert!(only_resolves_local_activity(&resolved, 2));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id,
+            vec![
+                CompleteWorkflowExecution::default().into(),
+                output_commit_command(live[1].clone()),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    let completions = completions.lock();
+    assert_eq!(completions.len(), 1, "only the live task completes");
+    assert_eq!(
+        stream_markers_in(&completions[0]),
+        vec![
+            output_marker(ExternalStreamBoundary::CommandsProduced, live[0].clone()),
+            output_marker(ExternalStreamBoundary::WorkflowCompleted, live[1].clone()),
+        ]
+    );
+    assert_eq!(
+        local_activity_activation_indexes(&completions[0]),
+        vec![Some(1)]
+    );
+}
+
+#[tokio::test]
+async fn replay_keeps_each_local_activity_result_and_its_commit_in_the_live_activation() {
+    // Live, lang committed, scheduled two local activities, and committed again after each one
+    // resolved in an activation of its own. Both activity markers sit where they were scheduled.
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let [first, second] = two_manifests(history.get_orig_run_id(), 1);
+    let mut third = output_manifest(history.get_orig_run_id(), 1, "third-token");
+    third.topics[0].topic = "summary".to_string();
+    let manifests = vec![first, second, third];
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifests[0].clone(),
+    ));
+    for seq in 1..=2 {
+        history.add_local_activity_marker(
+            seq,
+            &seq.to_string(),
+            Some(local_activity_result()),
+            None,
+            |d| d.activation_index = Some(u64::from(seq)),
+        );
+    }
+    for (manifest, boundary) in manifests[1..].iter().zip([
+        ExternalStreamBoundary::TaskCompleted,
+        ExternalStreamBoundary::CommandsProduced,
+    ]) {
+        history.add_external_stream_marker_data(output_marker(boundary, manifest.clone()));
+    }
+    let timer_started = history.add_by_type(EventType::TimerStarted);
+    history.add_timer_fired(timer_started, "1".to_string());
+    history.add_workflow_task_scheduled_and_started();
+
+    let worker = local_activity_worker(history, vec![2.into()], Default::default(), 0);
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    assert_eq!(replay_outputs(&activation), manifests);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(unstaged(manifests[0].clone())),
+                schedule_local_activity(1),
+                schedule_local_activity(2),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved_first = worker.poll_workflow_activation().await.unwrap();
+    assert!(
+        only_resolves_local_activity(&resolved_first, 1),
+        "the second result was recorded for a later activation: {:?}",
+        resolved_first.jobs
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            output_commit_command(unstaged(manifests[1].clone())),
+        ))
+        .await
+        .unwrap();
+    let resolved_second = worker.poll_workflow_activation().await.unwrap();
+    assert!(only_resolves_local_activity(&resolved_second, 2));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(unstaged(manifests[2].clone())),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(has_fire_timer(&fired));
+    worker.complete_execution(&run_id).await;
+    worker.drain_pollers_and_shutdown().await;
 }
