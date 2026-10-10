@@ -33,6 +33,13 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Experimental: progress of a started Nexus operation reaches lang as a
+  `ResolveNexusOperationProgress` job, at most one per operation per workflow task, with the
+  highest counter the server folded onto the task's scheduled event. Replay delivers the same jobs
+  in the same activations. Progress for an operation that is unknown, not started, already
+  resolved, or below a counter already delivered is dropped.
+
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
   metrics backends, including the Python SDK's `MetricBuffer`. Previously these counts could
