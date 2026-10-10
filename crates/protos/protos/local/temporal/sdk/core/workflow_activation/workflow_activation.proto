@@ -397,12 +397,12 @@ message ResolveNexusOperation {
 message ResolveNexusOperationProgress {
     // Sequence number as provided by lang in the corresponding ScheduleNexusOperation command
     uint32 seq = 1;
-    // Where the operation's output stands, in the handler's terms.
-    bytes position = 2;
+    // Where the operation's output stands, in the handler's terms, such as a stream cursor.
+    string position = 2;
     // Orders the progress of one operation.
     int64 counter = 3;
     // Small details from the handler.
-    map<string, temporal.api.common.v1.Payload> metadata = 4;
+    map<string, string> metadata = 4;
 }
 
 message RemoveFromCache {

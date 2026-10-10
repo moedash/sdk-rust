@@ -17989,8 +17989,7 @@
         },
         "position": {
           "type": "string",
-          "format": "byte",
-          "description": "Where the operation's output stands after the change this progress reports, in the\nhandler's terms. Opaque to the server."
+          "description": "Where the operation's output stands after the change this progress reports, in the\nhandler's terms, such as a stream cursor. Opaque to the server."
         },
         "counter": {
           "type": "string",
@@ -18000,9 +17999,9 @@
         "metadata": {
           "type": "object",
           "additionalProperties": {
-            "$ref": "#/definitions/v1Payload"
+            "type": "string"
           },
-          "description": "Small details for the caller. The server rejects progress whose metadata exceeds 2 KiB in\ntotal (keys and encoded payloads)."
+          "description": "Small details for the caller. The server rejects progress whose metadata keys and values\nexceed 2 KiB in total, counted as UTF-8 bytes."
         }
       },
       "description": "Non-terminal progress of an asynchronous Nexus operation, delivered to the operation's callback\nwith the `running` state before its completion.\n\nProgress says that the operation's output moved, not what the output is: the receiver reads the\noutput itself, starting from `position`. Deliveries may arrive out of order or be dropped, so a\nreceiver keeps the one with the highest `counter` and drops any lower one."

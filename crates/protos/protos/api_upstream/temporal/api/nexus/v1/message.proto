@@ -62,14 +62,14 @@ message NexusOperationProgress {
         int64 scheduled_event_id = 1;
     }
     // Where the operation's output stands after the change this progress reports, in the
-    // handler's terms. Opaque to the server.
-    bytes position = 2;
+    // handler's terms, such as a stream cursor. Opaque to the server.
+    string position = 2;
     // Orders the progress of one operation. Among progress folded together, the highest counter
     // is kept. Must be positive.
     int64 counter = 3;
-    // Small details for the caller. The server rejects progress whose metadata exceeds 2 KiB in
-    // total (keys and encoded payloads).
-    map<string, temporal.api.common.v1.Payload> metadata = 4;
+    // Small details for the caller. The server rejects progress whose metadata keys and values
+    // exceed 2 KiB in total, counted as UTF-8 bytes.
+    map<string, string> metadata = 4;
 }
 
 // A request to start an operation.

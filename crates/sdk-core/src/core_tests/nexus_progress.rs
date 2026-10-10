@@ -19,7 +19,6 @@ use temporalio_common::{
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            common::v1::Payload,
             enums::v1::EventType,
             history::v1::{
                 NexusOperationCompletedEventAttributes, NexusOperationScheduledEventAttributes,
@@ -36,16 +35,9 @@ fn progress(scheduled_event_id: i64, counter: i64) -> NexusOperationProgress {
         operation: Some(nexus_operation_progress::Operation::ScheduledEventId(
             scheduled_event_id,
         )),
-        position: format!("position-{counter}").into_bytes(),
+        position: format!("position-{counter}"),
         counter,
-        metadata: [(
-            "records".to_string(),
-            Payload {
-                data: counter.to_string().into_bytes(),
-                ..Default::default()
-            },
-        )]
-        .into(),
+        metadata: [("records".to_string(), counter.to_string())].into(),
     }
 }
 

@@ -14141,8 +14141,7 @@ components:
           type: string
           description: |-
             Where the operation's output stands after the change this progress reports, in the
-             handler's terms. Opaque to the server.
-          format: bytes
+             handler's terms, such as a stream cursor. Opaque to the server.
         counter:
           type: string
           description: |-
@@ -14151,10 +14150,10 @@ components:
         metadata:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/Payload'
+            type: string
           description: |-
-            Small details for the caller. The server rejects progress whose metadata exceeds 2 KiB in
-             total (keys and encoded payloads).
+            Small details for the caller. The server rejects progress whose metadata keys and values
+             exceed 2 KiB in total, counted as UTF-8 bytes.
       description: |-
         Non-terminal progress of an asynchronous Nexus operation, delivered to the operation's callback
          with the `running` state before its completion.

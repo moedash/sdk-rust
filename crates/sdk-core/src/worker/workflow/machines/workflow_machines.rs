@@ -1945,7 +1945,7 @@ mod nexus_progress_tests {
     fn progress(scheduled_event_id: i64, counter: i64, position: &str) -> NexusOperationProgress {
         NexusOperationProgress {
             operation: Some(Operation::ScheduledEventId(scheduled_event_id)),
-            position: position.as_bytes().to_vec(),
+            position: position.to_string(),
             counter,
             ..Default::default()
         }
