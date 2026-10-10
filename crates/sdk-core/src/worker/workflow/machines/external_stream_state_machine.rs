@@ -188,7 +188,7 @@ impl ExternalStreamMachine {
     ///
     /// Nothing is written: the marker is already in History, and issuing a command for it would
     /// produce a mismatch against the very event it was read from. The machine exists only so that
-    /// event, when history reaches it, has something to be matched by -- which is what turns a
+    /// event, when history reaches it, has something to be matched by. That is what turns a
     /// marker Core did not expect into a nondeterminism error rather than a silent skip.
     pub(super) fn resolved_from_marker_lookahead(data: ExternalStreamMarkerData) -> Self {
         let mut machine = ExternalStreamMachine {
