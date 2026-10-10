@@ -4,7 +4,8 @@
 use crate::{
     replay::TestHistoryBuilder,
     test_help::{
-        MockPollCfg, ResponseType, WorkerExt, build_mock_pollers, mock_worker, start_timer_cmd,
+        MockPollCfg, ResponseType, WorkerExt, build_mock_pollers, mock_worker,
+        schedule_local_activity_cmd, start_timer_cmd,
     },
     worker::client::mocks::mock_worker_client,
 };
@@ -15,10 +16,13 @@ use temporalio_common::{
             workflow_activation::{
                 ResolveNexusOperationProgress, WorkflowActivation, workflow_activation_job,
             },
-            workflow_commands::{CompleteWorkflowExecution, ScheduleNexusOperation},
+            workflow_commands::{
+                ActivityCancellationType, CompleteWorkflowExecution, ScheduleNexusOperation,
+            },
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
+            common::v1::Payload,
             enums::v1::EventType,
             history::v1::{
                 NexusOperationCompletedEventAttributes, NexusOperationScheduledEventAttributes,
@@ -91,6 +95,9 @@ fn job_names(activation: &WorkflowActivation) -> Vec<String> {
             }
             Some(workflow_activation_job::Variant::ResolveNexusOperation(r)) => {
                 format!("Resolve({})", r.seq)
+            }
+            Some(workflow_activation_job::Variant::ResolveActivity(r)) => {
+                format!("ResolveActivity({})", r.seq)
             }
             Some(other) => other.to_string(),
             None => "none".to_string(),
@@ -321,4 +328,114 @@ async fn progress_for_an_unknown_closed_or_stale_operation_is_dropped() {
     assert_eq!(job_names(&last), vec!["Resolve(2)"]);
     complete(&worker, &run_id, vec![CompleteWorkflowExecution::default()]).await;
     worker.drain_pollers_and_shutdown().await;
+}
+
+/// What a live run leaves in History when a local activity outlives the Workflow Task timeout:
+/// Core completes the task with no commands to heartbeat it, the activity resolves in the
+/// heartbeat task, lang starts a timer, and the timer's task carries progress. With
+/// `progress_on_heartbeat`, the server also put progress on the heartbeat task's scheduled event,
+/// which the server must never do.
+fn local_activity_heartbeat_then_progress(progress_on_heartbeat: bool) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled = add_operation_scheduled(&mut t);
+    add_operation_started(&mut t, scheduled);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed();
+    if progress_on_heartbeat {
+        t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 1)]);
+    } else {
+        t.add_workflow_task_scheduled();
+    }
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    t.add_local_activity_result_marker(1, "1", Payload::default());
+    let timer = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer, "1".to_string());
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 2)]);
+    t.add_workflow_task_started();
+    t
+}
+
+/// Replays `local_activity_heartbeat_then_progress` and returns each activation's jobs.
+async fn replay_local_activity_heartbeat(progress_on_heartbeat: bool) -> Vec<Vec<String>> {
+    let mut mock = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        local_activity_heartbeat_then_progress(progress_on_heartbeat),
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    ));
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes {
+            enable_local_activities: true,
+            ..WorkerTaskTypes::workflow_only()
+        };
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let mut seen = vec![];
+
+    let init = worker.poll_workflow_activation().await.unwrap();
+    let run_id = init.run_id.clone();
+    seen.push(job_names(&init));
+    complete(&worker, &run_id, vec![schedule_operation(1)]).await;
+
+    let started = worker.poll_workflow_activation().await.unwrap();
+    seen.push(job_names(&started));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            run_id.clone(),
+            schedule_local_activity_cmd(
+                1,
+                "1",
+                ActivityCancellationType::TryCancel,
+                Duration::from_secs(60),
+            ),
+        ))
+        .await
+        .unwrap();
+
+    // Lang waits on the activity, so any activation without its result gets no new commands.
+    loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        let jobs = job_names(&next);
+        seen.push(jobs.clone());
+        if jobs.iter().any(|j| j.starts_with("ResolveActivity")) {
+            complete(
+                &worker,
+                &run_id,
+                vec![start_timer_cmd(1, Duration::from_secs(1))],
+            )
+            .await;
+            break;
+        }
+        complete(&worker, &run_id, Vec::<ScheduleNexusOperation>::new()).await;
+    }
+
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    seen.push(job_names(&fired));
+    complete(&worker, &run_id, vec![CompleteWorkflowExecution::default()]).await;
+    worker.drain_pollers_and_shutdown().await;
+    seen
+}
+
+/// DD-52: the server keeps progress pending through a Workflow Task created by a heartbeat, so the
+/// heartbeat chain replays as one sequence and the activity result and the progress reach lang in
+/// the activations they had live.
+#[tokio::test]
+async fn progress_after_a_local_activity_heartbeat_replays_as_it_ran_live() {
+    let live = vec![
+        vec!["InitializeWorkflow".to_string()],
+        vec!["Start(1)".to_string()],
+        vec!["ResolveActivity(1)".to_string()],
+        vec!["FireTimer(1)".to_string(), "Progress(1, 2)".to_string()],
+    ];
+    let replayed = replay_local_activity_heartbeat(false).await;
+    assert_eq!(replayed, live);
+
+    // Progress on the heartbeat task's scheduled event would split the chain, and lang would see
+    // that progress in an activation the live run never had.
+    let violating = replay_local_activity_heartbeat(true).await;
+    assert_ne!(violating, replayed);
 }
