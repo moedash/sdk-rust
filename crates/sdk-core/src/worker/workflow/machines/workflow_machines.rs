@@ -102,7 +102,8 @@ pub(crate) struct WorkflowMachines {
     /// pairing.
     external_stream_marker_machines: VecDeque<MachineKey>,
     /// Output manifests the lookahead found for the Workflow Task being replayed, in History
-    /// order, so a commit lang sends while replaying can be checked against what was recorded.
+    /// order. Each commit lang sends while replaying consumes one, and any left when the next
+    /// task is applied were not committed again.
     replayed_output_manifests: VecDeque<ExternalOutputStreamManifest>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
@@ -850,9 +851,15 @@ impl WorkflowMachines {
             ProtocolMessage(IncomingProtocolMessage),
         }
         let mut delayed_actions = vec![];
-        // A manifest lang did not commit again belongs to a task that is over, and lang checked it
-        // through the replay job instead.
-        self.replayed_output_manifests.clear();
+        // Every activation of the previous task has completed by now, so a manifest lang did not
+        // commit again means the Workflow published less than History recorded. This holds on the
+        // switch to live as well: the live task's own markers are never looked ahead.
+        if let Some(uncommitted) = self.replayed_output_manifests.front() {
+            return Err(nondeterminism!(
+                "History recorded external output that the replayed Workflow Task did not commit: \
+                 {uncommitted:?}"
+            ));
+        }
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
         // pre-resolve them. This lookahead is necessary because we need these things to be already
         // resolved in the same activations they would have been resolved in during initial

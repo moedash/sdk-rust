@@ -79,6 +79,12 @@ fn output_manifest(
     }
 }
 
+/// The manifest lang re-sends while replaying: recomputed, so it has no stage token.
+fn unstaged(mut manifest: ExternalOutputStreamManifest) -> ExternalOutputStreamManifest {
+    manifest.stage_token.clear();
+    manifest
+}
+
 fn output_commit_command(manifest: ExternalOutputStreamManifest) -> workflow_command::Variant {
     workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit {
         manifest: Some(manifest),
@@ -479,11 +485,14 @@ async fn replay_hands_the_recorded_manifest_back_and_writes_nothing() {
     );
     let replayed = worker.poll_workflow_activation().await.unwrap();
     assert!(replayed.is_replaying);
-    assert_eq!(replay_outputs(&replayed), vec![manifest]);
+    assert_eq!(replay_outputs(&replayed), vec![manifest.clone()]);
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             replayed.run_id.clone(),
-            vec![start_timer_cmd(1, Duration::from_secs(10))],
+            vec![
+                output_commit_command(unstaged(manifest)),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
         ))
         .await
         .unwrap();
@@ -535,7 +544,10 @@ async fn the_output_marker_survives_a_cache_eviction() {
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.clone(),
-            vec![start_timer_cmd(1, Duration::from_secs(10))],
+            vec![
+                output_commit_command(unstaged(manifest.clone())),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
         ))
         .await
         .unwrap();
@@ -613,9 +625,8 @@ async fn replay_with_commit(
 
 #[tokio::test]
 async fn a_replayed_commit_matching_history_is_accepted_without_a_stage_token() {
-    let (history, mut manifest) = output_then_timer_history();
-    manifest.stage_token.clear();
-    replay_with_commit(history, manifest, 0).await;
+    let (history, manifest) = output_then_timer_history();
+    replay_with_commit(history, unstaged(manifest), 0).await;
 }
 
 #[tokio::test]
@@ -678,6 +689,98 @@ async fn a_replayed_commit_where_history_recorded_none_is_nondeterministic() {
                 output_commit_command(output_manifest(&replayed.run_id, 1, "")),
                 start_timer_cmd(1, Duration::from_secs(10)),
             ],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+/// A worker that expects exactly one Workflow Task failure: nondeterminism naming `message`.
+fn worker_expecting_nondeterminism(
+    history: TestHistoryBuilder,
+    batches: Vec<ResponseType>,
+    message: &'static str,
+) -> crate::Worker {
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, batches, mock_worker_client());
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
+        *cause == WorkflowTaskFailedCause::NonDeterministicError
+            && failure.as_ref().is_some_and(|f| f.message.contains(message))
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+#[tokio::test]
+async fn a_replay_that_commits_less_than_history_fails_when_going_live() {
+    let (history, manifest) = output_then_timer_history();
+    let worker = worker_expecting_nondeterminism(history, vec![2.into()], "did not commit");
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(replay_outputs(&replayed), vec![manifest]);
+    // The Workflow no longer publishes, so lang sends the timer alone.
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_replay_that_commits_less_than_history_fails_before_the_next_replayed_task() {
+    let (mut history, manifest) = output_then_timer_history();
+    history.add_workflow_task_completed();
+    let second_timer = history.add_by_type(EventType::TimerStarted);
+    history.add_timer_fired(second_timer, "2".to_string());
+    history.add_workflow_task_scheduled_and_started();
+    let worker = worker_expecting_nondeterminism(history, vec![3.into()], "did not commit");
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(replay_outputs(&replayed), vec![manifest]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id.clone(),
+            vec![start_timer_cmd(1, Duration::from_secs(10))],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_replay_that_commits_less_in_the_final_task_of_a_closed_history_fails() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let manifest = output_manifest(history.get_orig_run_id(), 1, "terminal-token");
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::WorkflowCompleted,
+        manifest.clone(),
+    ));
+    history.add_workflow_execution_completed();
+    let worker =
+        worker_expecting_nondeterminism(history, vec![ResponseType::AllHistory], "did not commit");
+
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(replay_outputs(&replayed), vec![manifest]);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            replayed.run_id.clone(),
+            vec![CompleteWorkflowExecution::default().into()],
         ))
         .await
         .unwrap();
