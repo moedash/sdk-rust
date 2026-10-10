@@ -148,6 +148,7 @@ interface workflow-service {
   record stream-reference {
     owner-kind: option<stream-owner-kind>,
     workflow-id: string,
+    /// @nexus.doc "The id of the first run in the owning Workflow's run chain. It is required, since the server refuses an empty run id."
     run-id: option<string>,
     topic: string,
   }

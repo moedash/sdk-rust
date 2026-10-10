@@ -22654,7 +22654,7 @@
             "type": "object",
             "$ref": "#/definitions/v1NexusOperationProgress"
           },
-          "description": "Progress of the Workflow's Nexus operations that arrived since the previous Workflow Task was\nscheduled, at most one entry per operation: the one with the highest counter. Recorded here\nrather than as events of its own, so a burst of progress costs one task and replay sees the\nsame progress the Workflow saw."
+          "description": "Progress of the Workflow's Nexus operations that arrived since the previous Workflow Task was\nscheduled, at most one entry per operation: the one with the highest counter. Recorded here\nrather than as events of its own, so a burst of progress costs one task and replay sees the\nsame progress the Workflow saw. Its size is bounded by the Workflow's pending Nexus operation\nlimit times the per-entry bounds on `position` and `metadata`, about 3 KiB per operation, and\nit counts toward the History size limit."
         }
       }
     },

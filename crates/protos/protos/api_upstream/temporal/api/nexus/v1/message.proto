@@ -56,7 +56,8 @@ message Link {
 // receiver keeps the one with the highest `counter` and drops any lower one.
 message NexusOperationProgress {
     // The operation this progress belongs to. A handler leaves it unset, since the callback already
-    // identifies the operation. The server sets it when it hands progress to a caller.
+    // identifies the operation. The server sets it when it hands progress to a caller. A oneof, so
+    // a later case can name an operation that no Workflow schedules, such as a standalone one.
     oneof operation {
         // The event ID of the `NEXUS_OPERATION_SCHEDULED` event of the caller Workflow's operation.
         int64 scheduled_event_id = 1;
