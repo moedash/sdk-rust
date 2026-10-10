@@ -1326,6 +1326,9 @@ pub mod coresdk {
                                 r.output.is_some()
                             )
                         }
+                        workflow_activation_job::Variant::ResolveNexusOperationProgress(p) => {
+                            write!(f, "ResolveNexusOperationProgress({}, {})", p.seq, p.counter)
+                        }
                     }
                 }
             }

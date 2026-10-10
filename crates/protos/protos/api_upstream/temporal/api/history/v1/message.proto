@@ -19,6 +19,7 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
+import "temporal/api/nexus/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
@@ -302,6 +303,11 @@ message WorkflowTaskScheduledEventAttributes {
     google.protobuf.Duration start_to_close_timeout = 2;
     // Starting at 1, how many attempts there have been to complete this task
     int32 attempt = 3;
+    // Progress of the Workflow's Nexus operations that arrived since the previous Workflow Task was
+    // scheduled, at most one entry per operation: the one with the highest counter. Recorded here
+    // rather than as events of its own, so a burst of progress costs one task and replay sees the
+    // same progress the Workflow saw.
+    repeated temporal.api.nexus.v1.NexusOperationProgress nexus_operation_progress = 4;
 }
 
 message WorkflowTaskStartedEventAttributes {

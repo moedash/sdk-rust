@@ -1129,6 +1129,11 @@ where
                         ..Default::default()
                     }));
                 }
+                // This runtime has no API for operation progress yet. Progress carries no data,
+                // only a hint to read the operation's output, so dropping it loses nothing.
+                Some(ActivationVariant::ResolveNexusOperationProgress(_)) => {
+                    ActivationJobResult::None
+                }
                 None => {
                     return Err(Box::new(Failure {
                         message: "Activation job missing variant".to_string(),

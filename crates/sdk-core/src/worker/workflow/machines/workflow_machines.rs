@@ -64,8 +64,8 @@ use temporalio_common::{
                 ExternalOutputStreamManifest, ExternalStreamBoundary, ExternalStreamMarkerData,
             },
             workflow_activation::{
-                self, NotifyHasPatch, ReplayExternalStreams, UpdateRandomSeed, WorkflowActivation,
-                workflow_activation_job,
+                self, NotifyHasPatch, ReplayExternalStreams, ResolveNexusOperationProgress,
+                UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
@@ -74,6 +74,7 @@ use temporalio_common::{
             common::v1::SearchAttributes,
             enums::v1::EventType,
             history::v1::{HistoryEvent, history_event},
+            nexus::v1::{NexusOperationProgress, nexus_operation_progress},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
         },
@@ -105,6 +106,11 @@ pub(crate) struct WorkflowMachines {
     /// order. Each commit lang sends while replaying consumes one, and any left when the next
     /// task is applied were not committed again.
     replayed_output_manifests: VecDeque<ExternalOutputStreamManifest>,
+    /// Nexus operation progress read from the scheduled events of the task being applied, one
+    /// entry per operation with the highest counter. A failed task's scheduled event and its
+    /// retry's are applied together, and the server clears what it put on the first, so both
+    /// count.
+    pending_nexus_progress: Vec<NexusOperationProgress>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
     /// The exact predecessor of the current WorkflowTaskScheduled event in the ordered History
@@ -292,6 +298,7 @@ impl WorkflowMachines {
         Self {
             last_history_from_server: basics.history,
             protocol_msgs: vec![],
+            pending_nexus_progress: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
@@ -558,6 +565,50 @@ impl WorkflowMachines {
         let machine = ExternalStreamMachine::resolved_from_marker_lookahead(data);
         let key = self.all_machines.insert(machine.into());
         self.external_stream_marker_machines.push_back(key);
+    }
+
+    /// Hands lang one job per started, unresolved operation for the progress folded from this
+    /// task's scheduled events.
+    ///
+    /// Runs once the task's events are applied, so an operation that resolved in the same task
+    /// gets its resolution and no progress, the same way live and on replay.
+    fn deliver_nexus_progress(&mut self) {
+        for progress in std::mem::take(&mut self.pending_nexus_progress) {
+            let Some(nexus_operation_progress::Operation::ScheduledEventId(scheduled_event_id)) =
+                progress.operation
+            else {
+                continue;
+            };
+            let Some(&key) = self.machines_by_event_id.get(&scheduled_event_id) else {
+                debug!(
+                    scheduled_event_id,
+                    "Dropping progress for an unknown Nexus operation"
+                );
+                continue;
+            };
+            let Some(Machines::NexusOperationMachine(machine)) = self.all_machines.get_mut(key)
+            else {
+                debug!(
+                    scheduled_event_id,
+                    "Dropping progress for an event that is not a Nexus operation"
+                );
+                continue;
+            };
+            let Some(seq) = machine.accept_progress(progress.counter) else {
+                continue;
+            };
+            self.drive_me.send_job(
+                workflow_activation_job::Variant::ResolveNexusOperationProgress(
+                    ResolveNexusOperationProgress {
+                        seq,
+                        position: progress.position,
+                        counter: progress.counter,
+                        metadata: progress.metadata,
+                    },
+                )
+                .into(),
+            );
+        }
     }
 
     pub(crate) fn has_pending_jobs(&self) -> bool {
@@ -842,6 +893,7 @@ impl WorkflowMachines {
             }
             self.last_processed_event = eid;
         }
+        self.deliver_nexus_progress();
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
         #[allow(clippy::large_enum_variant)]
@@ -1166,6 +1218,14 @@ impl WorkflowMachines {
                 }
             }
             Ok(EventType::WorkflowTaskScheduled) => {
+                if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(
+                    ref attrs,
+                )) = event_dat.event.attributes
+                {
+                    for progress in &attrs.nexus_operation_progress {
+                        fold_nexus_progress(&mut self.pending_nexus_progress, progress);
+                    }
+                }
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
                 self.submachine_handle_event(key, event_dat)?;
@@ -1993,4 +2053,52 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+/// Keeps one progress per operation, in order of first appearance. A later one replaces the held
+/// one only when its counter is higher.
+fn fold_nexus_progress(
+    folded: &mut Vec<NexusOperationProgress>,
+    progress: &NexusOperationProgress,
+) {
+    match folded
+        .iter_mut()
+        .find(|held| held.operation == progress.operation)
+    {
+        Some(held) if progress.counter > held.counter => *held = progress.clone(),
+        Some(_) => {}
+        None => folded.push(progress.clone()),
+    }
+}
+
+#[cfg(test)]
+mod nexus_progress_tests {
+    use super::fold_nexus_progress;
+    use temporalio_common::protos::temporal::api::nexus::v1::{
+        NexusOperationProgress, nexus_operation_progress::Operation,
+    };
+
+    fn progress(scheduled_event_id: i64, counter: i64, position: &str) -> NexusOperationProgress {
+        NexusOperationProgress {
+            operation: Some(Operation::ScheduledEventId(scheduled_event_id)),
+            position: position.to_string(),
+            counter,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_highest_counter_per_operation_is_kept_in_first_seen_order() {
+        let mut folded = vec![];
+        for p in [
+            progress(9, 2, "a"),
+            progress(5, 1, "b"),
+            progress(9, 4, "c"),
+            progress(9, 3, "d"),
+            progress(5, 1, "e"),
+        ] {
+            fold_nexus_progress(&mut folded, &p);
+        }
+        assert_eq!(folded, vec![progress(9, 4, "c"), progress(5, 1, "b")]);
+    }
 }
