@@ -745,9 +745,10 @@ fn find_end_index_of_next_wft_seq(
                         {
                             // If we've never seen an interesting event and the next two events are
                             // a completion followed immediately again by scheduled, then this is a
-                            // WFT heartbeat and also doesn't conclude the sequence. A task scheduled
-                            // with Nexus progress had an activation of its own live, so folding it
-                            // into this one on replay would hand lang the progress too early.
+                            // WFT heartbeat and also doesn't conclude the sequence. A task
+                            // scheduled with Nexus progress had an activation of its own live, so
+                            // folding it into this one on replay would hand lang the progress too
+                            // early.
                             continue;
                         } else {
                             // If we see an update accepted command after WFT completed, we want to

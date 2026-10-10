@@ -45,7 +45,7 @@ use temporalio_common::{
 use tokio::sync::Notify;
 
 /// Every completion's external stream markers, in the order the completions were reported.
-type RecordedMarkers = Arc<Mutex<Vec<Vec<ExternalStreamMarkerData>>>>;
+pub(super) type RecordedMarkers = Arc<Mutex<Vec<Vec<ExternalStreamMarkerData>>>>;
 
 fn stream_marker_data(wft: &WorkflowTaskCompletion) -> Vec<ExternalStreamMarkerData> {
     wft.commands
@@ -61,7 +61,7 @@ fn stream_marker_data(wft: &WorkflowTaskCompletion) -> Vec<ExternalStreamMarkerD
         .collect()
 }
 
-fn output_manifest(
+pub(super) fn output_manifest(
     run_id: &str,
     history_floor_event_id: i64,
     stage_token: &str,
@@ -88,18 +88,20 @@ fn output_manifest(
 }
 
 /// The manifest lang re-sends while replaying: recomputed, so it has no stage token.
-fn unstaged(mut manifest: ExternalOutputStreamManifest) -> ExternalOutputStreamManifest {
+pub(super) fn unstaged(mut manifest: ExternalOutputStreamManifest) -> ExternalOutputStreamManifest {
     manifest.stage_token.clear();
     manifest
 }
 
-fn output_commit_command(manifest: ExternalOutputStreamManifest) -> workflow_command::Variant {
+pub(super) fn output_commit_command(
+    manifest: ExternalOutputStreamManifest,
+) -> workflow_command::Variant {
     workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit {
         manifest: Some(manifest),
     })
 }
 
-fn output_marker(
+pub(super) fn output_marker(
     terminal: ExternalStreamBoundary,
     manifest: ExternalOutputStreamManifest,
 ) -> ExternalStreamMarkerData {
@@ -126,7 +128,7 @@ fn output_then_timer_history() -> (TestHistoryBuilder, ExternalOutputStreamManif
     (t, manifest)
 }
 
-fn replay_outputs(activation: &WorkflowActivation) -> Vec<ExternalOutputStreamManifest> {
+pub(super) fn replay_outputs(activation: &WorkflowActivation) -> Vec<ExternalOutputStreamManifest> {
     activation
         .jobs
         .iter()
@@ -149,7 +151,7 @@ fn has_fire_timer(activation: &WorkflowActivation) -> bool {
 }
 
 /// A worker that records the external stream markers and command types of every completion.
-fn worker_recording(
+pub(super) fn worker_recording(
     history: TestHistoryBuilder,
     batches: Vec<ResponseType>,
     markers: RecordedMarkers,

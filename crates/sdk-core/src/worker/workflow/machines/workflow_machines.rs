@@ -577,6 +577,10 @@ impl WorkflowMachines {
             let Some(nexus_operation_progress::Operation::ScheduledEventId(scheduled_event_id)) =
                 progress.operation
             else {
+                debug!(
+                    operation = ?progress.operation,
+                    "Dropping progress that names no scheduled Nexus operation"
+                );
                 continue;
             };
             let Some(&key) = self.machines_by_event_id.get(&scheduled_event_id) else {
