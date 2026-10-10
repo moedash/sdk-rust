@@ -277,6 +277,118 @@ async fn a_burst_across_a_failed_task_and_its_retry_is_one_job() {
 }
 
 #[tokio::test]
+async fn progress_on_a_failed_task_reaches_lang_when_the_retry_carries_none() {
+    // The server keeps progress on the scheduled event it folded into and does not repeat it on
+    // the retry, so the failed task's scheduled event is the only record of it.
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled = add_operation_scheduled(&mut t);
+    add_operation_started(&mut t, scheduled);
+    let only = progress(scheduled, 4);
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![only.clone()]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_failed_with_failure(
+        temporalio_common::protos::temporal::api::enums::v1::WorkflowTaskFailedCause::Unspecified,
+        Default::default(),
+    );
+    t.add_workflow_task_scheduled_and_started();
+    for batches in [
+        vec![1.into(), ResponseType::AllHistory],
+        vec![ResponseType::AllHistory],
+    ] {
+        let worker = worker(t.clone(), batches);
+        let init = worker.poll_workflow_activation().await.unwrap();
+        complete(&worker, &init.run_id, vec![schedule_operation(1)]).await;
+        let retried = worker.poll_workflow_activation().await.unwrap();
+        assert_eq!(job_names(&retried), vec!["Start(1)", "Progress(1, 4)"]);
+        assert_eq!(progress_jobs(&retried), vec![job_for(1, &only)]);
+        complete(
+            &worker,
+            &init.run_id,
+            vec![CompleteWorkflowExecution::default()],
+        )
+        .await;
+        worker.drain_pollers_and_shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn progress_at_or_below_a_delivered_counter_is_dropped_in_later_tasks() {
+    // After a failover the new active cluster can deliver a counter the Workflow already saw.
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled = add_operation_scheduled(&mut t);
+    let first_timer = t.add_timer_started("1".to_string());
+    add_operation_started(&mut t, scheduled);
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 5)]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    let second_timer = t.add_timer_started("2".to_string());
+    t.add_timer_fired(first_timer, "1".to_string());
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 5)]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    t.add_timer_fired(second_timer, "2".to_string());
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 4)]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    t.add_workflow_task_scheduled_with_nexus_progress(vec![progress(scheduled, 6)]);
+    t.add_workflow_task_started();
+
+    let mut runs = vec![];
+    for batches in [
+        vec![1.into(), 2.into(), 3.into(), 4.into(), 5.into()],
+        vec![5.into()],
+    ] {
+        let worker = worker(t.clone(), batches);
+        let mut seen = vec![];
+        let init = worker.poll_workflow_activation().await.unwrap();
+        let run_id = init.run_id.clone();
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                run_id.clone(),
+                vec![
+                    schedule_operation(1).into(),
+                    start_timer_cmd(1, Duration::from_secs(60)),
+                ],
+            ))
+            .await
+            .unwrap();
+        let started = worker.poll_workflow_activation().await.unwrap();
+        seen.push(job_names(&started));
+        complete(
+            &worker,
+            &run_id,
+            vec![start_timer_cmd(2, Duration::from_secs(60))],
+        )
+        .await;
+        for _ in 0..3 {
+            let next = worker.poll_workflow_activation().await.unwrap();
+            seen.push(job_names(&next));
+            if seen.len() == 4 {
+                complete(&worker, &run_id, vec![CompleteWorkflowExecution::default()]).await;
+            } else {
+                complete(&worker, &run_id, Vec::<ScheduleNexusOperation>::new()).await;
+            }
+        }
+        worker.drain_pollers_and_shutdown().await;
+        runs.push(seen);
+    }
+    assert_eq!(
+        runs[0],
+        vec![
+            vec!["Start(1)".to_string(), "Progress(1, 5)".to_string()],
+            vec!["FireTimer(1)".to_string()],
+            vec!["FireTimer(2)".to_string()],
+            vec!["Progress(1, 6)".to_string()],
+        ]
+    );
+    assert_eq!(runs[0], runs[1]);
+}
+
+#[tokio::test]
 async fn progress_for_an_unknown_closed_or_stale_operation_is_dropped() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
