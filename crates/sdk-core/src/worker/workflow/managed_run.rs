@@ -2372,6 +2372,14 @@ mod tests {
         use rstest::rstest;
         use std::{collections::BTreeMap, time::Duration};
         use temporalio_common::protos::{
+            constants::LOCAL_ACTIVITY_MARKER_NAME,
+            coresdk::external_data::{
+                ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
+                ExternalOutputTopicManifest, ExternalStreamBoundary, ExternalStreamMarkerData,
+                extract_external_stream_marker_data,
+            },
+        };
+        use temporalio_common::protos::{
             coresdk::{
                 AsJsonPayloadExt,
                 activity_result::{ActivityResolution, Success, activity_resolution},
@@ -2387,7 +2395,9 @@ mod tests {
                 command::v1::command,
                 common::v1::Payload,
                 enums::v1::EventType,
-                history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes},
+                history::v1::{
+                    History, HistoryEvent, MarkerRecordedEventAttributes, history_event,
+                },
             },
         };
 
@@ -3097,6 +3107,196 @@ mod tests {
                 replay.push_commands_and_iterate(respond(&activation))?;
                 activations.push(job_names(&activation));
             }
+        }
+
+        fn stream_manifest(topic: &str) -> ExternalOutputStreamManifest {
+            ExternalOutputStreamManifest {
+                schema_version: 1,
+                fingerprint_version: 1,
+                stage_token: format!("{topic}-token"),
+                history_floor_event_id: 1,
+                run_id: "run".to_owned(),
+                topics: vec![ExternalOutputTopicManifest {
+                    topic: topic.to_owned(),
+                    record_count: 1,
+                    logical_byte_count: 1,
+                    logical_fingerprint: vec![1; 32],
+                    finished: false,
+                }],
+                segments: vec![ExternalOutputSegmentManifest {
+                    record_counts_by_topic: vec![1],
+                }],
+                provider_id: "provider".to_owned(),
+                provider_format_version: 1,
+            }
+        }
+
+        /// Commits `manifest` the way a completion carrying an output commit does: the marker is
+        /// queued ahead of lang's other commands.
+        fn commit_live(live: &mut WorkflowManager, manifest: ExternalOutputStreamManifest) {
+            live.machines
+                .emit_external_stream_marker(ExternalStreamMarkerData {
+                    schema_version: 1,
+                    terminal_boundary: ExternalStreamBoundary::CommandsProduced as i32,
+                    output: Some(manifest),
+                })
+                .unwrap();
+        }
+
+        fn schedule_la_1() -> WFCommand {
+            let workflow_command::Variant::ScheduleLocalActivity(command) =
+                schedule_local_activity_cmd(
+                    1,
+                    "la-1",
+                    ActivityCancellationType::TryCancel,
+                    Duration::from_secs(10),
+                )
+            else {
+                unreachable!()
+            };
+            WFCommand::new(WFCommandVariant::AddLocalActivity(command))
+        }
+
+        fn complete_workflow() -> WFCommand {
+            WFCommand::new(WFCommandVariant::CompleteWorkflow(Default::default()))
+        }
+
+        /// A commit, a local activity that outlives the task timeout so Core heartbeats the task,
+        /// and a second commit when the activity resolves. Live and replay must give the same
+        /// activations, and replay must hand back each manifest where it was committed.
+        #[rstest]
+        #[case::la_resolves_after_the_heartbeat_task(1, false)]
+        #[case::la_resolves_before_the_heartbeat_task(1, true)]
+        // The second heartbeat completes with no commands, so replay applies the heartbeat tasks
+        // as one sequence.
+        #[case::la_outlives_two_heartbeats(2, false)]
+        #[case::la_resolves_before_the_second_heartbeat_task(2, true)]
+        fn output_commits_around_a_heartbeated_local_activity_replay_as_live(
+            #[case] heartbeats: usize,
+            #[case] resolve_before_last_wft: bool,
+        ) {
+            let first = stream_manifest("before");
+            let second = stream_manifest("after");
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_workflow_task_scheduled_and_started();
+            let mut live = manager(&history);
+            let mut live_activations = vec![];
+
+            let init = live.get_next_activation().unwrap();
+            live_activations.push(job_names(&init));
+            commit_live(&mut live, first.clone());
+            live.push_commands_and_iterate(vec![schedule_la_1()])
+                .unwrap();
+
+            // The activity outlives the task timeout, so Core heartbeats the task.
+            let mut heartbeat_task = WorkflowActivation::default();
+            for heartbeat in 1..=heartbeats {
+                record_wft_completion(&mut history, &live);
+                live.wft_completion_reported();
+                if resolve_before_last_wft && heartbeat == heartbeats {
+                    resolve(&mut live, 1);
+                }
+                history.add_workflow_task_scheduled_and_started();
+                heartbeat_task = live
+                    .new_work_from_server(
+                        history.get_one_wft(heartbeat + 1).unwrap().into(),
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            let resolved = if heartbeat_task.jobs.is_empty() {
+                resolve(&mut live, 1);
+                live.get_next_activation().unwrap()
+            } else {
+                heartbeat_task
+            };
+            live_activations.push(job_names(&resolved));
+            commit_live(&mut live, second.clone());
+            live.push_commands_and_iterate(vec![complete_workflow()])
+                .unwrap();
+            record_wft_completion(&mut history, &live);
+
+            let markers: Vec<_> = history
+                .get_full_history_info()
+                .unwrap()
+                .events()
+                .iter()
+                .filter_map(|e| match &e.attributes {
+                    Some(history_event::Attributes::MarkerRecordedEventAttributes(m)) => {
+                        Some(match extract_external_stream_marker_data(&m.details) {
+                            Some(data) => data.output.unwrap().topics[0].topic.clone(),
+                            None => m.marker_name.clone(),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                markers,
+                vec![
+                    "before".to_owned(),
+                    LOCAL_ACTIVITY_MARKER_NAME.to_owned(),
+                    "after".to_owned()
+                ],
+                "the first commit rides the heartbeat completion, ahead of the activity's marker"
+            );
+
+            let mut replay = manager(&history);
+            let mut replay_activations = vec![];
+            let mut replayed_manifests = vec![];
+            let mut replay_jobs = vec![];
+            loop {
+                let activation = replay.get_next_activation().unwrap();
+                if activation.jobs.is_empty() {
+                    break;
+                }
+                let lang_jobs: Vec<_> = job_names(&WorkflowActivation {
+                    jobs: activation
+                        .jobs
+                        .iter()
+                        .filter(|j| !matches!(j.variant, Some(Variant::ReplayExternalStreams(_))))
+                        .cloned()
+                        .collect(),
+                    ..Default::default()
+                });
+                replay_jobs.push(
+                    activation
+                        .jobs
+                        .iter()
+                        .filter_map(|j| match &j.variant {
+                            Some(Variant::ReplayExternalStreams(r)) => {
+                                Some(r.output.as_ref().unwrap().topics[0].topic.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                // Lang commits again on replay, which takes the next recorded manifest.
+                let recorded = replay.machines.take_replayed_output_manifest();
+                replayed_manifests.push(recorded.map(|m| m.topics[0].topic.clone()));
+                let commands = if lang_jobs.iter().any(|j| j == "init") {
+                    vec![schedule_la_1()]
+                } else {
+                    vec![complete_workflow()]
+                };
+                replay.push_commands_and_iterate(commands).unwrap();
+                // A completion applies the next task the way a run does, which skips a task that
+                // only heartbeated and so has nothing for lang.
+                replay.apply_next_task_if_ready().unwrap();
+                replay_activations.push(lang_jobs);
+            }
+            assert_eq!(replay_activations, live_activations);
+            assert_eq!(
+                replay_jobs,
+                vec![vec!["before".to_owned()], vec!["after".to_owned()]],
+                "each recorded manifest reaches the activation that committed it live"
+            );
+            assert_eq!(
+                replayed_manifests,
+                vec![Some("before".to_owned()), Some("after".to_owned())],
+                "each activation that committed live gets its own manifest back, in order"
+            );
         }
     }
 }
