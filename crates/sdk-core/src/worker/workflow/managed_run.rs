@@ -16,6 +16,9 @@ use crate::{
             WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
+            stream_output::{
+                MARKER_SCHEMA_VERSION, build_output_manifest, check_replayed_output_manifest,
+            },
         },
     },
 };
@@ -32,9 +35,7 @@ use temporalio_common::protos::{
     TaskToken,
     coresdk::{
         common::ExternalStorageMetrics,
-        external_data::{
-            ExternalOutputStreamManifest, ExternalStreamBoundary, ExternalStreamMarkerData,
-        },
+        external_data::{ExternalStreamBoundary, ExternalStreamMarkerData},
         workflow_activation::{
             WorkflowActivation, create_evict_activation, query_to_job,
             remove_from_cache::EvictionReason, workflow_activation_job,
@@ -49,6 +50,7 @@ use temporalio_common::protos::{
 };
 use tokio::sync::oneshot;
 use tracing::Span;
+use uuid::Uuid;
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 pub(super) type RunUpdateAct = Option<ActivationOrAuto>;
@@ -880,27 +882,31 @@ impl ManagedRun {
         }
     }
 
-    /// Records lang's staged output, if it sent any, as a marker ahead of its other commands.
+    /// Records the stream output lang committed, if any, as a marker ahead of its other commands.
     ///
-    /// The marker is what makes the staged batch visible: readers promote it only once the marker
-    /// is in History, so a Workflow Task that fails or times out publishes nothing.
+    /// The marker is what makes the output visible. It's promoted only once the marker is in
+    /// History, so a Workflow Task that fails or times out publishes nothing.
     fn commit_external_output(&mut self, commands: &mut Vec<WFCommand>) -> Result<()> {
         let Some(commit) = take_output_stream_commit(commands)? else {
             return Ok(());
         };
-        let Some(manifest) = commit.manifest else {
-            return Err(WFMachinesError::Fatal(
-                "WorkflowOutputStreamCommit carried no staged output manifest".to_string(),
-            ));
-        };
         if self.wfm.machines.replaying {
+            let replayed = build_output_manifest(
+                &commit.records,
+                self.wfm.machines.current_wft_history_floor_event_id(),
+                &self.wfm.machines.run_id,
+                String::new(),
+                true,
+            )?;
             let recorded = self.wfm.machines.take_replayed_output_manifest();
-            return check_replayed_output_manifest(manifest, recorded);
+            return check_replayed_output_manifest(replayed, recorded);
         }
-        validate_output_manifest(
-            &manifest,
+        let manifest = build_output_manifest(
+            &commit.records,
             self.wfm.machines.current_wft_history_floor_event_id(),
             &self.wfm.machines.run_id,
+            Uuid::new_v4().simple().to_string(),
+            false,
         )?;
         let terminal_boundary = if commands.iter().any(|c| c.variant.is_terminal()) {
             ExternalStreamBoundary::WorkflowCompleted
@@ -917,7 +923,7 @@ impl ManagedRun {
         self.wfm
             .machines
             .emit_external_stream_marker(ExternalStreamMarkerData {
-                schema_version: EXTERNAL_STREAM_MARKER_SCHEMA_VERSION,
+                schema_version: MARKER_SCHEMA_VERSION,
                 terminal_boundary: terminal_boundary as i32,
                 output: Some(manifest),
             })
@@ -1355,11 +1361,6 @@ impl ManagedRun {
     }
 }
 
-/// The marker version Core writes. Readers must accept every version up to this one.
-const EXTERNAL_STREAM_MARKER_SCHEMA_VERSION: u32 = 1;
-/// Keeps one output proof well inside the server's per-event payload limits.
-const MAX_OUTPUT_MANIFEST_BYTES: usize = 64 * 1024;
-
 /// Removes lang's output commit from `commands`, if it sent one.
 fn take_output_stream_commit(
     commands: &mut Vec<WFCommand>,
@@ -1381,136 +1382,6 @@ fn take_output_stream_commit(
         Some(err) => Err(err),
         None => Ok(commit),
     }
-}
-
-/// Rejects a manifest that this Workflow Task could not have produced, or that replay could not
-/// validate later.
-fn validate_output_manifest(
-    manifest: &ExternalOutputStreamManifest,
-    history_floor_event_id: Option<i64>,
-    run_id: &str,
-) -> Result<()> {
-    let Some(history_floor_event_id) = history_floor_event_id.filter(|id| *id > 0) else {
-        return Err(WFMachinesError::Fatal(
-            "Refusing an external output commit because Core could not identify the exact event \
-             preceding this Workflow Task's scheduled event"
-                .to_string(),
-        ));
-    };
-    if manifest.history_floor_event_id != history_floor_event_id {
-        return Err(WFMachinesError::Fatal(format!(
-            "External output manifest history floor {} does not match this Workflow Task's exact \
-             floor {history_floor_event_id}",
-            manifest.history_floor_event_id
-        )));
-    }
-    if manifest.run_id != run_id {
-        return Err(WFMachinesError::Fatal(format!(
-            "External output manifest names Run {} but this Workflow Task belongs to {run_id}",
-            manifest.run_id
-        )));
-    }
-    if manifest.stage_token.is_empty() {
-        return Err(WFMachinesError::Fatal(
-            "External output manifest carried an empty stage token".to_string(),
-        ));
-    }
-    // The task fails on every retry, so the message has to say which field to fix.
-    let encoded_len = prost::Message::encoded_len(manifest);
-    let unsupported = if manifest.schema_version != 1 {
-        Some(format!("schema version {}", manifest.schema_version))
-    } else if manifest.fingerprint_version != 1 {
-        Some(format!(
-            "fingerprint version {}",
-            manifest.fingerprint_version
-        ))
-    } else if manifest.provider_id.is_empty() {
-        Some("no provider id".to_string())
-    } else if manifest.provider_format_version == 0 {
-        Some("provider format version 0".to_string())
-    } else if manifest.topics.is_empty() {
-        Some("no topics".to_string())
-    } else if manifest.segments.is_empty() {
-        Some("no segments".to_string())
-    } else if encoded_len > MAX_OUTPUT_MANIFEST_BYTES {
-        Some(format!(
-            "encodes to {encoded_len} bytes, over the {} KiB marker budget",
-            MAX_OUTPUT_MANIFEST_BYTES / 1024
-        ))
-    } else {
-        None
-    };
-    if let Some(reason) = unsupported {
-        return Err(WFMachinesError::Fatal(format!(
-            "Unsupported external output manifest ({reason})"
-        )));
-    }
-    let mut topic_names = HashSet::new();
-    let malformed_topic = manifest.topics.iter().any(|topic| {
-        topic.topic.is_empty()
-            || !topic_names.insert(topic.topic.as_str())
-            || topic.record_count == 0
-            || topic.logical_byte_count == 0
-            || topic.logical_fingerprint.len() != 32
-    });
-    let malformed_segment = manifest
-        .segments
-        .iter()
-        .any(|segment| segment.record_counts_by_topic.len() != manifest.topics.len());
-    let counts_disagree = !malformed_segment
-        && manifest
-            .topics
-            .iter()
-            .enumerate()
-            .any(|(topic_index, topic)| {
-                manifest
-                    .segments
-                    .iter()
-                    .map(|segment| u64::from(segment.record_counts_by_topic[topic_index]))
-                    .sum::<u64>()
-                    != u64::from(topic.record_count)
-            });
-    if malformed_topic || malformed_segment || counts_disagree {
-        return Err(WFMachinesError::Fatal(
-            "External output manifest has duplicate or malformed topics, fingerprints, or \
-             activation segment counts"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Compares the output lang recomputed while replaying with the manifest History recorded.
-///
-/// The stage token is left out because lang must not stage again on replay, so it has no token to
-/// offer. The run id is left out because a reset forks the base run's History, so the new run
-/// replays markers that name the base run. Everything else is derived deterministically from the
-/// Workflow's own output.
-fn check_replayed_output_manifest(
-    mut replayed: ExternalOutputStreamManifest,
-    recorded: Option<ExternalOutputStreamManifest>,
-) -> Result<()> {
-    let Some(mut recorded) = recorded else {
-        return Err(WFMachinesError::Nondeterminism(
-            "Lang committed external output while replaying a Workflow Task that recorded none"
-                .to_string(),
-        ));
-    };
-    // Only the logical output must replay the same. A reset run replays markers that name its
-    // base run, a stage token is new on every attempt, and a provider can be renamed or swapped
-    // for a Replayer without changing what the Workflow published.
-    for manifest in [&mut replayed, &mut recorded] {
-        manifest.stage_token.clear();
-        manifest.run_id.clear();
-        manifest.provider_id.clear();
-    }
-    if replayed != recorded {
-        return Err(WFMachinesError::Nondeterminism(format!(
-            "External output committed while replaying differs from the manifest recorded in \
-             History: committed {replayed:?}, recorded {recorded:?}"
-        )));
-    }
-    Ok(())
 }
 
 // Construct a new command sequence with query responses removed, and any
@@ -1912,63 +1783,21 @@ mod tests {
     };
 
     mod output_commit {
-        use super::super::{
-            check_replayed_output_manifest, take_output_stream_commit, validate_output_manifest,
-        };
-        use crate::worker::workflow::{
-            CommandAnnotations, WFCommand, WFCommandVariant, WFMachinesError,
-        };
-        use temporalio_common::protos::coresdk::{
-            external_data::{
-                ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
-                ExternalOutputTopicManifest,
-            },
-            workflow_commands::{StartTimer, WorkflowOutputStreamCommit},
+        use super::super::take_output_stream_commit;
+        use crate::worker::workflow::{CommandAnnotations, WFCommand, WFCommandVariant};
+        use temporalio_common::protos::{
+            coresdk::workflow_commands::{OutputRecord, StartTimer, WorkflowOutputStreamCommit},
+            temporal::sdk::streams::v1::StreamRecordKind,
         };
 
-        const RUN_ID: &str = "run-id";
-        const FLOOR: i64 = 4;
-
-        fn manifest() -> ExternalOutputStreamManifest {
-            ExternalOutputStreamManifest {
-                schema_version: 1,
-                fingerprint_version: 1,
-                stage_token: "token".to_string(),
-                history_floor_event_id: FLOOR,
-                run_id: RUN_ID.to_string(),
-                topics: vec![
-                    ExternalOutputTopicManifest {
-                        topic: "a".to_string(),
-                        record_count: 3,
-                        logical_byte_count: 9,
-                        logical_fingerprint: vec![1; 32],
-                        finished: false,
-                    },
-                    ExternalOutputTopicManifest {
-                        topic: "b".to_string(),
-                        record_count: 1,
-                        logical_byte_count: 2,
-                        logical_fingerprint: vec![2; 32],
-                        finished: true,
-                    },
-                ],
-                segments: vec![
-                    ExternalOutputSegmentManifest {
-                        record_counts_by_topic: vec![2, 0],
-                    },
-                    ExternalOutputSegmentManifest {
-                        record_counts_by_topic: vec![1, 1],
-                    },
-                ],
-                provider_id: "provider".to_string(),
-                provider_format_version: 1,
+        fn commit() -> WorkflowOutputStreamCommit {
+            WorkflowOutputStreamCommit {
+                records: vec![OutputRecord {
+                    topic: "a".to_string(),
+                    kind: StreamRecordKind::Finish as i32,
+                    ..Default::default()
+                }],
             }
-        }
-
-        fn rejection(manifest: ExternalOutputStreamManifest, floor: Option<i64>) -> String {
-            validate_output_manifest(&manifest, floor, RUN_ID)
-                .expect_err("manifest must be rejected")
-                .to_string()
         }
 
         fn command(variant: WFCommandVariant) -> WFCommand {
@@ -1979,93 +1808,20 @@ mod tests {
         }
 
         #[test]
-        fn a_well_formed_manifest_is_accepted() {
-            validate_output_manifest(&manifest(), Some(FLOOR), RUN_ID).unwrap();
-        }
-
-        #[test]
-        fn an_unknown_floor_is_refused_rather_than_guessed() {
-            assert!(rejection(manifest(), None).contains("exact event"));
-            assert!(rejection(manifest(), Some(0)).contains("exact event"));
-        }
-
-        #[test]
-        fn a_different_floor_or_run_is_refused() {
-            assert!(rejection(manifest(), Some(FLOOR + 1)).contains("history floor"));
-            let mut other_run = manifest();
-            other_run.run_id = "other-run".to_string();
-            assert!(rejection(other_run, Some(FLOOR)).contains("names Run"));
-        }
-
-        #[test]
-        fn an_empty_stage_token_is_refused() {
-            let mut m = manifest();
-            m.stage_token.clear();
-            assert!(rejection(m, Some(FLOOR)).contains("empty stage token"));
-        }
-
-        #[test]
-        fn each_unsupported_field_is_refused_with_its_own_message() {
-            for (edit, expected) in [
-                (
-                    (|m: &mut ExternalOutputStreamManifest| m.schema_version = 2)
-                        as fn(&mut ExternalOutputStreamManifest),
-                    "schema version 2",
-                ),
-                (|m| m.fingerprint_version = 0, "fingerprint version 0"),
-                (|m| m.provider_id.clear(), "no provider id"),
-                (
-                    |m| m.provider_format_version = 0,
-                    "provider format version 0",
-                ),
-                (|m| m.topics.clear(), "no topics"),
-                (|m| m.segments.clear(), "no segments"),
-                (|m| m.stage_token = "x".repeat(64 * 1024), "encodes to 65"),
-            ] {
-                let mut m = manifest();
-                edit(&mut m);
-                let message = rejection(m, Some(FLOOR));
-                assert!(message.contains(expected), "{expected}: {message}");
-            }
-        }
-
-        #[test]
-        fn malformed_topics_and_segment_counts_are_refused() {
-            for edit in [
-                (|m: &mut ExternalOutputStreamManifest| m.topics[1].topic = "a".to_string())
-                    as fn(&mut ExternalOutputStreamManifest),
-                |m| m.topics[0].topic.clear(),
-                |m| m.topics[0].record_count = 0,
-                |m| m.topics[0].logical_byte_count = 0,
-                |m| m.topics[0].logical_fingerprint.truncate(31),
-                |m| m.segments[0].record_counts_by_topic.truncate(1),
-                |m| m.segments[0].record_counts_by_topic[0] = 5,
-            ] {
-                let mut m = manifest();
-                edit(&mut m);
-                assert!(rejection(m, Some(FLOOR)).contains("malformed topics"));
-            }
-        }
-
-        #[test]
         fn the_commit_is_taken_out_and_other_commands_keep_their_order() {
             let mut commands = vec![
                 command(WFCommandVariant::AddTimer(StartTimer {
                     seq: 1,
                     ..Default::default()
                 })),
-                command(WFCommandVariant::ExternalOutputStreamCommit(
-                    WorkflowOutputStreamCommit {
-                        manifest: Some(manifest()),
-                    },
-                )),
+                command(WFCommandVariant::ExternalOutputStreamCommit(commit())),
                 command(WFCommandVariant::AddTimer(StartTimer {
                     seq: 2,
                     ..Default::default()
                 })),
             ];
-            let commit = take_output_stream_commit(&mut commands).unwrap().unwrap();
-            assert_eq!(commit.manifest, Some(manifest()));
+            let taken = take_output_stream_commit(&mut commands).unwrap().unwrap();
+            assert_eq!(taken, commit());
             let seqs: Vec<_> = commands
                 .iter()
                 .map(|c| match &c.variant {
@@ -2074,55 +1830,6 @@ mod tests {
                 })
                 .collect();
             assert_eq!(seqs, vec![1, 2]);
-        }
-
-        #[test]
-        fn a_replayed_commit_matches_the_recorded_manifest_whatever_its_token() {
-            let mut replayed = manifest();
-            replayed.stage_token.clear();
-            check_replayed_output_manifest(replayed, Some(manifest())).unwrap();
-        }
-
-        #[test]
-        fn a_replayed_commit_matches_a_manifest_recorded_by_another_run() {
-            let mut recorded = manifest();
-            recorded.run_id = "reset-base-run".to_string();
-            check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
-        }
-
-        #[test]
-        fn a_replayed_commit_matches_a_manifest_recorded_under_another_provider_name() {
-            let mut recorded = manifest();
-            recorded.provider_id = "renamed-provider".to_string();
-            check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
-        }
-
-        #[test]
-        fn a_replayed_commit_in_another_provider_format_is_nondeterministic() {
-            let mut recorded = manifest();
-            recorded.provider_format_version = 2;
-            assert!(matches!(
-                check_replayed_output_manifest(manifest(), Some(recorded)),
-                Err(WFMachinesError::Nondeterminism(message)) if message.contains("differs")
-            ));
-        }
-
-        #[test]
-        fn a_replayed_commit_that_differs_from_history_is_nondeterministic() {
-            let mut replayed = manifest();
-            replayed.topics[0].logical_fingerprint = vec![9; 32];
-            assert!(matches!(
-                check_replayed_output_manifest(replayed, Some(manifest())),
-                Err(WFMachinesError::Nondeterminism(message)) if message.contains("differs")
-            ));
-        }
-
-        #[test]
-        fn a_replayed_commit_with_nothing_recorded_is_nondeterministic() {
-            assert!(matches!(
-                check_replayed_output_manifest(manifest(), None),
-                Err(WFMachinesError::Nondeterminism(message)) if message.contains("recorded none")
-            ));
         }
 
         #[test]
@@ -3229,7 +2936,7 @@ mod tests {
 
             let init = live.get_next_activation().unwrap();
             live_activations.push(job_names(&init));
-            let mut live_floors = vec![init.history_floor_event_id];
+            let mut live_floors = vec![live.machines.current_wft_history_floor_event_id()];
             commit_live(&mut live, first.clone());
             live.push_commands_and_iterate(vec![schedule_la_1()])
                 .unwrap();
@@ -3257,7 +2964,7 @@ mod tests {
                 heartbeat_task
             };
             live_activations.push(job_names(&resolved));
-            live_floors.push(resolved.history_floor_event_id);
+            live_floors.push(live.machines.current_wft_history_floor_event_id());
             commit_live(&mut live, second.clone());
             live.push_commands_and_iterate(vec![complete_workflow()])
                 .unwrap();
@@ -3291,35 +2998,14 @@ mod tests {
             let mut replay = manager(&history);
             let mut replay_activations = vec![];
             let mut replayed_manifests = vec![];
-            let mut replay_jobs = vec![];
             let mut replay_floors = vec![];
             loop {
                 let activation = replay.get_next_activation().unwrap();
                 if activation.jobs.is_empty() {
                     break;
                 }
-                replay_floors.push(activation.history_floor_event_id);
-                let lang_jobs: Vec<_> = job_names(&WorkflowActivation {
-                    jobs: activation
-                        .jobs
-                        .iter()
-                        .filter(|j| !matches!(j.variant, Some(Variant::ReplayExternalStreams(_))))
-                        .cloned()
-                        .collect(),
-                    ..Default::default()
-                });
-                replay_jobs.push(
-                    activation
-                        .jobs
-                        .iter()
-                        .filter_map(|j| match &j.variant {
-                            Some(Variant::ReplayExternalStreams(r)) => {
-                                Some(r.output.as_ref().unwrap().topics[0].topic.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                replay_floors.push(replay.machines.current_wft_history_floor_event_id());
+                let lang_jobs = job_names(&activation);
                 // Lang commits again on replay, which takes the next recorded manifest.
                 let recorded = replay.machines.take_replayed_output_manifest();
                 replayed_manifests.push(recorded.map(|m| m.topics[0].topic.clone()));
@@ -3337,11 +3023,6 @@ mod tests {
             assert_eq!(replay_activations, live_activations);
             // The replay check compares the floor, so a heartbeat chain must report the same one.
             assert_eq!(replay_floors, live_floors);
-            assert_eq!(
-                replay_jobs,
-                vec![vec!["before".to_owned()], vec!["after".to_owned()]],
-                "each recorded manifest reaches the activation that committed it live"
-            );
             assert_eq!(
                 replayed_manifests,
                 vec![Some("before".to_owned()), Some("after".to_owned())],

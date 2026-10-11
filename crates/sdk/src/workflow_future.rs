@@ -339,11 +339,6 @@ impl WorkflowFuture {
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
                 }
-                // This SDK never sends `WorkflowOutputStreamCommit`, so its histories hold no
-                // external stream marker for Core to replay.
-                Variant::ReplayExternalStreams(_) => {
-                    bail!("External stream activation jobs are not supported by this SDK");
-                }
             }
         }
 
