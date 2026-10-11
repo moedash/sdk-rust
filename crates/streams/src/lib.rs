@@ -11,11 +11,13 @@
 
 mod cursor;
 mod error;
+mod reader;
 mod record;
 mod store;
 
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
 pub use error::{StreamError, StreamResult};
+pub use reader::{DEFAULT_MAX_RECORDS, ReadTarget, read_page};
 pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, append_digest, stored_append_record,
     stored_output_record,
