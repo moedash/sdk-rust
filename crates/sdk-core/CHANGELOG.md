@@ -34,13 +34,13 @@ relevant information.
 ## Unreleased
 
 ### Added
-* Experimental: a workflow can commit output it staged in an external stream store with the new
-  `WorkflowOutputStreamCommit` command. Core records the output manifest in a
-  `core_external_stream` marker ahead of the completion's other commands, so the output becomes
-  visible only when the workflow task is accepted. Activations now carry
-  `history_floor_event_id`, which the manifest must match. A workflow that wrote this marker
-  can only move forward. A Worker on an older Core, or one whose lang does not commit the output
-  again on replay, fails that workflow's next task, so don't roll such a fleet back.
+* Experimental: a workflow can commit the stream records it published with the new
+  `WorkflowOutputStreamCommit` command, each with its plaintext content hash and size. Core
+  builds the output manifest from them and records it in a `core_external_stream` marker ahead
+  of the completion's other commands, so the output becomes visible only when the workflow task
+  is accepted. A workflow that wrote this marker can only move forward. A Worker on an older
+  Core, or one whose lang doesn't commit the records again on replay, fails that workflow's next
+  task, so don't roll such a fleet back.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
