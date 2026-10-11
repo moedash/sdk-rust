@@ -76,6 +76,21 @@ pub trait StreamStore: Send + Sync {
     /// Deletes every stream and stage of one owner, across all its chains.
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
 
+    /// Closes one topic of a chain in the store, then tells the topic's notifier on the server,
+    /// which completes every attached operation with `result`. The store closes first, so a
+    /// reader the completion reaches always finds the stream's end. A store that sends no
+    /// notifications only closes the topic. Fails as refused when the server will never take the
+    /// close, and with another kind when trying again may help.
+    async fn close_stream(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        result: temporalio_common::protos::temporal::api::common::v1::Payload,
+    ) -> StreamResult<()> {
+        let _ = result;
+        self.close_topic(chain, topic).await
+    }
+
     /// Waits until the notifications this store sent are out. A store that sends none returns at
     /// once.
     async fn flush_notifications(&self) {}

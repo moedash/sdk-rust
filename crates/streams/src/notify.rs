@@ -481,6 +481,37 @@ impl StreamStore for NotifyingStore {
         self.inner.delete_owner(request).await
     }
 
+    async fn close_stream(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        result: Payload,
+    ) -> StreamResult<()> {
+        self.close_topic(chain, topic).await?;
+        let position = self
+            .inner
+            .latest(StoreLatestRequest {
+                chain: Some(chain.clone()),
+                topic: topic.to_string(),
+            })
+            .await?
+            .position;
+        // One above the newest record, so the close outranks every notification of the stream.
+        let counter = progress_counter(&position).unwrap_or(0).saturating_add(1);
+        let cursor = if position.is_empty() {
+            String::new()
+        } else {
+            self.cursor(chain, topic, &position)
+        };
+        self.notifier
+            .close(chain, topic, cursor, counter, result)
+            .await
+            .map_err(|error| match error {
+                NotifyError::Refused(message) => crate::StreamError::refused(message),
+                NotifyError::Failed(message) => crate::StreamError::storage(message),
+            })
+    }
+
     async fn flush_notifications(&self) {
         self.notifier.flush().await;
     }
@@ -922,5 +953,112 @@ mod tests {
         assert_eq!(store.notifier().slots.lock().unwrap().len(), 1);
         store.close_chain(&run).await.unwrap();
         assert_eq!(store.notifier().slots.lock().unwrap().len(), 0);
+    }
+
+    /// Tells, on each notification, whether the store already refuses appends to the topic.
+    struct SeesTheStore {
+        store: Arc<MemoryStore>,
+        refused_then: Mutex<Vec<bool>>,
+        answer: Option<NotifyError>,
+        sent: Mutex<Vec<StreamNotification>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NotifierClient for SeesTheStore {
+        async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError> {
+            // Probed only on the close, since an append to an open topic would add a record.
+            let refused = notification.close_result.is_some()
+                && self
+                    .store
+                    .append(append_request(&notification.chain, &notification.topic, 99))
+                    .await
+                    .is_err();
+            self.refused_then.lock().unwrap().push(refused);
+            self.sent.lock().unwrap().push(notification);
+            self.answer.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    fn sees_the_store(answer: Option<NotifyError>) -> (Arc<SeesTheStore>, NotifyingStore) {
+        let inner = Arc::new(MemoryStore::new());
+        let client = Arc::new(SeesTheStore {
+            store: inner.clone(),
+            refused_then: Mutex::default(),
+            answer,
+            sent: Mutex::default(),
+        });
+        let notifier = Arc::new(Notifier::new(client.clone(), 10));
+        (client, NotifyingStore::new(inner, notifier))
+    }
+
+    fn summary() -> Payload {
+        Payload {
+            data: b"summary".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_closes_the_store_then_the_notifier_above_every_notification() {
+        let (client, store) = sees_the_store(None);
+        let run = chain("run-1");
+        store.append(append_request(&run, "t", 1)).await.unwrap();
+        store.append(append_request(&run, "t", 2)).await.unwrap();
+        store.flush_notifications().await;
+        store.close_stream(&run, "t", summary()).await.unwrap();
+        let sent = client.sent.lock().unwrap().clone();
+        let close = sent.last().unwrap();
+        assert_eq!(close.close_result, Some(summary()));
+        assert_eq!(close.counter, 3, "one above the newest record's counter");
+        assert!(
+            sent[..sent.len() - 1]
+                .iter()
+                .all(|n| n.counter < close.counter)
+        );
+        assert_eq!(
+            client.refused_then.lock().unwrap().last(),
+            Some(&true),
+            "the store refused appends before the notifier heard the close"
+        );
+        assert!(store.notifier().slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_close_of_an_empty_stream_carries_the_first_counter() {
+        let (client, store) = sees_the_store(None);
+        store
+            .close_stream(&chain("run-1"), "t", summary())
+            .await
+            .unwrap();
+        let sent = client.sent.lock().unwrap().clone();
+        assert_eq!((sent[0].position.as_str(), sent[0].counter), ("", 1));
+    }
+
+    #[tokio::test]
+    async fn a_close_says_whether_trying_again_can_help() {
+        let (_, store) = sees_the_store(Some(NotifyError::Refused("no notifier".to_string())));
+        let error = store
+            .close_stream(&chain("run-1"), "t", summary())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, crate::proto::StreamFailureKind::Refused);
+        let (_, store) = sees_the_store(Some(NotifyError::Failed("down".to_string())));
+        let error = store
+            .close_stream(&chain("run-1"), "t", summary())
+            .await
+            .unwrap_err();
+        assert_ne!(error.kind, crate::proto::StreamFailureKind::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_store_without_notifications_only_closes_the_topic() {
+        let store = MemoryStore::new();
+        let run = chain("run-1");
+        store.close_stream(&run, "t", summary()).await.unwrap();
+        let error = store
+            .append(append_request(&run, "t", 1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, crate::proto::StreamFailureKind::Closed);
     }
 }
