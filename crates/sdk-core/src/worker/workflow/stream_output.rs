@@ -40,20 +40,90 @@ pub(crate) struct OutputBatch {
     pub(crate) records: Vec<OutputRecord>,
 }
 
-/// Stages a Workflow's output in the Worker's stream store.
+/// The stream output a completion carries to the report path.
+#[derive(Debug, Default)]
+pub(crate) struct ReportedOutput {
+    /// To stage before the completion is sent, in commit order.
+    pub(crate) output: Vec<OutputBatch>,
+    /// What replay proved committed, to promote, in commit order.
+    pub(crate) proven: Vec<ProvenStage>,
+}
+
+impl ReportedOutput {
+    /// What to report with the next completion, leaving both lists empty, or `None` when there is
+    /// nothing.
+    pub(crate) fn take(
+        output: &mut Vec<OutputBatch>,
+        proven: &mut Vec<ProvenStage>,
+    ) -> Option<Box<Self>> {
+        if output.is_empty() && proven.is_empty() {
+            return None;
+        }
+        Some(Box::new(Self {
+            output: std::mem::take(output),
+            proven: std::mem::take(proven),
+        }))
+    }
+}
+
+/// A stage History proved committed, found while replaying.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProvenStage {
+    pub(crate) token: String,
+    pub(crate) workflow_id: String,
+    pub(crate) first_run_id: String,
+    /// In order of first publish, as the recorded manifest lists them.
+    pub(crate) topics: Vec<String>,
+}
+
+/// What the server answered to a completion that carried stream output.
 #[cfg(feature = "streams")]
-pub(crate) struct OutputStager {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionOutcome {
+    /// The commands were applied, so each output marker is in History.
+    Accepted,
+    /// The commands were not applied, so no output marker is in History.
+    Refused,
+    /// The completion may or may not have been applied.
+    Unknown,
+}
+
+/// The Worker's side of a Workflow's stream output: stages each completion's records, then
+/// promotes or aborts them by what the server answered.
+#[cfg(feature = "streams")]
+pub(crate) struct OutputStore {
     store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
     namespace: String,
+    /// Stages whose completion's outcome is unknown, by run. The run is evicted when that
+    /// happens, so the replay before its next completion proves each committed one. Bounded,
+    /// since a run that moves to another Worker never comes back here.
+    undecided: parking_lot::Mutex<lru::LruCache<String, Vec<OutputBatch>>>,
+    /// Tokens this Worker promoted or aborted, so a run replayed again and again doesn't ask the
+    /// store about each one every time. Forgetting one only costs a repeat request.
+    settled: parking_lot::Mutex<lru::LruCache<String, ()>>,
 }
 
 #[cfg(feature = "streams")]
-impl OutputStager {
+const MAX_UNDECIDED_RUNS: usize = 1000;
+#[cfg(feature = "streams")]
+const MAX_SETTLED_TOKENS: usize = 10_000;
+
+#[cfg(feature = "streams")]
+impl OutputStore {
     pub(crate) fn new(
         store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
         namespace: String,
     ) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            undecided: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_UNDECIDED_RUNS).expect("not zero"),
+            )),
+            settled: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_SETTLED_TOKENS).expect("not zero"),
+            )),
+        }
     }
 
     /// Stages `batches` in commit order, each whole. Nothing is visible until promoted, so a
@@ -63,7 +133,7 @@ impl OutputStager {
         batches: &[OutputBatch],
     ) -> std::result::Result<(), temporalio_streams::StreamError> {
         use prost::Message;
-        use temporalio_streams::proto::{ChainId, StagedBatch, StagedRecord};
+        use temporalio_streams::proto::{StagedBatch, StagedRecord};
         for batch in batches {
             let records = batch
                 .records
@@ -84,11 +154,7 @@ impl OutputStager {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             self.store
                 .stage(StagedBatch {
-                    chain: Some(ChainId {
-                        namespace: self.namespace.clone(),
-                        workflow_id: batch.workflow_id.clone(),
-                        first_run_id: batch.first_run_id.clone(),
-                    }),
+                    chain: Some(self.chain(&batch.workflow_id, &batch.first_run_id)),
                     run_id: batch.run_id.clone(),
                     token: batch.token.clone(),
                     history_floor_event_id: batch.history_floor_event_id,
@@ -97,6 +163,134 @@ impl OutputStager {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Promotes the stages replay proved committed, in commit order, each once.
+    pub(crate) async fn promote_proven(&self, run_id: &str, proven: &[ProvenStage]) {
+        for stage in proven {
+            if let Some(undecided) = self.undecided.lock().get_mut(run_id) {
+                undecided.retain(|batch| batch.token != stage.token);
+            }
+            if self.settled.lock().contains(&stage.token) {
+                continue;
+            }
+            let stage_ref = self.stage_ref(
+                &stage.workflow_id,
+                &stage.first_run_id,
+                &stage.token,
+                stage.topics.clone(),
+            );
+            self.promote(stage_ref).await;
+        }
+    }
+
+    /// Promotes or aborts `batches`, staged for one completion, by the server's answer to it.
+    ///
+    /// An accepted completion also settles the run's stages whose outcome was unknown. Replay
+    /// before this completion proved and promoted every one of them that History holds, so the
+    /// rest never committed.
+    pub(crate) async fn settle(
+        &self,
+        run_id: &str,
+        batches: Vec<OutputBatch>,
+        outcome: CompletionOutcome,
+    ) {
+        match outcome {
+            CompletionOutcome::Accepted => {
+                for batch in &batches {
+                    self.promote(self.batch_ref(batch)).await;
+                }
+                let undecided = self.undecided.lock().pop(run_id).unwrap_or_default();
+                for batch in &undecided {
+                    self.abort(self.batch_ref(batch)).await;
+                }
+            }
+            CompletionOutcome::Refused => {
+                for batch in &batches {
+                    self.abort(self.batch_ref(batch)).await;
+                }
+            }
+            CompletionOutcome::Unknown => {
+                if !batches.is_empty() {
+                    let mut undecided = self.undecided.lock();
+                    match undecided.get_mut(run_id) {
+                        Some(held) => held.extend(batches),
+                        None => {
+                            undecided.put(run_id.to_string(), batches);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn promote(&self, stage: temporalio_streams::proto::StageRef) {
+        use temporalio_streams::proto::PromoteOutcome;
+        match self.store.promote(&stage).await {
+            Ok(result) => {
+                if result.outcome() == PromoteOutcome::Lost {
+                    warn!(
+                        token = %stage.token,
+                        "Stream output a Workflow committed was dropped by retention before it \
+                         was promoted"
+                    );
+                }
+                self.settled.lock().put(stage.token, ());
+            }
+            Err(error) => {
+                // The stage stays pending in the store, and a reader settles it from History.
+                warn!(token = %stage.token, %error, "Could not promote committed stream output");
+            }
+        }
+    }
+
+    async fn abort(&self, stage: temporalio_streams::proto::StageRef) {
+        match self.store.abort(&stage).await {
+            Ok(()) => {
+                self.settled.lock().put(stage.token, ());
+            }
+            Err(error) => {
+                // The stage stays pending in the store, and a reader settles it from History.
+                warn!(token = %stage.token, %error, "Could not abort uncommitted stream output");
+            }
+        }
+    }
+
+    fn chain(&self, workflow_id: &str, first_run_id: &str) -> temporalio_streams::proto::ChainId {
+        temporalio_streams::proto::ChainId {
+            namespace: self.namespace.clone(),
+            workflow_id: workflow_id.to_string(),
+            first_run_id: first_run_id.to_string(),
+        }
+    }
+
+    fn batch_ref(&self, batch: &OutputBatch) -> temporalio_streams::proto::StageRef {
+        let mut topics: Vec<String> = vec![];
+        for record in &batch.records {
+            if !topics.contains(&record.topic) {
+                topics.push(record.topic.clone());
+            }
+        }
+        self.stage_ref(
+            &batch.workflow_id,
+            &batch.first_run_id,
+            &batch.token,
+            topics,
+        )
+    }
+
+    fn stage_ref(
+        &self,
+        workflow_id: &str,
+        first_run_id: &str,
+        token: &str,
+        topics: Vec<String>,
+    ) -> temporalio_streams::proto::StageRef {
+        temporalio_streams::proto::StageRef {
+            chain: Some(self.chain(workflow_id, first_run_id)),
+            token: token.to_string(),
+            topics,
+        }
     }
 }
 
@@ -446,5 +640,132 @@ mod tests {
             message.contains("over the 64 KiB marker budget"),
             "{message}"
         );
+    }
+
+    #[cfg(feature = "streams")]
+    mod store {
+        use super::{super::*, data};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use temporalio_streams::{
+            StreamError, StreamResult, StreamStore,
+            proto::{
+                ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
+                PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
+                StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse,
+            },
+        };
+
+        /// Logs promotions and aborts, and refuses everything else.
+        #[derive(Default)]
+        struct Log(Mutex<Vec<String>>);
+
+        #[async_trait::async_trait]
+        impl StreamStore for Log {
+            fn name(&self) -> &str {
+                "log"
+            }
+            async fn append(&self, _: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
+                Err(StreamError::unsupported("append"))
+            }
+            async fn read(&self, _: StoreReadRequest) -> StreamResult<StoreReadResponse> {
+                Err(StreamError::unsupported("read"))
+            }
+            async fn latest(&self, _: StoreLatestRequest) -> StreamResult<StoreLatestResponse> {
+                Err(StreamError::unsupported("latest"))
+            }
+            async fn stage(&self, _: StagedBatch) -> StreamResult<()> {
+                Err(StreamError::unsupported("stage"))
+            }
+            async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
+                self.0.lock().push(format!("promote {}", stage.token));
+                Ok(PromoteResult {
+                    outcome: PromoteOutcome::Promoted as i32,
+                    records: 1,
+                })
+            }
+            async fn abort(&self, stage: &StageRef) -> StreamResult<()> {
+                self.0.lock().push(format!("abort {}", stage.token));
+                Ok(())
+            }
+            async fn close_chain(&self, _: &ChainId) -> StreamResult<()> {
+                Err(StreamError::unsupported("close_chain"))
+            }
+            async fn close_topic(&self, _: &ChainId, _: &str) -> StreamResult<()> {
+                Err(StreamError::unsupported("close_topic"))
+            }
+            async fn pending_stages(&self, _: &ChainId) -> StreamResult<Vec<PendingStage>> {
+                Err(StreamError::unsupported("pending_stages"))
+            }
+            async fn delete_owner(
+                &self,
+                _: DeleteOwnerRequest,
+            ) -> StreamResult<DeleteOwnerResponse> {
+                Err(StreamError::unsupported("delete_owner"))
+            }
+        }
+
+        fn proven(token: &str) -> ProvenStage {
+            ProvenStage {
+                token: token.to_string(),
+                workflow_id: "wf".to_string(),
+                first_run_id: "run".to_string(),
+                topics: vec!["t".to_string()],
+            }
+        }
+
+        fn batch(token: &str) -> OutputBatch {
+            OutputBatch {
+                token: token.to_string(),
+                history_floor_event_id: 3,
+                workflow_id: "wf".to_string(),
+                run_id: "run".to_string(),
+                first_run_id: "run".to_string(),
+                records: vec![data("t", 1, 1)],
+            }
+        }
+
+        #[tokio::test]
+        async fn a_proven_stage_is_promoted_once_however_often_the_run_replays() {
+            let log = Arc::new(Log::default());
+            let store = OutputStore::new(log.clone(), "ns".to_string());
+            for _ in 0..3 {
+                store
+                    .promote_proven("run", &[proven("a"), proven("b")])
+                    .await;
+            }
+            assert_eq!(*log.0.lock(), ["promote a", "promote b"]);
+        }
+
+        #[tokio::test]
+        async fn an_undecided_stage_that_replay_proves_is_not_aborted() {
+            let log = Arc::new(Log::default());
+            let store = OutputStore::new(log.clone(), "ns".to_string());
+            store
+                .settle(
+                    "run",
+                    vec![batch("kept"), batch("lost")],
+                    CompletionOutcome::Unknown,
+                )
+                .await;
+            store.promote_proven("run", &[proven("kept")]).await;
+            store
+                .settle("run", vec![], CompletionOutcome::Accepted)
+                .await;
+            assert_eq!(*log.0.lock(), ["promote kept", "abort lost"]);
+        }
+
+        #[tokio::test]
+        async fn undecided_stages_belong_to_their_run() {
+            let log = Arc::new(Log::default());
+            let store = OutputStore::new(log.clone(), "ns".to_string());
+            store
+                .settle("other", vec![batch("theirs")], CompletionOutcome::Unknown)
+                .await;
+            store
+                .settle("run", vec![batch("mine")], CompletionOutcome::Accepted)
+                .await;
+            assert_eq!(*log.0.lock(), ["promote mine"]);
+        }
     }
 }
