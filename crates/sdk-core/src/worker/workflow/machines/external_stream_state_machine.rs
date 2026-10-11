@@ -2,7 +2,8 @@
 //!
 //! Modeled on [`super::local_activity_state_machine`], and for the same reason: a marker written
 //! live must be *matched* by the `MarkerRecorded` event on replay, and on replay the marker must
-//! be found by lookahead so lang receives the recorded output in the activation that produced it.
+//! be found by lookahead so the commit lang sends again is checked in the activation that produced
+//! it.
 //!
 //! The two paths are created by different callers and never by the same one: the live marker comes
 //! from a completion that committed staged output, and the replay marker comes from the lookahead
@@ -17,8 +18,8 @@ use std::convert::TryFrom;
 use temporalio_common::protos::{
     constants::EXTERNAL_STREAM_MARKER_NAME,
     coresdk::external_data::{
-        ExternalStreamMarkerData, build_external_stream_marker_details,
-        extract_external_stream_marker_data,
+        ExternalOutputStreamManifest, ExternalStreamMarkerData,
+        build_external_stream_marker_details, extract_external_stream_marker_data,
     },
     temporal::api::{
         command::v1::{Command as ProtoCommand, RecordMarkerCommandAttributes, command},
@@ -151,12 +152,13 @@ impl ResolvedFromMarkerLookAheadWaitingMarkerEvent {
 ///
 /// Markers carry no sequence number and are paired with machines in History order, so comparing
 /// the manifest is what turns a reordered or foreign marker into a nondeterminism error rather
-/// than a silently different published batch.
+/// than a silently different published batch. The stage token is left out. Core mints it fresh
+/// for each attempt, so it says nothing about what the Workflow published.
 fn verify_marker_matches(
     state: &mut SharedState,
     data: &ExternalStreamMarkerData,
 ) -> ExternalStreamMachineTransition<MarkerCommandRecorded> {
-    if data.output != state.data.output {
+    if without_stage_token(&data.output) != without_stage_token(&state.data.output) {
         return TransitionResult::Err(WFMachinesError::Nondeterminism(
             "External stream marker in history carries a different external output manifest than \
              the machine expecting it"
@@ -164,6 +166,15 @@ fn verify_marker_matches(
         ));
     }
     TransitionResult::default()
+}
+
+fn without_stage_token(
+    output: &Option<ExternalOutputStreamManifest>,
+) -> Option<ExternalOutputStreamManifest> {
+    output.clone().map(|mut manifest| {
+        manifest.stage_token.clear();
+        manifest
+    })
 }
 
 impl ExternalStreamMachine {
@@ -313,16 +324,15 @@ impl WFMachinesAdapter for ExternalStreamMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_common::protos::coresdk::external_data::ExternalOutputStreamManifest;
 
-    fn marker_with_stage_token(stage_token: &str) -> ExternalStreamMarkerData {
+    fn marker(stage_token: &str, history_floor_event_id: i64) -> ExternalStreamMarkerData {
         ExternalStreamMarkerData {
             schema_version: 1,
             output: Some(ExternalOutputStreamManifest {
                 schema_version: 1,
-                fingerprint_version: 1,
+                fingerprint_version: 2,
                 stage_token: stage_token.to_string(),
-                history_floor_event_id: 1,
+                history_floor_event_id,
                 run_id: "run-id".to_string(),
                 provider_id: "provider".to_string(),
                 provider_format_version: 1,
@@ -334,11 +344,11 @@ mod tests {
 
     #[test]
     fn a_different_output_manifest_is_nondeterministic() {
-        let expected = marker_with_stage_token("expected");
+        let expected = marker("token", 1);
         let mut state = SharedState {
             data: expected.clone(),
         };
-        let actual = marker_with_stage_token("different");
+        let actual = marker("token", 2);
 
         assert!(matches!(
             verify_marker_matches(&mut state, &actual),
@@ -348,15 +358,16 @@ mod tests {
     }
 
     #[test]
-    fn the_same_output_manifest_matches() {
-        let expected = marker_with_stage_token("expected");
+    fn the_same_output_manifest_matches_whatever_its_stage_token() {
         let mut state = SharedState {
-            data: expected.clone(),
+            data: marker("token", 1),
         };
 
-        assert!(matches!(
-            verify_marker_matches(&mut state, &expected),
-            TransitionResult::Ok { .. }
-        ));
+        for recorded in [marker("token", 1), marker("other attempt's token", 1)] {
+            assert!(matches!(
+                verify_marker_matches(&mut state, &recorded),
+                TransitionResult::Ok { .. }
+            ));
+        }
     }
 }
