@@ -90,6 +90,21 @@ async def run(op: dict[str, Any]) -> Any:
             digest = content_fingerprint(wires).hex()
             cursor = await producer.append(*op["values"])
             return {"cursor": cursor.token, "digest": digest}
+        if op["op"] == "digest":
+            converter = owner.data_converter.payload_converter
+            wires = [
+                to_wire(
+                    converter,
+                    topic=topic,
+                    kind=RecordKind.DATA,
+                    value=value,
+                    producer_id=op["producer"],
+                    attempt=op.get("attempt", 1),
+                    sequence=op.get("sequence", 1) + index,
+                )
+                for index, value in enumerate(op["values"])
+            ]
+            return content_fingerprint(wires).hex()
         if op["op"] == "read":
             records = stream.read(topic=topic, after=Cursor(op.get("after", "")))
             out = []
