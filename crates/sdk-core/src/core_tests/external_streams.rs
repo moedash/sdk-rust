@@ -22,7 +22,7 @@ use temporalio_common::{
             },
             workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_commands::{
-                CompleteWorkflowExecution, OutputRecord, WorkflowOutputStreamCommit,
+                CompleteWorkflowExecution, OutputClose, OutputRecord, WorkflowOutputStreamCommit,
                 workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
@@ -550,4 +550,31 @@ async fn a_marker_in_history_with_a_different_manifest_is_nondeterministic() {
     // Applying the next task reconciles the written marker against History and fails it.
     worker.handle_eviction().await;
     worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_close_without_its_finish_fails_the_task() {
+    let worker = worker_failing_with(
+        canned_histories::single_timer("1"),
+        "has no FINISH record in the same commit",
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let commit = WorkflowOutputStreamCommit {
+        records: records(&["a"]),
+        closes: vec![OutputClose {
+            topic: TOPIC.to_string(),
+            result: Some(Payload::default()),
+        }],
+    };
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![workflow_command::Variant::WorkflowOutputStreamCommit(
+                commit,
+            )],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
 }

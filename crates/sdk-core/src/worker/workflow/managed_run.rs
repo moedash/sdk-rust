@@ -16,7 +16,7 @@ use crate::{
             WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
-            stream_output::{MARKER_SCHEMA_VERSION, build_output_manifest},
+            stream_output::{MARKER_SCHEMA_VERSION, build_output_manifest, check_output_closes},
         },
     },
 };
@@ -888,6 +888,7 @@ impl ManagedRun {
         let Some(commit) = take_output_stream_commit(commands)? else {
             return Ok(());
         };
+        check_output_closes(&commit.records, &commit.closes)?;
         let manifest = build_output_manifest(
             &commit.records,
             self.wfm.machines.current_wft_history_floor_event_id(),
