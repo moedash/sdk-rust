@@ -53,9 +53,19 @@ struct Setup {
 }
 
 async fn setup_at(url: &str, raw_url: &str) -> Setup {
-    let prefix = unique("redis-store");
+    setup_with(url, raw_url, &unique("redis-store"), |_| {}).await
+}
+
+async fn setup_with(
+    url: &str,
+    raw_url: &str,
+    prefix: &str,
+    configure: impl FnOnce(&mut RedisStoreOptions),
+) -> Setup {
+    let prefix = prefix.to_string();
     let mut options = RedisStoreOptions::new(url);
     options.key_prefix = prefix.clone();
+    configure(&mut options);
     Setup {
         store: RedisStore::connect(options).await.unwrap(),
         raw: redis::Client::open(raw_url)
@@ -585,4 +595,199 @@ async fn a_lost_connection_while_staging_is_an_unknown_outcome() {
         .await
         .unwrap();
     assert_eq!(items, 2);
+}
+
+async fn retained_for(retention: Duration) -> Option<Setup> {
+    let url = url()?;
+    Some(
+        setup_with(&url, &url, &unique("retention"), |options| {
+            options.retention = retention
+        })
+        .await,
+    )
+}
+
+fn stage_of(chain: &ChainId, token: &str, count: usize) -> StagedBatch {
+    StagedBatch {
+        chain: Some(chain.clone()),
+        run_id: "run-1".to_string(),
+        token: token.to_string(),
+        history_floor_event_id: 3,
+        records: (0..count)
+            .map(|index| StagedRecord {
+                topic: "events".to_string(),
+                record: record("events", "", index as i64),
+            })
+            .collect(),
+    }
+}
+
+fn stage_ref(chain: &ChainId, token: &str) -> StageRef {
+    StageRef {
+        chain: Some(chain.clone()),
+        token: token.to_string(),
+        topics: vec!["events".to_string()],
+    }
+}
+
+const GRACE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+#[tokio::test]
+async fn retention_must_be_positive() {
+    let mut options = RedisStoreOptions::new("redis://localhost:1");
+    options.retention = Duration::ZERO;
+    let error = RedisStore::connect(options).await.unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused);
+    assert!(error.message.contains("retention"), "{error}");
+}
+
+#[tokio::test]
+async fn appends_trim_to_retention_and_slide_the_expiry() {
+    let Some(mut setup) = retained_for(Duration::from_millis(500)).await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 2, b"\x01"))
+        .await
+        .unwrap();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let meta = format!("{log}:meta");
+    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
+    assert!(0 < ttl && ttl <= 500, "{ttl}");
+    // The meta outlives the log by the tombstone grace.
+    let ttl: i64 = setup.raw.pttl(&meta).await.unwrap();
+    assert!(ttl > GRACE_MS - 60_000, "{ttl}");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let landed = setup
+        .store
+        .append(append(&chain, "p", 3, 1, b"\x02"))
+        .await
+        .unwrap();
+    let entries: Vec<(String, HashMap<String, Vec<u8>>)> =
+        setup.raw.xrange_all(&log).await.unwrap();
+    let sequences: Vec<_> = entries
+        .iter()
+        .map(|(_, fields)| StreamRecord::decode(&*fields["r"]).unwrap().sequence)
+        .collect();
+    assert_eq!(sequences, [3]);
+    let fields: HashMap<String, String> = setup.raw.hgetall(&meta).await.unwrap();
+    assert_eq!(fields["added"], "3");
+    assert_eq!(fields["last"], landed.last_position);
+    // The trim leaves the newest dropped id, since XTRIM leaves no trace a reader could compare.
+    assert!(fields.contains_key("trimmed"));
+}
+
+#[tokio::test]
+async fn rule_18_1_a_session_older_than_the_retention_leaves_the_meta() {
+    // One field per session would otherwise grow the meta for as long as the topic is written,
+    // long after the records it guards are gone.
+    let Some(mut setup) = retained_for(Duration::from_millis(300)).await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "old", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    setup
+        .store
+        .append(append(&chain, "new", 1, 1, b"\x02"))
+        .await
+        .unwrap();
+    let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
+    let held = held(&mut setup.raw, &meta).await;
+    assert_eq!(held.keys().collect::<Vec<_>>(), ["hw:3:new:1"]);
+}
+
+#[tokio::test]
+async fn rule_18_2_a_stage_lives_for_the_retention_and_the_grace() {
+    // A stage only has to live until someone promotes it, and crash repair can come late.
+    let Some(mut setup) = retained_for(Duration::from_secs(30)).await else {
+        return;
+    };
+    let chain = chain();
+    setup.store.stage(stage_of(&chain, "t1", 2)).await.unwrap();
+    let stage = format!("{}:stage:t1", base(&setup.prefix, &chain));
+    let ttl: i64 = setup.raw.pttl(&stage).await.unwrap();
+    assert!(30_000 < ttl && ttl <= 30_000 + GRACE_MS, "{ttl}");
+    setup.store.promote(&stage_ref(&chain, "t1")).await.unwrap();
+    let exists: bool = setup.raw.exists(&stage).await.unwrap();
+    assert!(!exists);
+    let log = log_key(&setup.prefix, &chain, "events");
+    let length: usize = setup.raw.xlen(&log).await.unwrap();
+    assert_eq!(length, 2);
+    // Promoted records live by the log's retention, like appended ones.
+    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
+    assert!(0 < ttl && ttl <= 30_000, "{ttl}");
+    let fields: HashMap<String, String> = setup.raw.hgetall(format!("{log}:meta")).await.unwrap();
+    assert_eq!(fields["added"], "2");
+    setup.store.promote(&stage_ref(&chain, "t1")).await.unwrap();
+    let length: usize = setup.raw.xlen(&log).await.unwrap();
+    assert_eq!(length, 2);
+}
+
+#[tokio::test]
+async fn rule_18_2_the_pending_stages_outlive_every_stage_they_name() {
+    let Some(url) = url() else {
+        return;
+    };
+    // Two Workers of one chain, configured with different retentions.
+    let prefix = unique("pending");
+    let mut long = setup_with(&url, &url, &prefix, |options| {
+        options.retention = Duration::from_secs(30)
+    })
+    .await;
+    let short = setup_with(&url, &url, &prefix, |options| {
+        options.retention = Duration::from_millis(300)
+    })
+    .await;
+    let chain = chain();
+    long.store.stage(stage_of(&chain, "long", 1)).await.unwrap();
+    short
+        .store
+        .stage(stage_of(&chain, "short", 1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let exists: bool = long
+        .raw
+        .exists(format!("{}:stage:long", base(&prefix, &chain)))
+        .await
+        .unwrap();
+    assert!(exists);
+    let pending = long.store.pending_stages(&chain).await.unwrap();
+    assert!(
+        pending.iter().any(|stage| stage.token == "long"),
+        "{pending:?}"
+    );
+}
+
+#[tokio::test]
+async fn rule_18_2_a_large_stage_lands_whole() {
+    // The stage script pushes in chunks, since Lua's unpack has a limit far below this.
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .stage(stage_of(&chain, "big", 10_000))
+        .await
+        .unwrap();
+    let promoted = setup
+        .store
+        .promote(&stage_ref(&chain, "big"))
+        .await
+        .unwrap();
+    assert_eq!(promoted.records, 10_000);
+    let length: usize = setup
+        .raw
+        .xlen(log_key(&setup.prefix, &chain, "events"))
+        .await
+        .unwrap();
+    assert_eq!(length, 10_000);
 }
