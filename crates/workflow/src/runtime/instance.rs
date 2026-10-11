@@ -1119,16 +1119,6 @@ where
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
-                // This runtime never sends `WorkflowOutputStreamCommit`, so it can only see this
-                // job by mistake, and silently dropping it would hide recorded output.
-                Some(job @ ActivationVariant::ReplayExternalStreams(_)) => {
-                    return Err(Box::new(Failure {
-                        message: format!(
-                            "External stream activation job {job} is not supported by this SDK"
-                        ),
-                        ..Default::default()
-                    }));
-                }
                 // This runtime has no API for operation progress yet. Progress carries no
                 // records, only a hint to read the operation's output, so dropping it loses
                 // nothing.
