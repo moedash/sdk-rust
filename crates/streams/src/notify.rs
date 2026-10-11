@@ -26,6 +26,11 @@ pub const DEFAULT_MAX_NOTIFIERS: usize = 1000;
 /// How long a stopping Worker waits for the notifications still out.
 pub const FLUSH_LIMIT: Duration = Duration::from_secs(10);
 
+/// The wait before a failed notifier close is tried again. It doubles up to [CLOSE_RETRY_CAP].
+pub const CLOSE_RETRY_FIRST: Duration = Duration::from_secs(1);
+/// The longest wait between two tries of a notifier close.
+pub const CLOSE_RETRY_CAP: Duration = Duration::from_secs(60);
+
 // Redis entry ids are `<ms>-<seq>`. Twenty bits hold the sequence, far more entries than one
 // stream takes in a millisecond, and the milliseconds stay below 2^43 until the year 2248, so the
 // packed value fits a positive i64.
@@ -223,6 +228,8 @@ pub struct Notifier {
     client: Arc<dyn NotifierClient>,
     slots: Mutex<lru::LruCache<StreamKey, Arc<Slot>>>,
     retired: Mutex<Vec<Arc<Slot>>>,
+    /// How many closes are still being tried in the background.
+    closing: watch::Sender<usize>,
 }
 
 impl std::fmt::Debug for Notifier {
@@ -242,7 +249,55 @@ impl Notifier {
                 NonZeroUsize::new(max_notifiers).unwrap_or(NonZeroUsize::MIN),
             )),
             retired: Mutex::default(),
+            closing: watch::Sender::new(0),
         }
+    }
+
+    /// Closes the stream on the server like [Notifier::close], in the background, trying again
+    /// until it lands or the server refuses it. The wait between tries starts at
+    /// [CLOSE_RETRY_FIRST] and doubles up to [CLOSE_RETRY_CAP].
+    ///
+    /// The close completes every attached operation, and it lives only in this process, so one
+    /// error must not drop it. Closing is idempotent on the server.
+    pub fn close_retrying(
+        self: &Arc<Self>,
+        chain: ChainId,
+        topic: String,
+        position: String,
+        counter: i64,
+        result: Payload,
+    ) {
+        self.closing.send_modify(|closing| *closing += 1);
+        let notifier = self.clone();
+        tokio::spawn(async move {
+            let mut delay = CLOSE_RETRY_FIRST;
+            loop {
+                let closed = notifier
+                    .close(&chain, &topic, position.clone(), counter, result.clone())
+                    .await;
+                match closed {
+                    Ok(()) => break,
+                    Err(NotifyError::Refused(error)) => {
+                        tracing::warn!(
+                            workflow_id = %chain.workflow_id,
+                            topic,
+                            error,
+                            "The server refused the close of a stream's notifier"
+                        );
+                        break;
+                    }
+                    Err(NotifyError::Failed(error)) => tracing::warn!(
+                        workflow_id = %chain.workflow_id,
+                        topic,
+                        error,
+                        "Could not close a stream's notifier; trying again in {delay:?}"
+                    ),
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(CLOSE_RETRY_CAP);
+            }
+            notifier.closing.send_modify(|closing| *closing -= 1);
+        });
     }
 
     /// Tells the notifier of `chain`'s stream on `topic` that it moved to `position`. Never
@@ -302,8 +357,12 @@ impl Notifier {
         self.retire(dropped);
     }
 
-    /// Waits until no notification is out or waiting.
+    /// Waits until no notification is out or waiting, including a close still being retried, so
+    /// bound the wait when the server may be down.
     pub async fn flush(&self) {
+        let mut closing = self.closing.subscribe();
+        // The sender lives as long as the notifier, so the wait can't fail.
+        let _ = closing.wait_for(|closing| *closing == 0).await;
         let slots: Vec<Arc<Slot>> = self
             .slots
             .lock()
@@ -1060,5 +1119,81 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind, crate::proto::StreamFailureKind::Closed);
+    }
+
+    /// Fails the first `failures` closes, then takes them, and fails every progress call.
+    struct FlakyCloses {
+        failures: Mutex<usize>,
+        refuse: bool,
+        at: Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NotifierClient for FlakyCloses {
+        async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError> {
+            assert!(notification.close_result.is_some());
+            self.at.lock().unwrap().push(tokio::time::Instant::now());
+            if self.refuse {
+                return Err(NotifyError::Refused("no notifier".to_string()));
+            }
+            let mut failures = self.failures.lock().unwrap();
+            if *failures == 0 {
+                return Ok(());
+            }
+            *failures -= 1;
+            Err(NotifyError::Failed("down".to_string()))
+        }
+    }
+
+    fn flaky(failures: usize, refuse: bool) -> Arc<FlakyCloses> {
+        Arc::new(FlakyCloses {
+            failures: Mutex::new(failures),
+            refuse,
+            at: Mutex::default(),
+        })
+    }
+
+    fn close_retrying_on(notifier: &Arc<Notifier>) {
+        notifier.close_retrying(chain("run-1"), "t".to_string(), String::new(), 1, summary());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_notifier_close_is_retried_with_backoff_until_it_lands() {
+        let client = flaky(3, false);
+        let notifier = Arc::new(Notifier::new(client.clone(), 10));
+        close_retrying_on(&notifier);
+        notifier.flush().await;
+        let at = client.at.lock().unwrap().clone();
+        assert_eq!(at.len(), 4, "three failures, then it lands");
+        let gaps: Vec<_> = at.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(
+            gaps,
+            [
+                CLOSE_RETRY_FIRST,
+                CLOSE_RETRY_FIRST * 2,
+                CLOSE_RETRY_FIRST * 4
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_notifier_close_retry_waits_at_most_the_cap() {
+        let client = flaky(12, false);
+        let notifier = Arc::new(Notifier::new(client.clone(), 10));
+        close_retrying_on(&notifier);
+        notifier.flush().await;
+        let at = client.at.lock().unwrap().clone();
+        let longest = at.windows(2).map(|pair| pair[1] - pair[0]).max().unwrap();
+        assert_eq!(longest, CLOSE_RETRY_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_notifier_close_the_server_refuses_is_not_retried() {
+        let client = flaky(0, true);
+        let notifier = Arc::new(Notifier::new(client.clone(), 10));
+        close_retrying_on(&notifier);
+        notifier.flush().await;
+        tokio::time::sleep(CLOSE_RETRY_CAP * 2).await;
+        assert_eq!(client.at.lock().unwrap().len(), 1);
     }
 }
