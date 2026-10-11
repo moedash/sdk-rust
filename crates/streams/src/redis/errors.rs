@@ -8,6 +8,8 @@ use redis::RedisError;
 pub(crate) enum Call {
     Read,
     Write,
+    /// A read a write makes first. Nothing is written yet, but a refusal refuses the write.
+    BeforeWrite,
 }
 
 /// The stream error a Redis error stands for.
@@ -20,7 +22,9 @@ pub(crate) fn stream_error(error: &RedisError, call: Call) -> StreamError {
             Call::Write => StreamError::outcome_unknown(format!(
                 "the write may or may not have been applied: {error}"
             )),
-            Call::Read => StreamError::storage(format!("Redis could not be reached: {error}")),
+            Call::Read | Call::BeforeWrite => {
+                StreamError::storage(format!("Redis could not be reached: {error}"))
+            }
         };
     }
     let detail = error.detail().unwrap_or_default().to_string();
@@ -29,7 +33,7 @@ pub(crate) fn stream_error(error: &RedisError, call: Call) -> StreamError {
         Some("STREAMS_STALE") => StreamError::new(StreamFailureKind::ProducerStale, detail),
         Some("STREAMS_CLOSED") => StreamError::closed(detail),
         // The reply as the server wrote it, so the message names the code the Redis docs use.
-        Some(code) if call == Call::Write => {
+        Some(code) if call != Call::Read => {
             StreamError::refused(format!("Redis refused the write: {code} {detail}"))
         }
         Some(code) => StreamError::storage(format!("Redis refused the read: {code} {detail}")),
@@ -85,6 +89,20 @@ mod tests {
         assert!(error.message.contains("NOPERM"), "{error}");
         assert_eq!(
             stream_error(&refused, Call::Read).kind,
+            StreamFailureKind::Storage
+        );
+    }
+
+    #[test]
+    fn a_read_before_a_write_refuses_it_but_writes_nothing() {
+        let refused = stream_error(&server("WRONGTYPE", "wrong kind"), Call::BeforeWrite);
+        assert_eq!(refused.kind, StreamFailureKind::Refused);
+        let lost = RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert_eq!(
+            stream_error(&lost, Call::BeforeWrite).kind,
             StreamFailureKind::Storage
         );
     }

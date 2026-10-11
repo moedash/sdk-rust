@@ -380,7 +380,7 @@ struct Faults {
 }
 
 const PASS: u8 = 0;
-/// Forward the next request, then drop the connection before Redis answers.
+/// Forward the next script call, then drop the connection before Redis answers.
 const LOSE_REPLY: u8 = 1;
 /// Drop the connection instead of forwarding the next request.
 const LOSE_REQUEST: u8 = 2;
@@ -423,7 +423,10 @@ async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>) {
     let replies = tokio::spawn(async move {
         let mut buffer = vec![0; 64 * 1024];
         while let Ok(read) = server_in.read(&mut buffer).await {
-            if read == 0 || mute.load(Ordering::SeqCst) {
+            if read == 0 {
+                break;
+            }
+            if mute.load(Ordering::SeqCst) {
                 continue;
             }
             if client_out.write_all(&buffer[..read]).await.is_err() {
@@ -439,7 +442,13 @@ async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>) {
         if read == 0 {
             break;
         }
-        match mode.swap(PASS, Ordering::SeqCst) {
+        let chunk = &buffer[..read];
+        let script = chunk.windows(4).any(|window| window == b"EVAL");
+        let now = match mode.load(Ordering::SeqCst) {
+            LOSE_REPLY if !script => PASS,
+            _ => mode.swap(PASS, Ordering::SeqCst),
+        };
+        match now {
             LOSE_REQUEST => break,
             LOSE_REPLY => {
                 muted.store(true, Ordering::SeqCst);
@@ -790,4 +799,103 @@ async fn rule_18_2_a_large_stage_lands_whole() {
         .await
         .unwrap();
     assert_eq!(length, 10_000);
+}
+
+/// Temporal with one Workflow whose latest run can end.
+struct OneOwner {
+    status: std::sync::Mutex<
+        temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus,
+    >,
+}
+
+#[async_trait::async_trait]
+impl temporalio_streams::OwnerClient for OneOwner {
+    async fn describe(
+        &self,
+        _namespace: &str,
+        _workflow_id: &str,
+        _run_id: &str,
+    ) -> Result<temporalio_streams::OwnerDescription, temporalio_streams::OwnerError> {
+        Ok(temporalio_streams::OwnerDescription {
+            run_id: "run-1".to_string(),
+            first_run_id: "run-1".to_string(),
+            status: *self.status.lock().unwrap(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_new_producer_marks_an_ended_chain_closed_until_it_expires() {
+    use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
+    use temporalio_streams::{
+        Streams, StreamsOptions,
+        proto::{
+            AppendRecord, AppendRequest, NamedProducer, StreamAddress, StreamOwnerKind,
+            append_request::Producer,
+        },
+    };
+    let Some(url) = url() else {
+        return;
+    };
+    let mut setup = setup_at(&url, &url).await;
+    let owner = Arc::new(OneOwner {
+        status: std::sync::Mutex::new(WorkflowExecutionStatus::Running),
+    });
+    let mut options = RedisStoreOptions::new(url.clone());
+    options.key_prefix = setup.prefix.clone();
+    let streams = Streams::new(
+        Arc::new(RedisStore::connect(options).await.unwrap()),
+        owner.clone(),
+        StreamsOptions::default(),
+    );
+    let chain = chain();
+    let request = |producer: &str| AppendRequest {
+        stream: Some(StreamAddress {
+            namespace: chain.namespace.clone(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: chain.workflow_id.clone(),
+            run_id: String::new(),
+            topic: "events".to_string(),
+        }),
+        producer: Some(Producer::Named(NamedProducer {
+            producer_id: producer.to_string(),
+            attempt: 1,
+        })),
+        sequence: 1,
+        records: vec![AppendRecord {
+            kind: 2,
+            ..Default::default()
+        }],
+    };
+    streams.append(request("p")).await.unwrap();
+    *owner.status.lock().unwrap() = WorkflowExecutionStatus::Terminated;
+    let chain_key = format!("{}:chain", base(&setup.prefix, &chain));
+    let closed: Option<String> = setup.raw.hget(&chain_key, "closed").await.unwrap();
+    assert_eq!(closed, None);
+    let error = streams.append(request("q")).await.unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Closed);
+    let closed: Option<String> = setup.raw.hget(&chain_key, "closed").await.unwrap();
+    assert_eq!(closed.as_deref(), Some("1"));
+    let ttl: i64 = setup.raw.pttl(&chain_key).await.unwrap();
+    assert!(ttl > 0, "{ttl}");
+}
+
+#[tokio::test]
+async fn a_topic_closed_before_its_first_write_still_expires() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup.store.close_topic(&chain, "events").await.unwrap();
+    let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
+    let closed: Option<String> = setup.raw.hget(&meta, "closed").await.unwrap();
+    assert_eq!(closed.as_deref(), Some("1"));
+    let ttl: i64 = setup.raw.pttl(&meta).await.unwrap();
+    assert!(ttl > 0, "{ttl}");
+    let error = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Closed);
 }
