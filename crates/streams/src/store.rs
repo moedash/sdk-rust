@@ -41,6 +41,16 @@ pub trait StreamStore: Send + Sync {
     /// The position of the newest record of a topic, or empty when it holds none.
     async fn latest(&self, request: StoreLatestRequest) -> StreamResult<StoreLatestResponse>;
 
+    /// The serialized record at `position` on a topic, or `None` when the store no longer holds
+    /// it. A read that resumes looks at the record it last delivered, to know that record's
+    /// producer attempt.
+    async fn record_at(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        position: &str,
+    ) -> StreamResult<Option<Vec<u8>>>;
+
     /// Holds a Workflow Task's records, invisible to readers, until [StreamStore::promote] or
     /// [StreamStore::abort] names its token. A stage outlives the retention, since crash repair
     /// can come after it.

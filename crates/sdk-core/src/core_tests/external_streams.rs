@@ -96,6 +96,10 @@ impl StreamStore for RecordingStore {
         Err(StreamError::unsupported("latest"))
     }
 
+    async fn record_at(&self, _: &ChainId, _: &str, _: &str) -> StreamResult<Option<Vec<u8>>> {
+        Err(StreamError::unsupported("record_at"))
+    }
+
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
         if let Some(error) = &self.refuse {
             return Err(error.clone());
