@@ -94,7 +94,7 @@ impl StreamService {
                 .await
                 .map(|r| r.encode_to_vec()),
             "DeleteOwner" => self
-                .store
+                .streams
                 .delete_owner(decode::<DeleteOwnerRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
