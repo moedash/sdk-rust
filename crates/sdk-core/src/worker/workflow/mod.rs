@@ -841,6 +841,10 @@ impl Workflows {
                 anyhow!("Error joining workflow processing thread: {as_str:?}")
             })?;
         }
+        #[cfg(feature = "streams")]
+        if let Some(store) = &self.output_store {
+            store.flush_notifications().await;
+        }
         Ok(())
     }
 

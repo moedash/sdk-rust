@@ -300,6 +300,20 @@ impl OutputStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Waits a short while for the stream notifications still out, since they're sent in the
+    /// background and a process that stops right after its Worker would drop them.
+    pub(crate) async fn flush_notifications(&self) {
+        if tokio::time::timeout(
+            temporalio_streams::FLUSH_LIMIT,
+            self.store.flush_notifications(),
+        )
+        .await
+        .is_err()
+        {
+            warn!("Stream notifications were still out when the Worker stopped");
+        }
+    }
+
     async fn promote(&self, stage: temporalio_streams::proto::StageRef) {
         use temporalio_streams::proto::PromoteOutcome;
         match self.store.promote(&stage).await {
@@ -787,6 +801,115 @@ mod tests {
             ) -> StreamResult<DeleteOwnerResponse> {
                 Err(StreamError::unsupported("delete_owner"))
             }
+            async fn flush_notifications(&self) {
+                self.0.lock().push("flush".to_string());
+            }
+        }
+
+        /// A store whose notifications never go out.
+        struct Stuck(Log);
+
+        #[async_trait::async_trait]
+        impl StreamStore for Stuck {
+            fn name(&self) -> &str {
+                "stuck"
+            }
+            async fn append(&self, r: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
+                self.0.append(r).await
+            }
+            async fn read(&self, r: StoreReadRequest) -> StreamResult<StoreReadResponse> {
+                self.0.read(r).await
+            }
+            async fn latest(&self, r: StoreLatestRequest) -> StreamResult<StoreLatestResponse> {
+                self.0.latest(r).await
+            }
+            async fn record_at(
+                &self,
+                c: &ChainId,
+                t: &str,
+                p: &str,
+            ) -> StreamResult<Option<Vec<u8>>> {
+                self.0.record_at(c, t, p).await
+            }
+            async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
+                self.0.stage(b).await
+            }
+            async fn promote(&self, s: &StageRef) -> StreamResult<PromoteResult> {
+                self.0.promote(s).await
+            }
+            async fn abort(&self, s: &StageRef) -> StreamResult<()> {
+                self.0.abort(s).await
+            }
+            async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
+                self.0.close_chain(c).await
+            }
+            async fn close_topic(&self, c: &ChainId, t: &str) -> StreamResult<()> {
+                self.0.close_topic(c, t).await
+            }
+            async fn pending_stages(&self, c: &ChainId) -> StreamResult<Vec<PendingStage>> {
+                self.0.pending_stages(c).await
+            }
+            async fn delete_owner(
+                &self,
+                r: DeleteOwnerRequest,
+            ) -> StreamResult<DeleteOwnerResponse> {
+                self.0.delete_owner(r).await
+            }
+            async fn flush_notifications(&self) {
+                std::future::pending::<()>().await;
+            }
+        }
+
+        /// Records the stream notifications it was sent.
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<temporalio_streams::StreamNotification>>);
+
+        #[async_trait::async_trait]
+        impl temporalio_streams::NotifierClient for Recorder {
+            async fn notify(
+                &self,
+                notification: temporalio_streams::StreamNotification,
+            ) -> Result<(), temporalio_streams::NotifyError> {
+                self.0.lock().push(notification);
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn an_accepted_completion_notifies_each_topic_it_made_visible() {
+            let recorder = Arc::new(Recorder::default());
+            let notifying = Arc::new(temporalio_streams::NotifyingStore::new(
+                Arc::new(temporalio_streams::MemoryStore::new()),
+                Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
+            ));
+            let store = OutputStore::new(notifying.clone(), "ns".to_string());
+            store.stage(&[batch("a")]).await.unwrap();
+            assert!(recorder.0.lock().is_empty(), "staged output isn't visible");
+            store
+                .settle("run", vec![batch("a")], CompletionOutcome::Accepted)
+                .await;
+            store.flush_notifications().await;
+            let sent = recorder.0.lock().clone();
+            assert_eq!(sent.len(), 1);
+            assert_eq!((sent[0].topic.as_str(), sent[0].counter), ("t", 1));
+            assert_eq!(sent[0].chain.first_run_id, "run");
+        }
+
+        #[tokio::test]
+        async fn a_stopping_worker_waits_for_its_stream_notifications() {
+            let log = Arc::new(Log::default());
+            OutputStore::new(log.clone(), "ns".to_string())
+                .flush_notifications()
+                .await;
+            assert_eq!(*log.0.lock(), ["flush"]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_stopping_worker_waits_for_its_stream_notifications_only_so_long() {
+            let store = OutputStore::new(Arc::new(Stuck(Log::default())), "ns".to_string());
+            let started = tokio::time::Instant::now();
+            store.flush_notifications().await;
+            assert_eq!(started.elapsed(), temporalio_streams::FLUSH_LIMIT);
         }
 
         fn proven(token: &str) -> ProvenStage {

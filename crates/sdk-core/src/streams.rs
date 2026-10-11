@@ -5,20 +5,83 @@ use std::sync::Arc;
 use temporalio_client::Connection;
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution,
-    workflowservice::v1::{DescribeWorkflowExecutionRequest, DescribeWorkflowExecutionResponse},
+    enums::v1::StreamOwnerKind,
+    stream::v1::StreamReference,
+    workflowservice::v1::{
+        DescribeWorkflowExecutionRequest, DescribeWorkflowExecutionResponse, NotifyStreamRequest,
+    },
 };
-use temporalio_streams::{OwnerClient, OwnerDescription, OwnerError};
+use temporalio_streams::{
+    NotifierClient, NotifyError, OwnerClient, OwnerDescription, OwnerError, StreamNotification,
+};
 pub use temporalio_streams::{StreamError, StreamResult, StreamService, StreamStore, proto};
 use tonic::IntoRequest;
 
 /// Connects to the store `config` names. The service asks `connection`'s server about streams'
-/// owners, and its [StreamService::store] goes to each Worker's `stream_store`.
+/// owners, sends the stream notifications the config turns on to it, and its
+/// [StreamService::store] goes to each Worker's `stream_store`.
 pub async fn connect_stream_service(
     config: proto::StreamStoreConfig,
     connection: Connection,
 ) -> StreamResult<Arc<StreamService>> {
-    let owner = Arc::new(ConnectionOwnerClient { connection });
-    Ok(Arc::new(StreamService::connect(config, owner).await?))
+    let owner = Arc::new(ConnectionOwnerClient {
+        connection: connection.clone(),
+    });
+    let notifier = Arc::new(ConnectionNotifierClient { connection });
+    Ok(Arc::new(
+        StreamService::connect_with_notifier(config, owner, Some(notifier)).await?,
+    ))
+}
+
+/// Sends stream notifications to a Temporal server's stream notifier through a client
+/// connection.
+struct ConnectionNotifierClient {
+    connection: Connection,
+}
+
+#[async_trait::async_trait]
+impl NotifierClient for ConnectionNotifierClient {
+    async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError> {
+        self.connection
+            .workflow_service()
+            .notify_stream(notify_request(notification).into_request())
+            .await
+            .map(|_| ())
+            .map_err(notify_error)
+    }
+}
+
+fn notify_request(notification: StreamNotification) -> NotifyStreamRequest {
+    NotifyStreamRequest {
+        namespace: notification.chain.namespace,
+        // The run chain's first run keys the notifier, so one notifier serves the stream across
+        // Continue-as-New and a new chain on the same Workflow id gets its own.
+        stream_ref: Some(StreamReference {
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: notification.chain.workflow_id,
+            run_id: notification.chain.first_run_id,
+            topic: notification.topic,
+        }),
+        position: notification.position,
+        counter: notification.counter,
+        close: notification.close_result.is_some(),
+        close_result: notification.close_result,
+        ..Default::default()
+    }
+}
+
+/// Answers that mean the server will never take the notification, so a retry can't help.
+fn notify_error(status: tonic::Status) -> NotifyError {
+    use tonic::Code;
+    match status.code() {
+        Code::Unimplemented
+        | Code::InvalidArgument
+        | Code::NotFound
+        | Code::PermissionDenied
+        | Code::Unauthenticated
+        | Code::FailedPrecondition => NotifyError::Refused(status.to_string()),
+        _ => NotifyError::Failed(status.to_string()),
+    }
 }
 
 /// Asks a Temporal server about owners through a client connection.
@@ -143,5 +206,67 @@ mod tests {
             owner_description(DescribeWorkflowExecutionResponse::default()),
             Err(OwnerError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn a_notification_names_the_stream_by_its_chains_first_run() {
+        let request = notify_request(StreamNotification {
+            chain: proto::ChainId {
+                namespace: "ns".to_string(),
+                workflow_id: "wf".to_string(),
+                first_run_id: "run-1".to_string(),
+            },
+            topic: "tokens".to_string(),
+            position: "cursor".to_string(),
+            counter: 7,
+            close_result: None,
+        });
+        assert_eq!(request.namespace, "ns");
+        assert_eq!(
+            request.stream_ref,
+            Some(StreamReference {
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: "wf".to_string(),
+                run_id: "run-1".to_string(),
+                topic: "tokens".to_string(),
+            })
+        );
+        assert_eq!((request.position.as_str(), request.counter), ("cursor", 7));
+        assert!(!request.close);
+        assert!(request.close_result.is_none());
+    }
+
+    #[test]
+    fn only_answers_a_retry_cant_change_refuse_a_notification() {
+        for code in [
+            tonic::Code::Unimplemented,
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+            tonic::Code::FailedPrecondition,
+        ] {
+            assert!(
+                matches!(
+                    notify_error(tonic::Status::new(code, "")),
+                    NotifyError::Refused(_)
+                ),
+                "{code:?}"
+            );
+        }
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Internal,
+        ] {
+            assert!(
+                matches!(
+                    notify_error(tonic::Status::new(code, "")),
+                    NotifyError::Failed(_)
+                ),
+                "{code:?}"
+            );
+        }
     }
 }
