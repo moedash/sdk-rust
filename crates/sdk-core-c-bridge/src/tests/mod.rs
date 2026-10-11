@@ -548,6 +548,7 @@ fn test_stream_store_appends_and_reads_through_the_c_bridge() {
                         attempt: 1,
                     })),
                     sequence: 1,
+                    digest: vec![1; 32],
                     records: vec![AppendRecord {
                         kind: StreamRecordKind::Data as i32,
                         body: Some(Payload {
