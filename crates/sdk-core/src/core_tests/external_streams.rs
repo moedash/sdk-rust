@@ -30,8 +30,8 @@ use temporalio_common::{
             workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_commands::{
                 ActivityCancellationType, CompleteWorkflowExecution,
-                ContinueAsNewWorkflowExecution, OutputRecord, WorkflowOutputStreamCommit,
-                workflow_command,
+                ContinueAsNewWorkflowExecution, FailWorkflowExecution, OutputClose, OutputRecord,
+                WorkflowOutputStreamCommit, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
@@ -264,7 +264,10 @@ fn manifest_for(
 }
 
 fn output_commit_command(records: Vec<OutputRecord>) -> workflow_command::Variant {
-    workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit { records })
+    workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit {
+        records,
+        closes: vec![],
+    })
 }
 
 fn output_marker(
@@ -2104,8 +2107,11 @@ async fn the_chain_close_is_retried_until_it_lands() {
     assert_eq!(*store.close_attempts.lock(), 3);
 }
 
+#[rstest::rstest]
+#[case::retried_after_a_failure(FailWorkflowExecution::default().into())]
+#[case::cron_after_a_completion(complete())]
 #[tokio::test]
-async fn a_chain_whose_latest_run_still_runs_stays_open() {
+async fn a_chain_whose_latest_run_still_runs_stays_open(#[case] last: workflow_command::Variant) {
     // A retried or cron run follows in the same chain, so the chain's streams stay open.
     fn successor_running(first_run_id: &str) -> DescribeWorkflowExecutionResponse {
         DescribeWorkflowExecutionResponse {
@@ -2118,7 +2124,7 @@ async fn a_chain_whose_latest_run_still_runs_stays_open() {
         }
     }
     let store = Arc::new(RecordingStore::default());
-    let (worker, _) = final_task(store.clone(), true, complete(), Some(successor_running)).await;
+    let (worker, _) = final_task(store.clone(), true, last, Some(successor_running)).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     worker.drain_pollers_and_shutdown().await;
     assert!(store.closed().is_empty());
@@ -2139,4 +2145,95 @@ async fn neither_continue_as_new_nor_a_run_that_never_published_closes_the_chain
     quiet_worker.drain_pollers_and_shutdown().await;
     assert!(store.closed().is_empty());
     assert_eq!(*store.close_attempts.lock(), 0);
+}
+
+#[tokio::test]
+async fn a_failed_task_publishes_nothing() {
+    // The first activation commits and waits on a local activity. The second fails, so the task
+    // fails before any completion reports the commit, and nothing reaches the store.
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_workflow_task_scheduled_and_started();
+    let store = Arc::new(RecordingStore::default());
+    let failed = Arc::new(Notify::new());
+    let notify = failed.clone();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.num_expected_completions = Some(TimesRange::from(0));
+    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, _, failure| {
+        let matches = failure
+            .as_ref()
+            .is_some_and(|f| f.message.contains("the workflow broke"));
+        if matches {
+            notify.notify_one();
+        }
+        matches
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    let worker_store = store.clone();
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(worker_store);
+        w.task_types = WorkerTaskTypes {
+            enable_local_activities: true,
+            ..WorkerTaskTypes::workflow_only()
+        };
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                output_commit_command(records(&["a"])),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = run_local_activity(&worker).await;
+    assert!(only_resolves_local_activity(&resolved, 1));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::fail(
+            first.run_id,
+            Failure {
+                message: "the workflow broke".to_string(),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    failed_within_deadline(&failed).await;
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+    assert!(store.staged().is_empty());
+}
+
+#[tokio::test]
+async fn a_close_without_its_finish_fails_the_task() {
+    let worker = worker_failing_with(
+        canned_histories::single_timer("1"),
+        "has no FINISH record in the same commit",
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let commit = WorkflowOutputStreamCommit {
+        records: records(&["a"]),
+        closes: vec![OutputClose {
+            topic: TOPIC.to_string(),
+            result: Some(Payload::default()),
+        }],
+    };
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![workflow_command::Variant::WorkflowOutputStreamCommit(
+                commit,
+            )],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
 }
