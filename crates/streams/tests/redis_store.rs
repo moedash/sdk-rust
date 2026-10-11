@@ -880,6 +880,7 @@ async fn a_new_producer_marks_an_ended_chain_closed_until_it_expires() {
             kind: 2,
             ..Default::default()
         }],
+        digest: vec![1; 32],
     };
     streams.append(request("p")).await.unwrap();
     *owner.status.lock().unwrap() = WorkflowExecutionStatus::Terminated;

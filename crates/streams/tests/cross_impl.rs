@@ -12,15 +12,22 @@ use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
-use temporalio_common::protos::temporal::api::common::v1::Payload;
+use temporalio_common::protos::temporal::api::{
+    common::v1::Payload, enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+};
 use temporalio_streams::{
-    ReadTarget, RedisStore, RedisStoreOptions, StreamStore, mint_cursor,
+    OwnerClient, OwnerDescription, OwnerError, ReadTarget, RedisStore, RedisStoreOptions,
+    StreamStore, Streams, StreamsOptions, mint_cursor,
     proto::{
-        AppendRecord, ChainId, ReadRequest, StageRef, StagedBatch, StagedRecord,
-        StoreAppendRequest, StreamFailureKind, StreamRecordKind, read_record,
+        AppendRecord, AppendRequest, ChainId, NamedProducer, ReadRequest, StageRef, StagedBatch,
+        StagedRecord, StoreAppendRequest, StreamAddress, StreamFailureKind, StreamOwnerKind,
+        StreamRecordKind, append_request::Producer, read_record,
     },
     read_page, stored_append_record, stored_output_record, stream_hash,
 };
@@ -256,34 +263,105 @@ async fn what_core_wrote_python_reads_and_resumes() {
     assert_eq!(values(&after), [json!({"n": 2})]);
 }
 
+/// Temporal as the stream layer asks it: one Workflow, running in its first run.
+struct Running;
+
+#[async_trait::async_trait]
+impl OwnerClient for Running {
+    async fn describe(
+        &self,
+        _namespace: &str,
+        _workflow_id: &str,
+        _run_id: &str,
+    ) -> Result<OwnerDescription, OwnerError> {
+        Ok(OwnerDescription {
+            run_id: FIRST_RUN.to_string(),
+            first_run_id: FIRST_RUN.to_string(),
+            status: WorkflowExecutionStatus::Running,
+            start_time: None,
+        })
+    }
+
+    async fn history_after(
+        &self,
+        _namespace: &str,
+        _workflow_id: &str,
+        _run_id: &str,
+        _floor: i64,
+    ) -> Result<Vec<HistoryEvent>, OwnerError> {
+        Ok(Vec::new())
+    }
+}
+
+impl Both {
+    /// The stream layer over a store on the same keys, as lang reaches it.
+    async fn streams(&self) -> Streams {
+        let mut options = RedisStoreOptions::new(self.url.clone());
+        options.key_prefix = self.prefix.clone();
+        let store = RedisStore::connect(options).await.unwrap();
+        Streams::new(
+            Arc::new(store),
+            Arc::new(Running),
+            StreamsOptions::default(),
+        )
+    }
+
+    fn append_request(&self, values: &[Value], digest: Vec<u8>) -> AppendRequest {
+        AppendRequest {
+            stream: Some(StreamAddress {
+                namespace: NAMESPACE.to_string(),
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: self.workflow_id.clone(),
+                run_id: String::new(),
+                topic: "events".to_string(),
+            }),
+            producer: Some(Producer::Named(NamedProducer {
+                producer_id: "p".to_string(),
+                attempt: 1,
+            })),
+            sequence: 1,
+            records: values.iter().map(json_record).collect(),
+            digest,
+        }
+    }
+}
+
 #[tokio::test]
-async fn a_batch_python_wrote_dedupes_on_core_with_its_digest() {
-    // The store keeps the digest it was given, so a retry that carries the same digest is
-    // recognized whichever side wrote first.
+async fn a_batch_python_wrote_dedupes_through_core_with_its_digest() {
+    // Lang takes the digest and the store keeps it as given, so a retry that carries the same
+    // digest is recognized whichever SDK wrote first.
     let Some(both) = pair(WEEK).await else {
         return;
     };
+    let streams = both.streams().await;
     let landed = both.brook(json!({"op": "append", "producer": "p", "values": [{"n": 1}]}));
     let digest = hex(landed["digest"].as_str().unwrap());
-    let (_, last) = both.core_append(1, &[json!({"n": 1})], &digest).await;
-    assert_eq!(
-        both.cursor("events", &last),
-        landed["cursor"].as_str().unwrap()
-    );
-    let error = both
-        .core
-        .append(StoreAppendRequest {
-            chain: Some(both.chain()),
-            topic: "events".to_string(),
-            producer_id: "p".to_string(),
-            attempt: 1,
-            sequence: 1,
-            digest: b"other".to_vec(),
-            records: vec![b"\x1a\x06events".to_vec()],
-        })
+    let retry = streams
+        .append(both.append_request(&[json!({"n": 1})], digest))
+        .await
+        .unwrap();
+    assert_eq!(retry.last_cursor, landed["cursor"].as_str().unwrap());
+    let error = streams
+        .append(both.append_request(&[json!({"n": 1})], vec![7; 32]))
         .await
         .unwrap_err();
     assert_eq!(error.kind, StreamFailureKind::ProducerDivergent);
+    assert_eq!(both.core_read("events", "").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_batch_core_wrote_dedupes_through_python() {
+    let Some(both) = pair(WEEK).await else {
+        return;
+    };
+    let streams = both.streams().await;
+    let digest = both.brook(json!({"op": "digest", "producer": "p", "values": [{"n": 1}]}));
+    let landed = streams
+        .append(both.append_request(&[json!({"n": 1})], hex(digest.as_str().unwrap())))
+        .await
+        .unwrap();
+    let retry = both.brook(json!({"op": "append", "producer": "p", "values": [{"n": 1}]}));
+    assert_eq!(retry["cursor"].as_str().unwrap(), landed.last_cursor);
     assert_eq!(both.core_read("events", "").await.unwrap().len(), 1);
 }
 
