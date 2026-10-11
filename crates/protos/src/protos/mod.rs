@@ -1173,7 +1173,6 @@ pub mod coresdk {
                     last_sdk_version: String::new(),
                     suggest_continue_as_new_reasons: vec![],
                     target_worker_deployment_version_changed: false,
-                    history_floor_event_id: 0,
                 }
             }
 
@@ -1320,14 +1319,6 @@ pub mod coresdk {
                         }
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
-                        }
-                        workflow_activation_job::Variant::ReplayExternalStreams(r) => {
-                            write!(
-                                f,
-                                "ReplayExternalStreams({:?}, output: {})",
-                                r.terminal_boundary(),
-                                r.output.is_some()
-                            )
                         }
                     }
                 }
@@ -1699,11 +1690,8 @@ pub mod coresdk {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(
                         f,
-                        "WorkflowOutputStreamCommit({} topic(s))",
-                        self.manifest
-                            .as_ref()
-                            .map(|manifest| manifest.topics.len())
-                            .unwrap_or_default()
+                        "WorkflowOutputStreamCommit({} record(s))",
+                        self.records.len()
                     )
                 }
             }
@@ -3218,7 +3206,7 @@ mod sdk_helpers {
                     terminal_boundary: ExternalStreamBoundary::CommandsProduced as i32,
                     output: Some(ExternalOutputStreamManifest {
                         schema_version: 1,
-                        fingerprint_version: 1,
+                        fingerprint_version: 2,
                         stage_token: "token".to_string(),
                         history_floor_event_id: 3,
                         run_id: "run".to_string(),
@@ -3269,17 +3257,33 @@ mod sdk_helpers {
 
             #[test]
             fn the_commit_command_converts_and_displays() {
-                use crate::protos::coresdk::workflow_commands::{
-                    WorkflowCommand, WorkflowOutputStreamCommit, workflow_command,
+                use crate::protos::{
+                    coresdk::workflow_commands::{
+                        OutputRecord, WorkflowCommand, WorkflowOutputStreamCommit, workflow_command,
+                    },
+                    temporal::sdk::streams::v1::StreamRecordKind,
                 };
                 let variant = workflow_command::Variant::WorkflowOutputStreamCommit(
                     WorkflowOutputStreamCommit {
-                        manifest: marker().output,
+                        records: vec![
+                            OutputRecord {
+                                topic: "t".to_string(),
+                                kind: StreamRecordKind::Data as i32,
+                                body: Some(Payload::default()),
+                                content_hash: vec![7; 32],
+                                logical_size: 4,
+                            },
+                            OutputRecord {
+                                topic: "t".to_string(),
+                                kind: StreamRecordKind::Finish as i32,
+                                ..Default::default()
+                            },
+                        ],
                     },
                 );
                 assert_eq!(
                     variant.to_string(),
-                    "WorkflowOutputStreamCommit(1 topic(s))"
+                    "WorkflowOutputStreamCommit(2 record(s))"
                 );
                 let command: WorkflowCommand = variant.into();
                 assert!(matches!(
