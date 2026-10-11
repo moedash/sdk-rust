@@ -166,8 +166,17 @@ impl StreamStore for RecordingStore {
         Ok(())
     }
 
-    async fn close_topic(&self, _: &ChainId, _: &str) -> StreamResult<()> {
-        Err(StreamError::unsupported("close_topic"))
+    async fn close_topic(
+        &self,
+        _: &ChainId,
+        topic: &str,
+        result: Option<Payload>,
+    ) -> StreamResult<()> {
+        let result = result.map(|r| String::from_utf8(r.data).unwrap());
+        self.log
+            .lock()
+            .push(format!("close {topic} {}", result.unwrap_or_default()));
+        Ok(())
     }
 
     async fn pending_stages(&self, _: &ChainId) -> StreamResult<Vec<PendingStage>> {
@@ -2236,4 +2245,69 @@ async fn a_close_without_its_finish_fails_the_task() {
         .unwrap();
     worker.shutdown().await;
     worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_workflow_close_closes_its_topic_after_the_output_is_promoted() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let mut committed = records(&["a"]);
+    committed.push(OutputRecord {
+        topic: TOPIC.to_string(),
+        kind: StreamRecordKind::Finish as i32,
+        ..Default::default()
+    });
+    let mut manifest = manifest_for(&committed, history.get_orig_run_id(), 1);
+    manifest.topics[0].finished = true;
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifest,
+    ));
+    let timer_started = history.add_by_type(EventType::TimerStarted);
+    history.add_timer_fired(timer_started, "1".to_string());
+    history.add_workflow_task_scheduled_and_started();
+    let store = Arc::new(RecordingStore::default());
+    let worker = worker_staging_in(
+        history,
+        vec![1.into(), 2.into()],
+        store.clone(),
+        Default::default(),
+        Default::default(),
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let commit = WorkflowOutputStreamCommit {
+        records: committed,
+        closes: vec![OutputClose {
+            topic: TOPIC.to_string(),
+            result: Some(Payload {
+                data: b"done".to_vec(),
+                ..Default::default()
+            }),
+        }],
+    };
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                workflow_command::Variant::WorkflowOutputStreamCommit(commit),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.log().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the topic close never came");
+    worker.drain_pollers_and_shutdown().await;
+    let log = store.log();
+    assert!(log[0].starts_with("stage "), "{log:?}");
+    assert!(log[1].starts_with("promote "), "{log:?}");
+    assert_eq!(log[2], format!("close {TOPIC} done"));
 }

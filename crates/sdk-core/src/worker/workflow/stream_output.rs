@@ -38,6 +38,8 @@ pub(crate) struct OutputBatch {
     pub(crate) run_id: String,
     pub(crate) first_run_id: String,
     pub(crate) records: Vec<OutputRecord>,
+    /// The topics the completion closed, closed in the store once the output is promoted.
+    pub(crate) closes: Vec<OutputClose>,
 }
 
 /// The stream output a completion carries to the report path.
@@ -86,6 +88,8 @@ pub(crate) struct ProvenStage {
     pub(crate) first_run_id: String,
     /// In order of first publish, as the recorded manifest lists them.
     pub(crate) topics: Vec<String>,
+    /// The topics the replayed commit closed.
+    pub(crate) closes: Vec<OutputClose>,
 }
 
 /// What the server answered to a completion that carried stream output.
@@ -113,6 +117,8 @@ pub(crate) struct OutputStore {
     /// Tokens this Worker promoted or aborted, so a run replayed again and again doesn't ask the
     /// store about each one every time. Forgetting one only costs a repeat request.
     settled: parking_lot::Mutex<lru::LruCache<String, ()>>,
+    /// Stops the close retries when the Worker stops.
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[cfg(feature = "streams")]
@@ -132,10 +138,12 @@ impl OutputStore {
     pub(crate) fn new(
         store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
         namespace: String,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
             store,
             namespace,
+            shutdown,
             undecided: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_UNDECIDED_RUNS).expect("not zero"),
             )),
@@ -199,7 +207,9 @@ impl OutputStore {
                 &stage.token,
                 stage.topics.clone(),
             );
-            self.promote(stage_ref).await;
+            if self.promote(stage_ref).await {
+                self.close_topics(&stage.workflow_id, &stage.first_run_id, &stage.closes);
+            }
         }
     }
 
@@ -217,7 +227,9 @@ impl OutputStore {
         match outcome {
             CompletionOutcome::Accepted => {
                 for batch in &batches {
-                    self.promote(self.batch_ref(batch)).await;
+                    if self.promote(self.batch_ref(batch)).await {
+                        self.close_topics(&batch.workflow_id, &batch.first_run_id, &batch.closes);
+                    }
                 }
                 let undecided = self.undecided.lock().pop(run_id).unwrap_or_default();
                 for batch in &undecided {
@@ -300,7 +312,8 @@ impl OutputStore {
             .map_err(|error| error.to_string())
     }
 
-    async fn promote(&self, stage: temporalio_streams::proto::StageRef) {
+    /// Promotes one stage and says whether the store took the promotion.
+    async fn promote(&self, stage: temporalio_streams::proto::StageRef) -> bool {
         use temporalio_streams::proto::PromoteOutcome;
         match self.store.promote(&stage).await {
             Ok(result) => {
@@ -312,11 +325,49 @@ impl OutputStore {
                     );
                 }
                 self.settled.lock().put(stage.token, ());
+                true
             }
             Err(error) => {
                 // The stage stays pending in the store, and a reader settles it from History.
                 warn!(token = %stage.token, %error, "Could not promote committed stream output");
+                false
             }
+        }
+    }
+
+    /// Closes the topics a promoted stage closed, each in the background, retrying with backoff
+    /// until it lands or the Worker stops.
+    ///
+    /// Only after the promotion, so a reader that sees the topic end has every record before the
+    /// close. The close lives only in this Worker, so a failure must not drop it.
+    fn close_topics(&self, workflow_id: &str, first_run_id: &str, closes: &[OutputClose]) {
+        for close in closes {
+            let store = self.store.clone();
+            let chain = self.chain(workflow_id, first_run_id);
+            let close = close.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let mut delay = CLOSE_RETRY_FIRST;
+                loop {
+                    match store
+                        .close_topic(&chain, &close.topic, close.result.clone())
+                        .await
+                    {
+                        Ok(()) => return,
+                        Err(error) => warn!(
+                            topic = %close.topic,
+                            %error,
+                            "Could not close a stream topic after its output was promoted; \
+                             trying again in {delay:?}"
+                        ),
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = shutdown.cancelled() => return,
+                    }
+                    delay = (delay * 2).min(CLOSE_RETRY_CAP);
+                }
+            });
         }
     }
 
@@ -790,9 +841,36 @@ mod tests {
             },
         };
 
-        /// Logs promotions and aborts, and refuses everything else.
+        /// Logs promotions, aborts and topic closes, and refuses everything else. It can be told
+        /// to refuse some promotions and the first few closes.
         #[derive(Default)]
-        struct Log(Mutex<Vec<String>>);
+        struct Log(Mutex<Vec<String>>, Mutex<usize>, Mutex<Vec<String>>);
+
+        impl Log {
+            fn refusing_closes(count: usize) -> Self {
+                Self(Mutex::default(), Mutex::new(count), Mutex::default())
+            }
+
+            fn refusing_promotes_of(token: &str) -> Self {
+                Self(
+                    Mutex::default(),
+                    Mutex::default(),
+                    Mutex::new(vec![token.to_string()]),
+                )
+            }
+
+            /// Waits a bounded time for `count` entries, since closes run in the background.
+            async fn entries(&self, count: usize) -> Vec<String> {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while self.0.lock().len() < count {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the store never got the calls");
+                self.0.lock().clone()
+            }
+        }
 
         #[async_trait::async_trait]
         impl StreamStore for Log {
@@ -820,6 +898,9 @@ mod tests {
                 Err(StreamError::unsupported("stage"))
             }
             async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
+                if self.2.lock().contains(&stage.token) {
+                    return Err(StreamError::storage("redis is down"));
+                }
                 self.0.lock().push(format!("promote {}", stage.token));
                 Ok(PromoteResult {
                     outcome: PromoteOutcome::Promoted as i32,
@@ -833,8 +914,24 @@ mod tests {
             async fn close_chain(&self, _: &ChainId) -> StreamResult<()> {
                 Err(StreamError::unsupported("close_chain"))
             }
-            async fn close_topic(&self, _: &ChainId, _: &str) -> StreamResult<()> {
-                Err(StreamError::unsupported("close_topic"))
+            async fn close_topic(
+                &self,
+                chain: &ChainId,
+                topic: &str,
+                result: Option<temporalio_streams::proto::Payload>,
+            ) -> StreamResult<()> {
+                let mut failures = self.1.lock();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return Err(StreamError::storage("redis is down"));
+                }
+                let result = result.map(|r| String::from_utf8(r.data).unwrap());
+                self.0.lock().push(format!(
+                    "close {} {topic} {}",
+                    chain.first_run_id,
+                    result.unwrap_or_default()
+                ));
+                Ok(())
             }
             async fn pending_stages(&self, _: &ChainId) -> StreamResult<Vec<PendingStage>> {
                 Err(StreamError::unsupported("pending_stages"))
@@ -853,6 +950,7 @@ mod tests {
                 workflow_id: "wf".to_string(),
                 first_run_id: "run".to_string(),
                 topics: vec!["t".to_string()],
+                closes: vec![],
             }
         }
 
@@ -864,13 +962,84 @@ mod tests {
                 run_id: "run".to_string(),
                 first_run_id: "run".to_string(),
                 records: vec![data("t", 1, 1)],
+                closes: vec![],
             }
+        }
+
+        fn closing(topic: &str, result: &str) -> OutputClose {
+            OutputClose {
+                topic: topic.to_string(),
+                result: Some(temporalio_streams::proto::Payload {
+                    data: result.as_bytes().to_vec(),
+                    ..Default::default()
+                }),
+            }
+        }
+
+        fn store_on(log: &Arc<Log>) -> OutputStore {
+            OutputStore::new(
+                log.clone(),
+                "ns".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+        }
+
+        #[tokio::test]
+        async fn a_close_follows_its_stage_promotion() {
+            let log = Arc::new(Log::default());
+            let store = store_on(&log);
+            let mut closed = batch("a");
+            closed.closes = vec![closing("t", "done"), closing("u", "also done")];
+            store
+                .settle("run", vec![closed], CompletionOutcome::Accepted)
+                .await;
+            let entries = log.entries(3).await;
+            assert_eq!(entries[0], "promote a");
+            let mut closes = entries[1..].to_vec();
+            closes.sort();
+            assert_eq!(closes, ["close run t done", "close run u also done"]);
+        }
+
+        #[tokio::test]
+        async fn a_close_is_retried_until_it_lands() {
+            let log = Arc::new(Log::refusing_closes(2));
+            let store = store_on(&log);
+            let mut closed = batch("a");
+            closed.closes = vec![closing("t", "done")];
+            store
+                .settle("run", vec![closed], CompletionOutcome::Accepted)
+                .await;
+            assert_eq!(log.entries(2).await, ["promote a", "close run t done"]);
+            assert_eq!(*log.1.lock(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_stage_replay_proves_closes_its_topics_too() {
+            let log = Arc::new(Log::default());
+            let store = store_on(&log);
+            let mut stage = proven("a");
+            stage.closes = vec![closing("t", "done")];
+            store.promote_proven("run", &[stage]).await;
+            assert_eq!(log.entries(2).await, ["promote a", "close run t done"]);
+        }
+
+        #[tokio::test]
+        async fn a_stage_that_could_not_be_promoted_closes_nothing() {
+            let log = Arc::new(Log::refusing_promotes_of("a"));
+            let store = store_on(&log);
+            let mut closed = batch("a");
+            closed.closes = vec![closing("t", "done")];
+            store
+                .settle("run", vec![closed, batch("b")], CompletionOutcome::Accepted)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(*log.0.lock(), ["promote b"]);
         }
 
         #[tokio::test]
         async fn a_proven_stage_is_promoted_once_however_often_the_run_replays() {
             let log = Arc::new(Log::default());
-            let store = OutputStore::new(log.clone(), "ns".to_string());
+            let store = store_on(&log);
             for _ in 0..3 {
                 store
                     .promote_proven("run", &[proven("a"), proven("b")])
@@ -882,7 +1051,7 @@ mod tests {
         #[tokio::test]
         async fn an_undecided_stage_that_replay_proves_is_not_aborted() {
             let log = Arc::new(Log::default());
-            let store = OutputStore::new(log.clone(), "ns".to_string());
+            let store = store_on(&log);
             store
                 .settle(
                     "run",
@@ -900,7 +1069,7 @@ mod tests {
         #[tokio::test]
         async fn undecided_stages_belong_to_their_run() {
             let log = Arc::new(Log::default());
-            let store = OutputStore::new(log.clone(), "ns".to_string());
+            let store = store_on(&log);
             store
                 .settle("other", vec![batch("theirs")], CompletionOutcome::Unknown)
                 .await;
