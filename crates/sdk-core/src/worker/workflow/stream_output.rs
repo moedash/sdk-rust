@@ -133,6 +133,16 @@ const CLOSE_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(
 #[cfg(feature = "streams")]
 const CLOSE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Whether the store will refuse a close the same way however often it is asked.
+#[cfg(feature = "streams")]
+fn close_is_refused_for_good(error: &temporalio_streams::StreamError) -> bool {
+    use temporalio_streams::proto::StreamFailureKind;
+    matches!(
+        error.kind,
+        StreamFailureKind::Refused | StreamFailureKind::Unsupported | StreamFailureKind::NotFound
+    )
+}
+
 #[cfg(feature = "streams")]
 impl OutputStore {
     pub(crate) fn new(
@@ -349,40 +359,53 @@ impl OutputStore {
         }
     }
 
-    /// Closes the topics a promoted stage closed, each in the background, retrying with backoff
-    /// until it lands or the Worker stops.
+    /// Closes the topics a promoted stage closed, in commit order and in the background, each
+    /// retried with backoff until it lands or the Worker stops.
     ///
-    /// Only after the promotion, so a reader that sees the topic end has every record before the
-    /// close. The close lives only in this Worker, so a failure must not drop it.
+    /// Only after the promotion, so a reader that sees a topic end has every record before the
+    /// close. The close lives only in this Worker, so a failure must not drop it. A refusal the
+    /// store will give again is logged and given up on.
     fn close_topics(&self, workflow_id: &str, first_run_id: &str, closes: &[OutputClose]) {
-        for close in closes {
-            let store = self.store.clone();
-            let chain = self.chain(workflow_id, first_run_id);
-            let close = close.clone();
-            let shutdown = self.shutdown.clone();
-            tokio::spawn(async move {
+        if closes.is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        let chain = self.chain(workflow_id, first_run_id);
+        let closes = closes.to_vec();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            for close in closes {
                 let mut delay = CLOSE_RETRY_FIRST;
                 loop {
-                    match store
+                    let error = match store
                         .close_topic(&chain, &close.topic, close.result.clone())
                         .await
                     {
-                        Ok(()) => return,
-                        Err(error) => warn!(
+                        Ok(()) => break,
+                        Err(error) => error,
+                    };
+                    if close_is_refused_for_good(&error) {
+                        warn!(
                             topic = %close.topic,
                             %error,
-                            "Could not close a stream topic after its output was promoted; \
-                             trying again in {delay:?}"
-                        ),
+                            "The store refused to close a stream topic after its output was promoted"
+                        );
+                        break;
                     }
+                    warn!(
+                        topic = %close.topic,
+                        %error,
+                        "Could not close a stream topic after its output was promoted; trying \
+                         again in {delay:?}"
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = shutdown.cancelled() => return,
                     }
                     delay = (delay * 2).min(CLOSE_RETRY_CAP);
                 }
-            });
-        }
+            }
+        });
     }
 
     async fn abort(&self, stage: temporalio_streams::proto::StageRef) {
@@ -858,11 +881,21 @@ mod tests {
         /// Logs promotions, aborts and topic closes, and refuses everything else. It can be told
         /// to refuse some promotions and the first few closes.
         #[derive(Default)]
-        struct Log(Mutex<Vec<String>>, Mutex<usize>, Mutex<Vec<String>>);
+        struct Log(
+            Mutex<Vec<String>>,
+            Mutex<usize>,
+            Mutex<Vec<String>>,
+            Mutex<Vec<String>>,
+        );
 
         impl Log {
-            fn refusing_closes(count: usize) -> Self {
-                Self(Mutex::default(), Mutex::new(count), Mutex::default())
+            fn failing_closes(count: usize) -> Self {
+                Self(
+                    Mutex::default(),
+                    Mutex::new(count),
+                    Mutex::default(),
+                    Mutex::default(),
+                )
             }
 
             fn refusing_promotes_of(token: &str) -> Self {
@@ -870,6 +903,16 @@ mod tests {
                     Mutex::default(),
                     Mutex::default(),
                     Mutex::new(vec![token.to_string()]),
+                    Mutex::default(),
+                )
+            }
+
+            fn refusing_closes_of(topic: &str) -> Self {
+                Self(
+                    Mutex::default(),
+                    Mutex::default(),
+                    Mutex::default(),
+                    Mutex::new(vec![topic.to_string()]),
                 )
             }
 
@@ -934,6 +977,10 @@ mod tests {
                 topic: &str,
                 result: Option<temporalio_streams::proto::Payload>,
             ) -> StreamResult<()> {
+                if self.3.lock().iter().any(|refused| refused == topic) {
+                    self.0.lock().push(format!("refused {topic}"));
+                    return Err(StreamError::refused("this topic can't be closed"));
+                }
                 let mut failures = self.1.lock();
                 if *failures > 0 {
                     *failures -= 1;
@@ -1199,16 +1246,15 @@ mod tests {
             store
                 .settle("run", vec![closed], CompletionOutcome::Accepted)
                 .await;
-            let entries = log.entries(3).await;
-            assert_eq!(entries[0], "promote a");
-            let mut closes = entries[1..].to_vec();
-            closes.sort();
-            assert_eq!(closes, ["close run t done", "close run u also done"]);
+            assert_eq!(
+                log.entries(3).await,
+                ["promote a", "close run t done", "close run u also done"]
+            );
         }
 
         #[tokio::test]
         async fn a_close_is_retried_until_it_lands() {
-            let log = Arc::new(Log::refusing_closes(2));
+            let log = Arc::new(Log::failing_closes(2));
             let store = store_on(&log);
             let mut closed = batch("a");
             closed.closes = vec![closing("t", "done")];
@@ -1227,6 +1273,36 @@ mod tests {
             stage.closes = vec![closing("t", "done")];
             store.promote_proven("run", &[stage]).await;
             assert_eq!(log.entries(2).await, ["promote a", "close run t done"]);
+        }
+
+        #[tokio::test]
+        async fn a_close_the_store_refuses_for_good_is_given_up() {
+            let log = Arc::new(Log::refusing_closes_of("t"));
+            let store = store_on(&log);
+            let mut closed = batch("a");
+            closed.closes = vec![closing("t", "done"), closing("u", "also done")];
+            store
+                .settle("run", vec![closed], CompletionOutcome::Accepted)
+                .await;
+            assert_eq!(
+                log.entries(3).await,
+                ["promote a", "refused t", "close run u also done"]
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(log.0.lock().len(), 3, "a refused close is not retried");
+        }
+
+        #[tokio::test]
+        async fn a_commit_the_server_did_not_apply_closes_nothing() {
+            let log = Arc::new(Log::default());
+            let store = store_on(&log);
+            for outcome in [CompletionOutcome::Refused, CompletionOutcome::Unknown] {
+                let mut closed = batch("a");
+                closed.closes = vec![closing("t", "done")];
+                store.settle("run", vec![closed], outcome).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(*log.0.lock(), ["abort a"]);
         }
 
         #[tokio::test]
