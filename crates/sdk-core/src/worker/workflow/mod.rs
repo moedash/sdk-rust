@@ -145,7 +145,7 @@ pub(crate) struct Workflows {
     shutdown_token: CancellationToken,
     /// Stages, promotes and aborts Workflow stream output, when the Worker has a stream store.
     #[cfg(feature = "streams")]
-    output_store: Option<stream_output::OutputStore>,
+    output_store: Option<Arc<stream_output::OutputStore>>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -197,7 +197,10 @@ impl Workflows {
         let shutdown_token = basics.shutdown_token.clone();
         #[cfg(feature = "streams")]
         let output_store = basics.worker_config.stream_store.clone().map(|store| {
-            stream_output::OutputStore::new(store, basics.worker_config.namespace.clone())
+            Arc::new(stream_output::OutputStore::new(
+                store,
+                basics.worker_config.namespace.clone(),
+            ))
         });
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
@@ -387,8 +390,11 @@ impl Workflows {
                     },
                 metrics: run_metrics,
             } => {
-                let stream_output::ReportedOutput { output, proven } =
-                    stream_output.map(|o| *o).unwrap_or_default();
+                let stream_output::ReportedOutput {
+                    output,
+                    proven,
+                    close,
+                } = stream_output.map(|o| *o).unwrap_or_default();
                 #[cfg(feature = "streams")]
                 if let Some(store) = &self.output_store {
                     store.promote_proven(run_id, &proven).await;
@@ -544,7 +550,18 @@ impl Workflows {
                 #[cfg(feature = "streams")]
                 if let Some(store) = &self.output_store {
                     store.settle(run_id, output, output_outcome).await;
+                    if let Some(chain) = close
+                        && output_outcome == stream_output::CompletionOutcome::Accepted
+                    {
+                        store.close_after_final_task(
+                            self.client.clone(),
+                            chain,
+                            self.shutdown_token.clone(),
+                        );
+                    }
                 }
+                #[cfg(not(feature = "streams"))]
+                let _ = close;
                 WFTReportStatus::Reported {
                     reset_last_started_to,
                     completion_time,
