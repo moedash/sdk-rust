@@ -50,6 +50,12 @@ pub(crate) struct ReadState {
     /// When the next owner check is due, in milliseconds since the Unix epoch.
     #[prost(uint64, tag = "6")]
     pub(crate) next_check_ms: u64,
+    /// The store's trim watermark when a read that has delivered nothing started. Such a read
+    /// has no position, so a change means retention dropped records it never saw.
+    #[prost(string, tag = "7")]
+    watermark: String,
+    #[prost(bool, tag = "8")]
+    watermark_known: bool,
 }
 
 /// What one record tells the read about its producer's attempts.
@@ -160,6 +166,22 @@ pub(crate) async fn read_with(
         }
     }
     state.started = true;
+    if position.is_empty() {
+        let watermark = store
+            .trimmed(&target.chain, &target.topic)
+            .await?
+            .unwrap_or_default();
+        if !state.watermark_known {
+            state.watermark = watermark;
+            state.watermark_known = true;
+        } else if watermark != state.watermark {
+            return Err(StreamError::expired(format!(
+                "records on topic {:?} were dropped by retention while this read was behind \
+                 them, before it delivered any; the newest dropped one is {watermark}",
+                target.topic
+            )));
+        }
+    }
 
     let page = store
         .read(StoreReadRequest {
