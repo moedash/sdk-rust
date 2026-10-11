@@ -1,0 +1,524 @@
+//! The in-process store, for tests.
+//!
+//! It holds everything in process memory, so nothing survives the process and it is no store for
+//! production. It exists so the conformance suite runs the whole store contract without a server,
+//! and to show in one file what a store owes. Positions are offsets that are never reused, so a
+//! position keeps naming the same record after [MemoryStore::truncate] drops older ones.
+
+use crate::{
+    StreamError, StreamResult, StreamStore,
+    proto::{
+        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
+        PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
+        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
+        StreamOwnerKind,
+    },
+};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Mutex,
+    time::Duration,
+};
+use tokio::{sync::watch, time::Instant};
+
+const NAME: &str = "memory";
+
+type ChainKey = (String, String, String);
+
+fn chain_key(chain: &ChainId) -> ChainKey {
+    (
+        chain.namespace.clone(),
+        chain.workflow_id.clone(),
+        chain.first_run_id.clone(),
+    )
+}
+
+/// The newest batch one producer attempt wrote.
+#[derive(Debug, Clone)]
+struct Held {
+    sequence: i64,
+    count: i64,
+    first: u64,
+    digest: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct Topic {
+    /// The offset of the first retained record.
+    base: u64,
+    records: VecDeque<Vec<u8>>,
+    /// One entry per producer attempt, so the state stays bounded however long a producer writes.
+    held: HashMap<(String, i64), Held>,
+    closed: bool,
+}
+
+impl Topic {
+    fn head(&self) -> u64 {
+        self.base + self.records.len() as u64
+    }
+
+    fn push(&mut self, record: Vec<u8>) -> u64 {
+        self.records.push_back(record);
+        self.head() - 1
+    }
+
+    fn at(&self, offset: u64) -> Option<&Vec<u8>> {
+        offset
+            .checked_sub(self.base)
+            .and_then(|index| self.records.get(index as usize))
+    }
+}
+
+#[derive(Debug, Default)]
+struct Chain {
+    topics: HashMap<String, Topic>,
+    closed: bool,
+    /// In staging order, which is the order a Worker commits them in.
+    stages: Vec<StagedBatch>,
+}
+
+/// A [StreamStore] in process memory. For tests only.
+///
+/// Share one instance between every client and Worker of a test, since two instances share
+/// nothing.
+#[derive(Debug)]
+pub struct MemoryStore {
+    chains: Mutex<HashMap<ChainKey, Chain>>,
+    /// Bumped on every write, so a waiting read checks again.
+    written: watch::Sender<u64>,
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self {
+            chains: Mutex::default(),
+            written: watch::Sender::new(0),
+        }
+    }
+}
+
+impl MemoryStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drops all but the newest `keep` records of a topic, standing in for a store's retention.
+    pub fn truncate(&self, chain: &ChainId, topic: &str, keep: usize) {
+        let mut chains = self.chains.lock().unwrap();
+        let Some(topic) = chains
+            .get_mut(&chain_key(chain))
+            .and_then(|chain| chain.topics.get_mut(topic))
+        else {
+            return;
+        };
+        let drop = topic.records.len().saturating_sub(keep);
+        topic.records.drain(..drop);
+        topic.base += drop as u64;
+    }
+
+    fn wrote(&self) {
+        self.written.send_modify(|version| *version += 1);
+    }
+
+    /// One look at what a read gets now: `None` when it should wait for more.
+    fn read_now(&self, request: &StoreReadRequest) -> StreamResult<Option<StoreReadResponse>> {
+        let chains = self.chains.lock().unwrap();
+        let chain = chains.get(&chain_key(chain_of(request.chain.as_ref())?));
+        let topic = chain.and_then(|chain| chain.topics.get(&request.topic));
+        let closed = chain.is_some_and(|chain| chain.closed) || topic.is_some_and(|t| t.closed);
+        let after = parse_position(&request.after_position)?;
+        let Some(topic) = topic else {
+            if after.is_some() {
+                return Err(StreamError::not_found(format!(
+                    "topic {:?} holds no records and none were dropped, so nothing is known \
+                     about what followed position {}",
+                    request.topic, request.after_position
+                )));
+            }
+            return Ok(closed.then(|| StoreReadResponse {
+                records: Vec::new(),
+                closed,
+            }));
+        };
+        let start = after.map_or(topic.base, |after| after + 1);
+        if start > topic.head() {
+            return Err(StreamError::cursor(format!(
+                "position {} is one topic {:?} never held",
+                request.after_position, request.topic
+            )));
+        }
+        if start < topic.base {
+            return Err(StreamError::expired(format!(
+                "the records from offset {start} on topic {:?} were dropped by retention; the \
+                 topic now starts at {}",
+                request.topic, topic.base
+            )));
+        }
+        let records: Vec<_> = (start..topic.head())
+            .take(request.max_records.max(1) as usize)
+            .map(|offset| StoredRecord {
+                position: offset.to_string(),
+                record: topic.at(offset).cloned().unwrap_or_default(),
+            })
+            .collect();
+        Ok((!records.is_empty() || closed).then_some(StoreReadResponse { records, closed }))
+    }
+}
+
+fn chain_of(chain: Option<&ChainId>) -> StreamResult<&ChainId> {
+    chain.ok_or_else(|| StreamError::refused("a store call needs the chain it is about"))
+}
+
+fn parse_position(position: &str) -> StreamResult<Option<u64>> {
+    if position.is_empty() {
+        return Ok(None);
+    }
+    position.parse().map(Some).map_err(|_| {
+        StreamError::cursor(format!(
+            "position {position:?} is not a position of the memory store"
+        ))
+    })
+}
+
+fn wait_of(request: &StoreReadRequest) -> Duration {
+    request.wait.as_ref().map_or(Duration::ZERO, |wait| {
+        Duration::new(
+            u64::try_from(wait.seconds).unwrap_or(0),
+            u32::try_from(wait.nanos).unwrap_or(0),
+        )
+    })
+}
+
+#[async_trait::async_trait]
+impl StreamStore for MemoryStore {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
+        if request.records.is_empty() {
+            return Err(StreamError::refused("an append needs at least one record"));
+        }
+        if request.digest.is_empty() {
+            return Err(StreamError::refused("an append needs the batch's digest"));
+        }
+        let mut chains = self.chains.lock().unwrap();
+        let chain = chains
+            .entry(chain_key(chain_of(request.chain.as_ref())?))
+            .or_default();
+        let chain_closed = chain.closed;
+        let topic = chain.topics.entry(request.topic.clone()).or_default();
+        let session = (request.producer_id.clone(), request.attempt);
+        if let Some(held) = topic.held.get(&session) {
+            if request.sequence == held.sequence {
+                if request.digest != held.digest {
+                    return Err(StreamError::new(
+                        crate::proto::StreamFailureKind::ProducerDivergent,
+                        format!(
+                            "sequence {} was already written with different content",
+                            request.sequence
+                        ),
+                    ));
+                }
+                let last = held.first + held.count as u64 - 1;
+                return Ok(StoreAppendResponse {
+                    first_position: held.first.to_string(),
+                    last_position: last.to_string(),
+                });
+            }
+            let next = held.sequence + held.count;
+            if request.sequence < next {
+                return Err(StreamError::new(
+                    crate::proto::StreamFailureKind::ProducerStale,
+                    format!(
+                        "sequence {} is below the next one expected, {next}",
+                        request.sequence
+                    ),
+                ));
+            }
+        }
+        if chain_closed || topic.closed {
+            return Err(StreamError::closed(
+                "the Workflow that owns this stream has closed",
+            ));
+        }
+        let count = request.records.len() as i64;
+        let mut positions = request.records.into_iter().map(|record| topic.push(record));
+        let first = positions.next().unwrap_or_default();
+        let last = positions.last().unwrap_or(first);
+        topic.held.insert(
+            session,
+            Held {
+                sequence: request.sequence,
+                count,
+                first,
+                digest: request.digest,
+            },
+        );
+        drop(chains);
+        self.wrote();
+        Ok(StoreAppendResponse {
+            first_position: first.to_string(),
+            last_position: last.to_string(),
+        })
+    }
+
+    async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse> {
+        let deadline = Instant::now() + wait_of(&request);
+        let mut written = self.written.subscribe();
+        loop {
+            if let Some(response) = self.read_now(&request)? {
+                return Ok(response);
+            }
+            if tokio::time::timeout_at(deadline, written.changed())
+                .await
+                .is_err()
+            {
+                return Ok(StoreReadResponse::default());
+            }
+        }
+    }
+
+    async fn latest(&self, request: StoreLatestRequest) -> StreamResult<StoreLatestResponse> {
+        let chains = self.chains.lock().unwrap();
+        let head = chains
+            .get(&chain_key(chain_of(request.chain.as_ref())?))
+            .and_then(|chain| chain.topics.get(&request.topic))
+            .map_or(0, Topic::head);
+        Ok(StoreLatestResponse {
+            position: head
+                .checked_sub(1)
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        })
+    }
+
+    async fn record_at(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        position: &str,
+    ) -> StreamResult<Option<Vec<u8>>> {
+        let Some(offset) = parse_position(position)? else {
+            return Ok(None);
+        };
+        let chains = self.chains.lock().unwrap();
+        Ok(chains
+            .get(&chain_key(chain))
+            .and_then(|chain| chain.topics.get(topic))
+            .and_then(|topic| topic.at(offset))
+            .cloned())
+    }
+
+    async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
+        let mut chains = self.chains.lock().unwrap();
+        let chain = chains
+            .entry(chain_key(chain_of(batch.chain.as_ref())?))
+            .or_default();
+        chain.stages.retain(|held| held.token != batch.token);
+        chain.stages.push(batch);
+        Ok(())
+    }
+
+    async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
+        let mut chains = self.chains.lock().unwrap();
+        let Some(chain) = chains.get_mut(&chain_key(chain_of(stage.chain.as_ref())?)) else {
+            return Ok(settled());
+        };
+        let Some(index) = chain
+            .stages
+            .iter()
+            .position(|held| held.token == stage.token)
+        else {
+            return Ok(settled());
+        };
+        // Checked before any write, so a promotion that names too few topics writes nothing and
+        // the stage stays pending.
+        if let Some(stray) = chain.stages[index]
+            .records
+            .iter()
+            .find(|record| !stage.topics.contains(&record.topic))
+        {
+            return Err(StreamError::storage(format!(
+                "the stage holds topic {:?}, which the promotion did not name",
+                stray.topic
+            )));
+        }
+        let batch = chain.stages.remove(index);
+        let records = batch.records.len() as u32;
+        for record in batch.records {
+            chain
+                .topics
+                .entry(record.topic)
+                .or_default()
+                .push(record.record);
+        }
+        drop(chains);
+        self.wrote();
+        Ok(PromoteResult {
+            outcome: PromoteOutcome::Promoted as i32,
+            records,
+        })
+    }
+
+    async fn abort(&self, stage: &StageRef) -> StreamResult<()> {
+        let mut chains = self.chains.lock().unwrap();
+        if let Some(chain) = chains.get_mut(&chain_key(chain_of(stage.chain.as_ref())?)) {
+            chain.stages.retain(|held| held.token != stage.token);
+        }
+        Ok(())
+    }
+
+    async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
+        self.chains
+            .lock()
+            .unwrap()
+            .entry(chain_key(chain))
+            .or_default()
+            .closed = true;
+        self.wrote();
+        Ok(())
+    }
+
+    async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
+        self.chains
+            .lock()
+            .unwrap()
+            .entry(chain_key(chain))
+            .or_default()
+            .topics
+            .entry(topic.to_string())
+            .or_default()
+            .closed = true;
+        self.wrote();
+        Ok(())
+    }
+
+    async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>> {
+        let chains = self.chains.lock().unwrap();
+        Ok(chains
+            .get(&chain_key(chain))
+            .map(|chain| chain.stages.iter().map(pending).collect())
+            .unwrap_or_default())
+    }
+
+    async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
+        if request.owner_kind != StreamOwnerKind::Workflow as i32 {
+            return Err(StreamError::unsupported(format!(
+                "this release keeps streams of Workflows only, not owner kind {}",
+                request.owner_kind
+            )));
+        }
+        let mut chains = self.chains.lock().unwrap();
+        let mut deleted = 0;
+        chains.retain(|(namespace, workflow_id, _), chain| {
+            let owned = *namespace == request.namespace && *workflow_id == request.workflow_id;
+            if owned {
+                deleted += 1 + chain.topics.len() as u64 + chain.stages.len() as u64;
+            }
+            !owned
+        });
+        Ok(DeleteOwnerResponse { deleted })
+    }
+}
+
+fn settled() -> PromoteResult {
+    PromoteResult {
+        outcome: PromoteOutcome::Settled as i32,
+        records: 0,
+    }
+}
+
+fn pending(batch: &StagedBatch) -> PendingStage {
+    let mut topics: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    for record in &batch.records {
+        if seen.insert(record.topic.as_str()) {
+            topics.push(record.topic.clone());
+        }
+    }
+    PendingStage {
+        token: batch.token.clone(),
+        run_id: batch.run_id.clone(),
+        history_floor_event_id: batch.history_floor_event_id,
+        topics,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::StreamFailureKind;
+
+    fn chain() -> ChainId {
+        ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: "wf".to_string(),
+            first_run_id: "run-1".to_string(),
+        }
+    }
+
+    fn append(sequence: i64, records: &[&[u8]]) -> StoreAppendRequest {
+        StoreAppendRequest {
+            chain: Some(chain()),
+            topic: "out".to_string(),
+            producer_id: "p".to_string(),
+            attempt: 1,
+            sequence,
+            digest: records.concat(),
+            records: records.iter().map(|record| record.to_vec()).collect(),
+        }
+    }
+
+    fn read_after(position: &str) -> StoreReadRequest {
+        StoreReadRequest {
+            chain: Some(chain()),
+            topic: "out".to_string(),
+            after_position: position.to_string(),
+            max_records: 10,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_position_past_the_head_is_one_the_topic_never_held() {
+        let store = MemoryStore::new();
+        store.append(append(1, &[b"a"])).await.unwrap();
+        let error = store.read(read_after("5")).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Cursor);
+        assert!(error.message.contains("never held"), "{error}");
+        let error = store.read(read_after("x")).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Cursor);
+    }
+
+    #[tokio::test]
+    async fn positions_survive_truncation() {
+        let store = MemoryStore::new();
+        store.append(append(1, &[b"a", b"b", b"c"])).await.unwrap();
+        store.truncate(&chain(), "out", 1);
+        let read = store.read(read_after("1")).await.unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.records[0].position, "2");
+        assert_eq!(read.records[0].record, b"c");
+        assert_eq!(
+            store.record_at(&chain(), "out", "2").await.unwrap(),
+            Some(b"c".to_vec())
+        );
+        assert_eq!(store.record_at(&chain(), "out", "0").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn another_owner_kind_is_unsupported() {
+        let store = MemoryStore::new();
+        let error = store
+            .delete_owner(DeleteOwnerRequest {
+                namespace: "ns".to_string(),
+                owner_kind: StreamOwnerKind::Unspecified as i32,
+                workflow_id: "wf".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Unsupported);
+    }
+}
