@@ -18,6 +18,7 @@ mod reader;
 mod record;
 #[cfg(feature = "redis")]
 mod redis;
+mod repair;
 mod store;
 
 #[cfg(feature = "redis")]
@@ -29,9 +30,10 @@ pub use memory::MemoryStore;
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{DEFAULT_MAX_RECORDS, ReadTarget, read_page};
 pub use record::{
-    WORKFLOW_OWNER_KIND, activity_producer_id, append_digest, stored_append_record,
+    WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
     stored_output_record,
 };
+pub use repair::{Decision, decide_token};
 pub use store::StreamStore;
 
 /// The protos stores and lang exchange.

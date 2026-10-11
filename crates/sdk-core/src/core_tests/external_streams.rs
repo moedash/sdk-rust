@@ -30,7 +30,7 @@ use temporalio_common::{
             workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_commands::{
                 ActivityCancellationType, CompleteWorkflowExecution,
-                ContinueAsNewWorkflowExecution, FailWorkflowExecution, OutputRecord,
+                ContinueAsNewWorkflowExecution, FailWorkflowExecution, OutputClose, OutputRecord,
                 WorkflowOutputStreamCommit, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
@@ -264,7 +264,10 @@ fn manifest_for(
 }
 
 fn output_commit_command(records: Vec<OutputRecord>) -> workflow_command::Variant {
-    workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit { records })
+    workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit {
+        records,
+        closes: vec![],
+    })
 }
 
 fn output_marker(
@@ -2206,4 +2209,31 @@ async fn a_failed_task_publishes_nothing() {
     worker.shutdown().await;
     worker.finalize_shutdown().await;
     assert!(store.staged().is_empty());
+}
+
+#[tokio::test]
+async fn a_close_without_its_finish_fails_the_task() {
+    let worker = worker_failing_with(
+        canned_histories::single_timer("1"),
+        "has no FINISH record in the same commit",
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let commit = WorkflowOutputStreamCommit {
+        records: records(&["a"]),
+        closes: vec![OutputClose {
+            topic: TOPIC.to_string(),
+            result: Some(Payload::default()),
+        }],
+    };
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![workflow_command::Variant::WorkflowOutputStreamCommit(
+                commit,
+            )],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
 }
