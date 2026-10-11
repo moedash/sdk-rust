@@ -773,7 +773,11 @@ fn progress_task_that_commits_output() -> (
 async fn run_progress_task_that_commits_output(
     batches: Vec<ResponseType>,
     replaying: bool,
-) -> (Vec<Vec<String>>, RecordedMarkers, ExternalOutputStreamManifest) {
+) -> (
+    Vec<Vec<String>>,
+    RecordedMarkers,
+    ExternalOutputStreamManifest,
+) {
     let (history, [quiet, committing_progress, last_progress], manifest) =
         progress_task_that_commits_output();
     let markers: RecordedMarkers = Default::default();

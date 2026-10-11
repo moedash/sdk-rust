@@ -279,7 +279,9 @@ pub(super) fn output_marker(
 }
 
 /// The written markers with their stage tokens checked and cleared, since Core mints them.
-pub(super) fn without_tokens(written: &[Vec<ExternalStreamMarkerData>]) -> Vec<Vec<ExternalStreamMarkerData>> {
+pub(super) fn without_tokens(
+    written: &[Vec<ExternalStreamMarkerData>],
+) -> Vec<Vec<ExternalStreamMarkerData>> {
     written
         .iter()
         .map(|markers| {
