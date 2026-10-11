@@ -130,6 +130,105 @@ mod on_redis {
         pub(crate) store: Arc<RedisStore>,
         pub(crate) raw: Raw,
         pub(crate) prefix: String,
+        _user: Option<DocumentedUser>,
+    }
+
+    /// The rules of the documented `ACL SETUSER` line, after the user name.
+    pub(crate) fn documented_rules() -> Vec<String> {
+        let page = include_str!("../docs/redis.md");
+        let lines: Vec<_> = page
+            .lines()
+            .filter_map(|line| line.strip_prefix("ACL SETUSER "))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the Redis page should give one ACL SETUSER line"
+        );
+        lines[0]
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_string)
+            .collect()
+    }
+
+    const DOCUMENTED_KEYS: &str = "~temporal-streams:{my-ns:*";
+
+    /// A Redis user with exactly the documented rules, for one prefix and namespace. The page's
+    /// key pattern and password are swapped for the test's own, and nothing else changes.
+    pub(crate) struct DocumentedUser {
+        admin_url: String,
+        name: String,
+        pub(crate) url: String,
+    }
+
+    impl DocumentedUser {
+        pub(crate) async fn create(
+            url: &str,
+            prefix: &str,
+            namespace: &str,
+            extra: &[&str],
+        ) -> Self {
+            let rules = documented_rules();
+            assert!(
+                rules.iter().any(|rule| rule == DOCUMENTED_KEYS),
+                "{rules:?}"
+            );
+            assert!(rules.iter().any(|rule| rule == ">secret"), "{rules:?}");
+            let name = unique("streams-acl");
+            let password = unique("pw");
+            let keys = format!("~{}:{{{}:*", part(prefix), part(namespace));
+            let mut setuser = redis::cmd("ACL");
+            setuser.arg("SETUSER").arg(&name);
+            for rule in &rules {
+                match rule.as_str() {
+                    DOCUMENTED_KEYS => setuser.arg(&keys),
+                    ">secret" => setuser.arg(format!(">{password}")),
+                    rule => setuser.arg(rule),
+                };
+            }
+            for rule in extra {
+                setuser.arg(*rule);
+            }
+            let mut admin = Raw::connect(url, false).await;
+            let _: () = admin.query(&setuser).await;
+            let address = url.trim_start_matches("redis://");
+            Self {
+                admin_url: url.to_string(),
+                url: format!("redis://{name}:{password}@{address}"),
+                name,
+            }
+        }
+    }
+
+    impl Drop for DocumentedUser {
+        fn drop(&mut self) {
+            if let Ok(mut admin) = redis::Client::open(self.admin_url.as_str())
+                .and_then(|client| client.get_connection())
+            {
+                let _: redis::RedisResult<()> = redis::cmd("ACL")
+                    .arg("DELUSER")
+                    .arg(&self.name)
+                    .query(&mut admin);
+            }
+        }
+    }
+
+    pub(crate) async fn redis_as_documented_user() -> Option<Redis> {
+        let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
+            eprintln!("set STREAMS_REDIS_URL to run the Redis store cases");
+            return None;
+        };
+        let prefix = unique("conformance-acl");
+        let user = DocumentedUser::create(&url, &prefix, "default", &[]).await;
+        let mut options = RedisStoreOptions::new(user.url.clone());
+        options.key_prefix = prefix.clone();
+        Some(Redis {
+            store: Arc::new(RedisStore::connect(options).await.unwrap()),
+            raw: Raw::connect(&url, false).await,
+            prefix,
+            _user: Some(user),
+        })
     }
 
     pub(crate) async fn redis(variable: &str, cluster: bool) -> Option<Redis> {
@@ -146,6 +245,7 @@ mod on_redis {
             store: Arc::new(RedisStore::connect(options).await.unwrap()),
             raw: Raw::connect(&url, cluster).await,
             prefix,
+            _user: None,
         })
     }
 
@@ -1219,4 +1319,9 @@ mod standalone_redis {
 #[cfg(feature = "redis")]
 mod cluster_redis {
     redis_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
+}
+
+#[cfg(feature = "redis")]
+mod documented_acl_redis {
+    redis_cases!(super::on_redis::redis_as_documented_user());
 }
