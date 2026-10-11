@@ -269,4 +269,210 @@ mod tests {
             );
         }
     }
+
+    /// One HTTP request the test listener got: its `Nexus-Operation-State` and its body.
+    type Delivery = (String, String);
+
+    /// Answers every request with `200` and hands each one on, so a test sees what the server's
+    /// callbacks deliver.
+    fn listen(address: &str) -> std::sync::mpsc::Receiver<Delivery> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind(address).unwrap();
+        let (sender, deliveries) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut state, mut length) = (String::new(), 0usize);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(value) = lower.strip_prefix("nexus-operation-state:") {
+                        state = value.trim().to_string();
+                    }
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+                if sender
+                    .send((state, String::from_utf8_lossy(&body).to_string()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        deliveries
+    }
+
+    fn next_delivery(deliveries: &std::sync::mpsc::Receiver<Delivery>) -> Delivery {
+        deliveries
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the server delivered nothing")
+    }
+
+    /// Needs a server with the stream notifier and progress on, at `STREAMS_NOTIFIER_SERVER`
+    /// (such as `http://127.0.0.1:7861`), whose `callback.allowedAddresses` takes
+    /// `127.0.0.1:7899`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_notifier_hears_appends_as_progress_and_the_close_as_the_result() {
+        use temporalio_common::protos::temporal::api::{
+            common::v1::{Payload, WorkflowType},
+            taskqueue::v1::TaskQueue,
+            workflowservice::v1::{
+                AttachStreamCallbackRequest, StartWorkflowExecutionRequest,
+                TerminateWorkflowExecutionRequest,
+            },
+        };
+        let Ok(server) = std::env::var("STREAMS_NOTIFIER_SERVER") else {
+            eprintln!("set STREAMS_NOTIFIER_SERVER to run the live notifier test");
+            return;
+        };
+        let connection = Connection::connect(
+            temporalio_client::ConnectionOptions::new(url::Url::parse(&server).unwrap()).build(),
+        )
+        .await
+        .unwrap();
+        let workflow_id = format!("cn-notifier-{}", uuid::Uuid::new_v4());
+        // A running owner, which no Worker polls, so the stream stays open.
+        let started = connection
+            .workflow_service()
+            .start_workflow_execution(
+                StartWorkflowExecutionRequest {
+                    namespace: "default".to_string(),
+                    workflow_id: workflow_id.clone(),
+                    workflow_type: Some(WorkflowType {
+                        name: "owner".to_string(),
+                    }),
+                    task_queue: Some(TaskQueue {
+                        name: "cn-notifier-nobody".to_string(),
+                        ..Default::default()
+                    }),
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let deliveries = listen("127.0.0.1:7899");
+        connection
+            .workflow_service()
+            .attach_stream_callback(
+                AttachStreamCallbackRequest {
+                    namespace: "default".to_string(),
+                    stream_ref: Some(StreamReference {
+                        owner_kind: StreamOwnerKind::Workflow as i32,
+                        workflow_id: workflow_id.clone(),
+                        run_id: started.run_id.clone(),
+                        topic: "tokens".to_string(),
+                    }),
+                    request_id: "caller".to_string(),
+                    callback: Some(
+                        temporalio_common::protos::temporal::api::common::v1::callback::Nexus {
+                            url: "http://127.0.0.1:7899/callback".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .unwrap();
+
+        let service = connect_stream_service(
+            proto::StreamStoreConfig {
+                store: Some(proto::stream_store_config::Store::Memory(
+                    proto::MemoryStoreConfig {},
+                )),
+                notify_on_append: true,
+                ..Default::default()
+            },
+            connection.clone(),
+        )
+        .await
+        .unwrap();
+        let stream = proto::StreamAddress {
+            namespace: "default".to_string(),
+            owner_kind: proto::StreamOwnerKind::Workflow as i32,
+            workflow_id: workflow_id.clone(),
+            run_id: String::new(),
+            topic: "tokens".to_string(),
+        };
+        let append = proto::AppendRequest {
+            stream: Some(stream.clone()),
+            producer: Some(proto::append_request::Producer::Named(
+                proto::NamedProducer {
+                    producer_id: "producer".to_string(),
+                    attempt: 1,
+                },
+            )),
+            sequence: 1,
+            records: vec![proto::AppendRecord {
+                kind: proto::StreamRecordKind::Data as i32,
+                body: Some(Payload {
+                    data: b"token".to_vec(),
+                    ..Default::default()
+                }),
+                content_hash: vec![7; 32],
+            }],
+        };
+        use prost::Message;
+        service
+            .call("Append", &append.encode_to_vec())
+            .await
+            .unwrap();
+        let (state, body) = next_delivery(&deliveries);
+        assert_eq!(state, "running", "{body}");
+        assert!(body.contains(r#""counter":"1""#), "{body}");
+
+        service
+            .call(
+                "Close",
+                &proto::CloseRequest {
+                    stream: Some(stream),
+                    result: Some(Payload {
+                        metadata: [("encoding".to_string(), b"json/plain".to_vec())].into(),
+                        data: br#""summary""#.to_vec(),
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        let (state, body) = loop {
+            // A progress retry may still arrive before the completion.
+            let delivery = next_delivery(&deliveries);
+            if delivery.0 != "running" {
+                break delivery;
+            }
+        };
+        assert_eq!(state, "succeeded", "{body}");
+        assert!(body.contains("summary"), "{body}");
+
+        connection
+            .workflow_service()
+            .terminate_workflow_execution(
+                TerminateWorkflowExecutionRequest {
+                    namespace: "default".to_string(),
+                    workflow_execution: Some(WorkflowExecution {
+                        workflow_id,
+                        run_id: started.run_id,
+                    }),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .unwrap();
+    }
 }
