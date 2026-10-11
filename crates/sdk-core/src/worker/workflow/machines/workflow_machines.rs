@@ -66,8 +66,8 @@ use temporalio_common::{
                 ExternalOutputStreamManifest, ExternalStreamBoundary, ExternalStreamMarkerData,
             },
             workflow_activation::{
-                self, NotifyHasPatch, ReplayExternalStreams, ResolveNexusOperationProgress,
-                UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
+                self, NotifyHasPatch, ResolveNexusOperationProgress, UpdateRandomSeed,
+                WorkflowActivation, workflow_activation_job,
             },
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
@@ -135,6 +135,9 @@ pub(crate) struct WorkflowMachines {
     pub(crate) workflow_type: String,
     /// Identifies the current run
     pub(crate) run_id: String,
+    /// The first run of the run chain this run belongs to, as the start event names it. Empty
+    /// until the start event is applied.
+    pub(crate) first_execution_run_id: String,
     /// Is set to true once we've seen the final event in workflow history, to avoid accidentally
     /// re-applying the final workflow task.
     pub(crate) have_seen_terminal_event: bool,
@@ -303,6 +306,7 @@ impl WorkflowMachines {
             protocol_msgs: vec![],
             pending_nexus_progress: vec![],
             workflow_id: basics.workflow_id,
+            first_execution_run_id: String::new(),
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
             drive_me: driven_wf,
@@ -439,6 +443,11 @@ impl WorkflowMachines {
         self.current_started_event_id
     }
 
+    #[cfg(feature = "streams")]
+    pub(crate) fn worker_config(&self) -> &WorkerConfig {
+        &self.worker_config
+    }
+
     pub(crate) fn current_wft_history_floor_event_id(&self) -> Option<i64> {
         self.current_wft_history_floor_event_id
     }
@@ -520,7 +529,6 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
-            history_floor_event_id: self.current_wft_history_floor_event_id.unwrap_or_default(),
         }
     }
 
@@ -555,18 +563,12 @@ impl WorkflowMachines {
         Ok(())
     }
 
-    /// Hands lang a marker the replay lookahead found, and creates the machine that settles it.
+    /// Keeps a marker the replay lookahead found for the commit lang sends again, and creates the
+    /// machine that settles it.
     fn replay_external_stream_marker(&mut self, data: ExternalStreamMarkerData) {
         if let Some(output) = &data.output {
             self.replayed_output_manifests.push_back(output.clone());
         }
-        self.drive_me.send_job(
-            workflow_activation_job::Variant::ReplayExternalStreams(ReplayExternalStreams {
-                terminal_boundary: data.terminal_boundary,
-                output: data.output.clone(),
-            })
-            .into(),
-        );
         let machine = ExternalStreamMachine::resolved_from_marker_lookahead(data);
         let key = self.all_machines.insert(machine.into());
         self.external_stream_marker_machines.push_back(key);
@@ -961,9 +963,9 @@ impl WorkflowMachines {
                 }
             } else if is_stream_marker(e) {
                 // The marker is written by the task's completion, so it follows the task in
-                // History. Finding it here hands lang the recorded output in the same activation
-                // that produced it live. Our name with details that don't decode is a broken
-                // History, and matching it as a foreign marker later would hide that.
+                // History. Finding it here lets Core check the commit lang sends again in the same
+                // activation that produced it live. Our name with details that don't decode is a
+                // broken History, and matching it as a foreign marker later would hide that.
                 let Some(stream_dat) = extract_stream_marker(e) else {
                     return Err(fatal!("External stream marker was unparsable: {e:?}"));
                 };
@@ -1222,6 +1224,7 @@ impl WorkflowMachines {
                         // workflow time set.
                         self.set_current_time(as_systime);
                     }
+                    self.first_execution_run_id = attrs.first_execution_run_id.clone();
                     // Notify the lang sdk that it's time to kick off a workflow
                     self.drive_me.start(
                         self.workflow_id.clone(),

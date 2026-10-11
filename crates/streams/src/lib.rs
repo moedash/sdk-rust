@@ -1,0 +1,45 @@
+#![warn(missing_docs)]
+
+//! Stream stores for Temporal Workflows.
+//!
+//! A stream is a topic of a Workflow, kept in a store outside Temporal and keyed by the
+//! Workflow's run chain. This crate holds what every store and every SDK share: the
+//! [StreamStore] trait a store implements, the cursor format, the record helpers that stamp and
+//! fingerprint records, and the error every call fails with. Lang reaches a store through Core's
+//! `StreamService`, and Core's Worker stages and promotes a Workflow's own output through the
+//! same trait.
+
+mod cursor;
+mod error;
+mod handle;
+mod memory;
+mod owner;
+mod reader;
+mod record;
+#[cfg(feature = "redis")]
+mod redis;
+mod service;
+mod store;
+
+#[cfg(feature = "redis")]
+pub use self::redis::{RedisStore, RedisStoreOptions};
+pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
+pub use error::{StreamError, StreamResult};
+pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
+pub use memory::MemoryStore;
+pub use owner::{OwnerClient, OwnerDescription, OwnerError};
+pub use reader::{DEFAULT_MAX_RECORDS, ReadTarget, read_page};
+pub use record::{
+    WORKFLOW_OWNER_KIND, activity_producer_id, append_digest, stored_append_record,
+    stored_output_record,
+};
+pub use service::StreamService;
+pub use store::StreamStore;
+
+/// The protos stores and lang exchange.
+pub mod proto {
+    pub use temporalio_common::protos::{
+        coresdk::streams::*,
+        temporal::sdk::streams::v1::{StreamRecord, StreamRecordKind},
+    };
+}

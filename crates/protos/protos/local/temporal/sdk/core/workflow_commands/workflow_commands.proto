@@ -20,7 +20,7 @@ import "temporal/api/workflow/v1/message.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
-import "temporal/sdk/core/external_data/external_data.proto";
+import "temporal/sdk/streams/v1/message.proto";
 
 message WorkflowCommand {
     // User metadata that may or may not be persisted into history depending on the command type.
@@ -60,15 +60,32 @@ message WorkflowCommand {
     }
 }
 
-// Reports that the output batch for this Workflow Task has been durably staged outside History.
-// Core records only this compact manifest, in a `core_external_stream` marker ordered before the
-// completion's other commands, so the batch becomes visible exactly when the task is accepted.
-// While replaying, Core writes nothing and instead requires the manifest to equal the recorded
-// one, ignoring `stage_token`, `run_id` (a reset run replays markers that name its base run) and
-// `provider_id` (a provider can be renamed or swapped for a Replayer). A mismatch, a commit where none was recorded, or a recorded manifest that the replayed task
-// does not commit again is nondeterminism.
+// The stream records this activation published, sent with its completion.
+//
+// Core builds the output manifest from them and records it in a `core_external_stream` marker
+// ordered before the completion's other commands, so the records become visible exactly when the
+// Workflow Task is accepted. While replaying, lang sends the same records without bodies, and
+// Core compares the manifest it builds from them with the recorded one. A mismatch, a commit
+// where none was recorded, or a recorded manifest the replayed task doesn't commit again is
+// nondeterminism. Core takes one commit per completion.
 message WorkflowOutputStreamCommit {
-    coresdk.external_data.ExternalOutputStreamManifest manifest = 1;
+    reserved 1;
+    reserved "manifest";
+    repeated OutputRecord records = 2;
+}
+
+// One record a Workflow published, in publish order across topics.
+message OutputRecord {
+    string topic = 1;
+    temporal.sdk.streams.v1.StreamRecordKind kind = 2;
+    // The value on DATA, after lang's payload codec and external storage. Absent while replaying,
+    // since nothing is stored again.
+    temporal.api.common.v1.Payload body = 3;
+    // The SHA-256 of the body as the payload converter made it, before the codec. Set on DATA,
+    // replaying or not, so the manifest never depends on the codec.
+    bytes content_hash = 4;
+    // The size of the body as the payload converter made it.
+    uint64 logical_size = 5;
 }
 
 message StartTimer {

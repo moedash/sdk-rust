@@ -19,7 +19,6 @@ import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/common/common.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
-import "temporal/sdk/core/external_data/external_data.proto";
 
 // An instruction to the lang sdk to run some workflow code, whether for the first time or from
 // a cached state.
@@ -104,10 +103,6 @@ message WorkflowActivation {
     // the workflow is Pinned.
     // Experimental.
     bool target_worker_deployment_version_changed = 12;
-    // The event immediately preceding this Workflow Task's WorkflowTaskScheduled event in the
-    // ordered History view Core used to build the activation. Zero means Core could not identify
-    // that exact predecessor, in which case output must not be staged for this task.
-    int64 history_floor_event_id = 13;
 }
 
 message WorkflowActivationJob {
@@ -145,8 +140,6 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
-        // Replay: deliver the output manifest recorded in an external stream marker.
-        ReplayExternalStreams replay_external_streams = 17;
         // A started nexus operation reported progress.
         ResolveNexusOperationProgress resolve_nexus_operation_progress = 18;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
@@ -154,19 +147,6 @@ message WorkflowActivationJob {
         // in the activation if present.
         RemoveFromCache remove_from_cache = 50;
     }
-}
-
-// Carries a recorded external stream marker back to lang during replay.
-//
-// Core issues exactly one of these per marker, found by lookahead, all in the first activation of
-// the Workflow Task that wrote them, in History order. Lang must not stage the output again, so a
-// publishing Workflow replays without touching the stream store. Lang must send each recomputed
-// output back as a WorkflowOutputStreamCommit, in the order it published, for Core to compare.
-// Fields 1 to 3 are left free for the stream input state the same marker will carry.
-message ReplayExternalStreams {
-    coresdk.external_data.ExternalStreamBoundary terminal_boundary = 4;
-    // The output manifest recorded in the marker, if this Workflow Task published output.
-    coresdk.external_data.ExternalOutputStreamManifest output = 5;
 }
 
 // Initialize a new workflow
