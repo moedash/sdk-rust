@@ -1065,6 +1065,55 @@ mod cases {
         }
     }
 
+    pub(crate) async fn a_chain_lists_its_open_topics(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let open = |chain: ChainId| async move {
+            let mut topics = case.store().open_topics(&chain).await.unwrap();
+            topics.sort();
+            topics
+        };
+        assert!(open(chain.clone()).await.is_empty());
+        // A topic name that needs escaping in a key comes back as written.
+        let odd = "a:b c/\u{e9}*";
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        Producer::new(case, &chain, odd, "p", 1)
+            .append(&["1"])
+            .await;
+        store
+            .stage(staged(&chain, "run-1", "t1", &[("staged", "1")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            open(chain.clone()).await,
+            [odd, OUT],
+            "a staged topic isn't listed before its promotion"
+        );
+        store
+            .promote(&stage_ref(&chain, "t1", &["staged"]))
+            .await
+            .unwrap();
+        store.close_topic(&chain, OUT, None).await.unwrap();
+        assert_eq!(open(chain.clone()).await, [odd, "staged"]);
+        let other = case.chain();
+        Producer::new(case, &other, OTHER, "p", 1)
+            .append(&["1"])
+            .await;
+        assert_eq!(
+            open(chain.clone()).await,
+            [odd, "staged"],
+            "chains are apart"
+        );
+        store.close_chain(&chain).await.unwrap();
+        assert_eq!(
+            open(chain).await,
+            [odd, "staged"],
+            "a chain close leaves its topics to be listed"
+        );
+    }
+
     pub(crate) async fn a_stage_is_invisible_until_promoted(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1320,6 +1369,7 @@ mod memory {
         a_promotion_lands_on_a_closed_chain,
         rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open,
         deleting_an_owner_drops_every_chain_of_it,
+        a_chain_lists_its_open_topics,
     );
 }
 
@@ -1373,6 +1423,7 @@ mod standalone_redis {
     redis_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
     conformance!(super::on_redis::redis("STREAMS_REDIS_URL", false);
         deleting_an_owner_drops_every_chain_of_it,
+        a_chain_lists_its_open_topics,
     );
 }
 
@@ -1382,6 +1433,7 @@ mod cluster_redis {
     // A Workflow id's chains hash to different slots, so the delete reaches every primary.
     conformance!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true);
         deleting_an_owner_drops_every_chain_of_it,
+        a_chain_lists_its_open_topics,
     );
 }
 
@@ -1391,5 +1443,6 @@ mod documented_acl_redis {
     // The page names the one rule a delete needs beyond the others.
     conformance!(super::on_redis::redis_as_documented_user(&["+scan"]);
         deleting_an_owner_drops_every_chain_of_it,
+        a_chain_lists_its_open_topics,
     );
 }

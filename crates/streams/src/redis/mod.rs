@@ -671,6 +671,49 @@ impl StreamStore for RedisStore {
             .collect()
     }
 
+    async fn open_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        // The chain's keys share one hash tag, so on a cluster they all sit on one primary. Each
+        // primary is scanned anyway, since the store doesn't track which one owns the slot. A
+        // scan walks the whole keyspace of a node, so it runs only when a chain ends.
+        let keys = ChainKeys::new(&self.prefix, chain);
+        let pattern = keys.meta_pattern();
+        let mut topics = vec![];
+        for node in self.shared.primaries().await.mapped(Call::Read)? {
+            let mut cursor = "0".to_string();
+            loop {
+                let (next, found) = self
+                    .shared
+                    .scan(node.as_ref(), &cursor, &pattern)
+                    .await
+                    .mapped(Call::Read)?;
+                if !found.is_empty() {
+                    let mut flags = redis::pipe();
+                    for key in &found {
+                        flags.hget(key, CLOSED_FIELD);
+                    }
+                    let closed: Vec<Option<String>> = flags
+                        .query_async(&mut self.shared.clone())
+                        .await
+                        .mapped(Call::Read)?;
+                    topics.extend(
+                        found
+                            .iter()
+                            .zip(closed)
+                            .filter(|(_, closed)| closed.is_none())
+                            .filter_map(|(key, _)| keys.topic_of_meta(key)),
+                    );
+                }
+                if next == "0" {
+                    break;
+                }
+                cursor = next;
+            }
+        }
+        topics.sort();
+        topics.dedup();
+        Ok(topics)
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
         if request.owner_kind != StreamOwnerKind::Workflow as i32 {
             return Err(StreamError::unsupported(format!(

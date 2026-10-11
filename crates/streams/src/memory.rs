@@ -417,6 +417,21 @@ impl StreamStore for MemoryStore {
             .unwrap_or_default())
     }
 
+    async fn open_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        let chains = self.chains.lock().unwrap();
+        Ok(chains
+            .get(&chain_key(chain))
+            .map(|chain| {
+                chain
+                    .topics
+                    .iter()
+                    .filter(|(_, topic)| !topic.closed)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
         if request.owner_kind != StreamOwnerKind::Workflow as i32 {
             return Err(StreamError::unsupported(format!(

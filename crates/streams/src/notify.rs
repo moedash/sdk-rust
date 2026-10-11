@@ -294,18 +294,6 @@ impl Notifier {
         });
     }
 
-    /// The topics of `chain` this process notified and still keeps a slot for.
-    fn topics_of(&self, chain: &ChainId) -> Vec<String> {
-        self.slots
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(key, _)| key)
-            .filter(|key| key.chain() == *chain)
-            .map(|key| key.topic.clone())
-            .collect()
-    }
-
     /// Tells the notifier of `chain`'s stream on `topic` that it moved to `position`. Never
     /// waits, and never fails: a notification that can't go is logged and dropped.
     pub fn notify(&self, chain: &ChainId, topic: &str, position: String, counter: i64) {
@@ -411,6 +399,32 @@ async fn close_position(
     Ok((cursor, counter))
 }
 
+/// Closes the notifier of `chain`'s stream on `topic` in the background, trying again until it
+/// lands or the server refuses it. Each try reads the newest position, so a failed read is tried
+/// again too.
+fn close_notifier_in_background(
+    inner: &Arc<dyn StreamStore>,
+    notifier: &Arc<Notifier>,
+    chain: &ChainId,
+    topic: &str,
+    result: Payload,
+) {
+    let (inner, closing) = (inner.clone(), notifier.clone());
+    let (chain, topic) = (chain.clone(), topic.to_string());
+    notifier.close_retrying(chain.clone(), topic.clone(), move || {
+        let (inner, notifier) = (inner.clone(), closing.clone());
+        let (chain, topic, result) = (chain.clone(), topic.clone(), result.clone());
+        async move {
+            let (cursor, counter) = close_position(inner.as_ref(), &chain, &topic)
+                .await
+                .map_err(|error| NotifyError::Failed(error.to_string()))?;
+            notifier
+                .close(&chain, &topic, cursor, counter, result)
+                .await
+        }
+    });
+}
+
 /// A store that notifies each stream's notifier after an append lands and after a Workflow's
 /// staged output becomes visible.
 ///
@@ -439,22 +453,7 @@ impl NotifyingStore {
     /// Closes the stream's notifier in the background, after the store closed the topic. It never
     /// fails the store close: the topic is closed, and only the callers wait for the notifier.
     fn close_notifier_in_background(&self, chain: &ChainId, topic: &str, result: Payload) {
-        let inner = self.inner.clone();
-        let notifier = self.notifier.clone();
-        let (chain, topic) = (chain.clone(), topic.to_string());
-        self.notifier
-            .close_retrying(chain.clone(), topic.clone(), move || {
-                let (inner, notifier) = (inner.clone(), notifier.clone());
-                let (chain, topic, result) = (chain.clone(), topic.clone(), result.clone());
-                async move {
-                    let (cursor, counter) = close_position(inner.as_ref(), &chain, &topic)
-                        .await
-                        .map_err(|error| NotifyError::Failed(error.to_string()))?;
-                    notifier
-                        .close(&chain, &topic, cursor, counter, result)
-                        .await
-                }
-            });
+        close_notifier_in_background(&self.inner, &self.notifier, chain, topic, result);
     }
 
     fn notify_at(&self, chain: &ChainId, topic: &str, position: &str) {
@@ -552,11 +551,34 @@ impl StreamStore for NotifyingStore {
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
         self.inner.close_chain(chain).await?;
-        // A stream ends when its store topic closes, so each topic this process notified ends on
-        // the server too.
-        for topic in self.notifier.topics_of(chain) {
-            self.close_notifier_in_background(chain, &topic, Payload::default());
-        }
+        // A stream ends when its store topic closes. Another process may have written some of the
+        // chain's topics, so the store lists them, and each one ends on the server too.
+        let (inner, notifier) = (self.inner.clone(), self.notifier.clone());
+        let listed = chain.clone();
+        self.notifier
+            .close_retrying(chain.clone(), String::new(), move || {
+                let (inner, notifier, chain) = (inner.clone(), notifier.clone(), listed.clone());
+                async move {
+                    // A topic closed with close_topic already closes its own notifier, with the
+                    // result it was given. The first close the server sees wins.
+                    let mut topics = inner
+                        .open_topics(&chain)
+                        .await
+                        .map_err(|error| NotifyError::Failed(error.to_string()))?;
+                    topics.sort();
+                    topics.dedup();
+                    for topic in topics {
+                        close_notifier_in_background(
+                            &inner,
+                            &notifier,
+                            &chain,
+                            &topic,
+                            Payload::default(),
+                        );
+                    }
+                    Ok(())
+                }
+            });
         Ok(())
     }
 
@@ -573,6 +595,10 @@ impl StreamStore for NotifyingStore {
 
     async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>> {
         self.inner.pending_stages(chain).await
+    }
+
+    async fn open_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        self.inner.open_topics(chain).await
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
@@ -1252,5 +1278,56 @@ mod tests {
         store.flush_notifications().await;
         tokio::time::sleep(CLOSE_RETRY_CAP * 2).await;
         assert_eq!(client.at.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_chain_end_closes_streams_another_process_notified() {
+        let recorder = Arc::new(Recorder::default());
+        let inner = Arc::new(MemoryStore::new());
+        let run = chain("run-1");
+        // Written by another Worker, or by this one before it restarted.
+        inner.append(append_request(&run, "a", 1)).await.unwrap();
+        inner.append(append_request(&run, "b", 1)).await.unwrap();
+        let store = NotifyingStore::new(inner, Arc::new(Notifier::new(recorder.clone(), 10)));
+        store.close_chain(&run).await.unwrap();
+        store.flush_notifications().await;
+        let mut closed: Vec<(String, i64)> = recorder
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.close_result.is_some())
+            .map(|n| (n.topic.clone(), n.counter))
+            .collect();
+        closed.sort();
+        assert_eq!(
+            closed,
+            [("a".to_string(), 2), ("b".to_string(), 2)],
+            "every topic the store holds ends on the server, or its callers wait for ever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_end_leaves_a_topic_closed_with_its_own_result() {
+        let recorder = Arc::new(Recorder::default());
+        let (_, store) = notifying_store(&recorder);
+        let run = chain("run-1");
+        store.append(append_request(&run, "a", 1)).await.unwrap();
+        store.close_topic(&run, "a", Some(summary())).await.unwrap();
+        store.close_chain(&run).await.unwrap();
+        store.flush_notifications().await;
+        let closes: Vec<Option<Payload>> = recorder
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.topic == "a" && n.close_result.is_some())
+            .map(|n| n.close_result.clone())
+            .collect();
+        assert_eq!(
+            closes,
+            [Some(summary())],
+            "the server keeps the first close, so the chain end mustn't race the Workflow's"
+        );
     }
 }

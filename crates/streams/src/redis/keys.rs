@@ -78,6 +78,52 @@ pub(crate) fn session_field(producer_id: &str, attempt: i64) -> String {
     format!("hw:{}:{producer_id}:{attempt}", producer_id.len())
 }
 
+impl ChainKeys {
+    /// The pattern that matches the meta key of every topic of the chain. Every topic the chain
+    /// knows has one, since the meta is the topic's tombstone.
+    pub(crate) fn meta_pattern(&self) -> String {
+        format!("{}:t:*:meta", glob_escape(&self.base))
+    }
+
+    /// The topic a meta key names, or `None` for a key that isn't a topic's meta.
+    pub(crate) fn topic_of_meta(&self, key: &str) -> Option<String> {
+        let encoded = key
+            .strip_prefix(&format!("{}:t:", self.base))?
+            .strip_suffix(":meta")?;
+        unpart(encoded)
+    }
+}
+
+/// Escapes the characters a `SCAN MATCH` pattern treats as wildcards.
+fn glob_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Undoes [part].
+fn unpart(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = encoded.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The pattern that matches every key of one Workflow id, across all its chains.
 pub(crate) fn owner_pattern(prefix: &str, namespace: &str, workflow_id: &str) -> String {
     format!(

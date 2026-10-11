@@ -89,6 +89,14 @@ pub trait StreamStore: Send + Sync {
     /// The chain's stages that no one has promoted or aborted yet, for crash repair.
     async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>>;
 
+    /// The topics of a chain that the store knows and that [StreamStore::close_topic] hasn't
+    /// closed, in no particular order. A staged topic shows once its stage is promoted. A store
+    /// that can't list its topics answers none.
+    async fn open_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        let _ = chain;
+        Ok(vec![])
+    }
+
     /// Deletes every stream and stage of one owner, across all its chains.
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
 
