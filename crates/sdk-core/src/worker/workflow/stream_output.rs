@@ -1055,6 +1055,80 @@ mod tests {
             assert_eq!(sent[0].chain.first_run_id, "run");
         }
 
+        /// A Worker's output store over memory that notifies `recorder`.
+        fn notifying_output(recorder: &Arc<Recorder>) -> OutputStore {
+            let notifying = Arc::new(temporalio_streams::NotifyingStore::new(
+                Arc::new(temporalio_streams::MemoryStore::new()),
+                Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
+            ));
+            OutputStore::new(notifying, "ns".to_string(), Default::default())
+        }
+
+        /// Waits until the background store close has sent its notifier close, then until every
+        /// notification is out.
+        async fn closed_on_the_server(store: &OutputStore, recorder: &Recorder) {
+            for _ in 0..500 {
+                if recorder.0.lock().iter().any(|n| n.close_result.is_some()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            store.flush_notifications().await;
+        }
+
+        fn progress_and_closes(recorder: &Recorder) -> Vec<(String, i64, Option<Vec<u8>>)> {
+            recorder
+                .0
+                .lock()
+                .iter()
+                .map(|n| {
+                    let result = n.close_result.as_ref().map(|result| result.data.clone());
+                    (n.topic.clone(), n.counter, result)
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_workflow_close_ends_the_stream_on_the_server_after_its_output() {
+            let recorder = Arc::new(Recorder::default());
+            let store = notifying_output(&recorder);
+            let mut closed = batch("a");
+            closed.closes = vec![closing("t", "done")];
+            store.stage(std::slice::from_ref(&closed)).await.unwrap();
+            store
+                .settle("run", vec![closed], CompletionOutcome::Accepted)
+                .await;
+            closed_on_the_server(&store, &recorder).await;
+            assert_eq!(
+                progress_and_closes(&recorder),
+                [
+                    ("t".to_string(), 1, None),
+                    ("t".to_string(), 2, Some(b"done".to_vec())),
+                ],
+                "the close comes after the output's progress and outranks it"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_close_replay_proves_ends_the_stream_on_the_server() {
+            let recorder = Arc::new(Recorder::default());
+            let store = notifying_output(&recorder);
+            store.stage(&[batch("a")]).await.unwrap();
+            let mut replayed = proven("a");
+            replayed.closes = vec![closing("t", "done")];
+            store
+                .promote_proven("run", std::slice::from_ref(&replayed))
+                .await;
+            closed_on_the_server(&store, &recorder).await;
+            assert_eq!(
+                progress_and_closes(&recorder),
+                [
+                    ("t".to_string(), 1, None),
+                    ("t".to_string(), 2, Some(b"done".to_vec())),
+                ]
+            );
+        }
+
         #[tokio::test]
         async fn a_stopping_worker_waits_for_its_stream_notifications() {
             let log = Arc::new(Log::default());
