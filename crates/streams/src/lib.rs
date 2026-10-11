@@ -13,6 +13,7 @@ mod cursor;
 mod error;
 mod handle;
 mod memory;
+mod notify;
 mod owner;
 mod reader;
 mod record;
@@ -27,6 +28,10 @@ pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
 pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
 pub use memory::MemoryStore;
+pub use notify::{
+    DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, Notifier, NotifierClient, NotifyError, NotifyingStore,
+    StreamNotification, progress_counter,
+};
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{DEFAULT_MAX_RECORDS, ReadTarget, read_page};
 pub use record::{
