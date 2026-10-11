@@ -30,8 +30,8 @@ use temporalio_common::{
             workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_commands::{
                 ActivityCancellationType, CompleteWorkflowExecution,
-                ContinueAsNewWorkflowExecution, OutputRecord, WorkflowOutputStreamCommit,
-                workflow_command,
+                ContinueAsNewWorkflowExecution, FailWorkflowExecution, OutputRecord,
+                WorkflowOutputStreamCommit, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
@@ -2104,8 +2104,11 @@ async fn the_chain_close_is_retried_until_it_lands() {
     assert_eq!(*store.close_attempts.lock(), 3);
 }
 
+#[rstest::rstest]
+#[case::retried_after_a_failure(FailWorkflowExecution::default().into())]
+#[case::cron_after_a_completion(complete())]
 #[tokio::test]
-async fn a_chain_whose_latest_run_still_runs_stays_open() {
+async fn a_chain_whose_latest_run_still_runs_stays_open(#[case] last: workflow_command::Variant) {
     // A retried or cron run follows in the same chain, so the chain's streams stay open.
     fn successor_running(first_run_id: &str) -> DescribeWorkflowExecutionResponse {
         DescribeWorkflowExecutionResponse {
@@ -2118,7 +2121,7 @@ async fn a_chain_whose_latest_run_still_runs_stays_open() {
         }
     }
     let store = Arc::new(RecordingStore::default());
-    let (worker, _) = final_task(store.clone(), true, complete(), Some(successor_running)).await;
+    let (worker, _) = final_task(store.clone(), true, last, Some(successor_running)).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     worker.drain_pollers_and_shutdown().await;
     assert!(store.closed().is_empty());
