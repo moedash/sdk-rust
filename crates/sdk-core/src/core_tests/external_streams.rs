@@ -110,7 +110,10 @@ fn manifest_for(
 }
 
 fn output_commit_command(records: Vec<OutputRecord>) -> workflow_command::Variant {
-    workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit { records })
+    workflow_command::Variant::WorkflowOutputStreamCommit(WorkflowOutputStreamCommit {
+        records,
+        closes: vec![],
+    })
 }
 
 fn output_marker(

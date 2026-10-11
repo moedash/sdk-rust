@@ -1784,6 +1784,7 @@ mod tests {
                     kind: StreamRecordKind::Finish as i32,
                     ..Default::default()
                 }],
+                closes: vec![],
             }
         }
 
