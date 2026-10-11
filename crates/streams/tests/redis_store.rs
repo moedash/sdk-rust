@@ -901,7 +901,11 @@ async fn a_topic_closed_before_its_first_write_still_expires() {
         return;
     };
     let chain = chain();
-    setup.store.close_topic(&chain, "events").await.unwrap();
+    setup
+        .store
+        .close_topic(&chain, "events", None)
+        .await
+        .unwrap();
     let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
     let closed: Option<String> = setup.raw.hget(&meta, "closed").await.unwrap();
     assert_eq!(closed.as_deref(), Some("1"));
