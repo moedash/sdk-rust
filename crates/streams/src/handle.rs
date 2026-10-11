@@ -461,7 +461,7 @@ impl Streams {
                     .close_stream(&chain, &stream.topic, result)
                     .await?
             }
-            None => self.store.close_topic(&chain, &stream.topic).await?,
+            None => self.store.close_topic(&chain, &stream.topic, None).await?,
         }
         Ok(CloseResponse {})
     }

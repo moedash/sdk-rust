@@ -560,9 +560,14 @@ impl StreamStore for NotifyingStore {
         Ok(())
     }
 
-    async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
-        self.inner.close_topic(chain, topic).await?;
-        self.close_notifier_in_background(chain, topic, Payload::default());
+    async fn close_topic(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        result: Option<Payload>,
+    ) -> StreamResult<()> {
+        self.inner.close_topic(chain, topic, result.clone()).await?;
+        self.close_notifier_in_background(chain, topic, result.unwrap_or_default());
         Ok(())
     }
 
@@ -580,7 +585,9 @@ impl StreamStore for NotifyingStore {
         topic: &str,
         result: Payload,
     ) -> StreamResult<()> {
-        self.inner.close_topic(chain, topic).await?;
+        self.inner
+            .close_topic(chain, topic, Some(result.clone()))
+            .await?;
         let (cursor, counter) = close_position(self.inner.as_ref(), chain, topic).await?;
         self.notifier
             .close(chain, topic, cursor, counter, result)
@@ -914,8 +921,8 @@ mod tests {
         async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
             self.0.close_chain(c).await
         }
-        async fn close_topic(&self, c: &ChainId, t: &str) -> StreamResult<()> {
-            self.0.close_topic(c, t).await
+        async fn close_topic(&self, c: &ChainId, t: &str, r: Option<Payload>) -> StreamResult<()> {
+            self.0.close_topic(c, t, r).await
         }
         async fn pending_stages(&self, c: &ChainId) -> StreamResult<Vec<PendingStage>> {
             self.0.pending_stages(c).await
@@ -1010,7 +1017,7 @@ mod tests {
         let run = chain("run-1");
         store.append(append_request(&run, "a", 1)).await.unwrap();
         store.append(append_request(&run, "b", 1)).await.unwrap();
-        store.close_topic(&run, "a").await.unwrap();
+        store.close_topic(&run, "a", None).await.unwrap();
         store.flush_notifications().await;
         assert_eq!(store.notifier().slots.lock().unwrap().len(), 1);
         store.close_chain(&run).await.unwrap();
@@ -1211,7 +1218,7 @@ mod tests {
     async fn a_failed_notifier_close_is_retried_with_backoff_until_it_lands() {
         let client = flaky(3, false);
         let store = closing_through(client.clone()).await;
-        store.close_topic(&chain("run-1"), "t").await.unwrap();
+        store.close_topic(&chain("run-1"), "t", None).await.unwrap();
         store.flush_notifications().await;
         let at = client.at.lock().unwrap().clone();
         assert_eq!(at.len(), 4, "three failures, then it lands");
@@ -1230,7 +1237,7 @@ mod tests {
     async fn the_notifier_close_retry_waits_at_most_the_cap() {
         let client = flaky(12, false);
         let store = closing_through(client.clone()).await;
-        store.close_topic(&chain("run-1"), "t").await.unwrap();
+        store.close_topic(&chain("run-1"), "t", None).await.unwrap();
         store.flush_notifications().await;
         let at = client.at.lock().unwrap().clone();
         let longest = at.windows(2).map(|pair| pair[1] - pair[0]).max().unwrap();
@@ -1241,7 +1248,7 @@ mod tests {
     async fn a_notifier_close_the_server_refuses_is_not_retried() {
         let client = flaky(0, true);
         let store = closing_through(client.clone()).await;
-        store.close_topic(&chain("run-1"), "t").await.unwrap();
+        store.close_topic(&chain("run-1"), "t", None).await.unwrap();
         store.flush_notifications().await;
         tokio::time::sleep(CLOSE_RETRY_CAP * 2).await;
         assert_eq!(client.at.lock().unwrap().len(), 1);

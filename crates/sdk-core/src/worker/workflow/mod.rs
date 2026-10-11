@@ -200,6 +200,7 @@ impl Workflows {
             Arc::new(stream_output::OutputStore::new(
                 store,
                 basics.worker_config.namespace.clone(),
+                basics.shutdown_token.clone(),
             ))
         });
         let extracted_wft_stream = WFTExtractor::build(
