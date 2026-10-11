@@ -1109,3 +1109,91 @@ async fn rule_20_4_a_malformed_entry_fails_with_its_cursor() {
     .unwrap();
     assert_eq!(after.records.len(), 1);
 }
+
+/// Records the stream notifications it was sent.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<temporalio_streams::StreamNotification>>);
+
+#[async_trait::async_trait]
+impl temporalio_streams::NotifierClient for Recorder {
+    async fn notify(
+        &self,
+        notification: temporalio_streams::StreamNotification,
+    ) -> Result<(), temporalio_streams::NotifyError> {
+        self.0.lock().unwrap().push(notification);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn notification_counters_come_from_redis_entry_ids_and_grow_with_the_stream() {
+    let Some(setup) = setup().await else { return };
+    let recorder = Arc::new(Recorder::default());
+    let store = temporalio_streams::NotifyingStore::new(
+        Arc::new(setup.store),
+        Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
+    );
+    let chain = chain();
+    let mut positions = vec![];
+    for sequence in [1, 3] {
+        let digest = [sequence as u8];
+        let landed = store
+            .append(append(&chain, "p", sequence, 2, &digest))
+            .await
+            .unwrap();
+        positions.push(landed.last_position);
+        store.flush_notifications().await;
+    }
+    store
+        .stage(StagedBatch {
+            chain: Some(chain.clone()),
+            run_id: "run-1".to_string(),
+            token: "token".to_string(),
+            history_floor_event_id: 3,
+            records: vec![StagedRecord {
+                topic: "events".to_string(),
+                record: record("events", "workflow", 1),
+            }],
+        })
+        .await
+        .unwrap();
+    let promoted = store
+        .promote(&StageRef {
+            chain: Some(chain.clone()),
+            token: "token".to_string(),
+            topics: vec!["events".to_string()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(promoted.outcome(), PromoteOutcome::Promoted);
+    store.flush_notifications().await;
+    let latest = store
+        .latest(StoreLatestRequest {
+            chain: Some(chain.clone()),
+            topic: "events".to_string(),
+        })
+        .await
+        .unwrap()
+        .position;
+    positions.push(latest);
+
+    let counters: Vec<i64> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|n| n.counter)
+        .collect();
+    let expected: Vec<i64> = positions
+        .iter()
+        .map(|position| {
+            let (milliseconds, sequence) = position.split_once('-').expect("an entry id");
+            (milliseconds.parse::<i64>().unwrap() << 20) | sequence.parse::<i64>().unwrap()
+        })
+        .collect();
+    assert_eq!(counters, expected);
+    assert!(
+        counters.windows(2).all(|pair| pair[0] < pair[1]),
+        "{counters:?}"
+    );
+}
