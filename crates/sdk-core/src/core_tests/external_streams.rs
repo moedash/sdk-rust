@@ -1985,3 +1985,67 @@ async fn replay_promotes_what_history_proves_and_the_next_completion_aborts_the_
         ]
     );
 }
+
+#[tokio::test]
+async fn a_failed_task_publishes_nothing() {
+    // The first activation commits and waits on a local activity. The second fails, so the task
+    // fails before any completion reports the commit, and nothing reaches the store.
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_workflow_task_scheduled_and_started();
+    let store = Arc::new(RecordingStore::default());
+    let failed = Arc::new(Notify::new());
+    let notify = failed.clone();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.num_expected_completions = Some(TimesRange::from(0));
+    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, _, failure| {
+        let matches = failure
+            .as_ref()
+            .is_some_and(|f| f.message.contains("the workflow broke"));
+        if matches {
+            notify.notify_one();
+        }
+        matches
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    let worker_store = store.clone();
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(worker_store);
+        w.task_types = WorkerTaskTypes {
+            enable_local_activities: true,
+            ..WorkerTaskTypes::workflow_only()
+        };
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                output_commit_command(records(&["a"])),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = run_local_activity(&worker).await;
+    assert!(only_resolves_local_activity(&resolved, 1));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::fail(
+            first.run_id,
+            Failure {
+                message: "the workflow broke".to_string(),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    failed_within_deadline(&failed).await;
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+    assert!(store.staged().is_empty());
+}
