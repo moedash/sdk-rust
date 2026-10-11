@@ -119,6 +119,11 @@ message AppendRequest {
   // The first record's position within the producer attempt, from one.
   int64 sequence = 4;
   repeated AppendRecord records = 5;
+  // The batch's identity, which the store compares when the producer repeats its newest batch.
+  // Lang takes it before the codec, as the SHA-256 over each converted record as its length in 8
+  // bytes big-endian, then its deterministic serialization. Every SDK takes it this way, so a
+  // retry through another SDK or release still dedupes. Required.
+  bytes digest = 6;
 }
 
 message AppendResponse {
