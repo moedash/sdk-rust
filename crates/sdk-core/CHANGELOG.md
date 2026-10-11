@@ -56,6 +56,10 @@ relevant information.
   and producers are refused. It checks the chain's latest run first and leaves the streams open
   for a retry or cron successor. A failed close is retried with backoff until it lands or the
   Worker stops.
+* Experimental: behind `streams`, `streams::connect_stream_service` builds one stream store from
+  a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
+  latest, close and owner delete, as serialized `coresdk.streams` requests. Its store goes to each
+  Worker's `stream_store`, so a Workflow's output and outside producers share it.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
