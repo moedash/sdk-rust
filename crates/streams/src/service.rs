@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_close_without_a_result_leaves_the_notifier_alone() {
+    async fn a_close_without_a_result_ends_the_stream_on_the_server_with_an_empty_result() {
         let recorder = Arc::new(Recorder::default());
         let service = service_notifying(true, recorder.clone()).await;
         service
@@ -549,6 +549,8 @@ mod tests {
             .await
             .unwrap();
         flush(&service).await;
-        assert!(recorder.0.lock().unwrap().is_empty());
+        let sent = recorder.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].close_result, Some(Payload::default()));
     }
 }
