@@ -913,6 +913,7 @@ impl ManagedRun {
                 workflow_id: self.wfm.machines.workflow_id.clone(),
                 first_run_id: self.wfm.machines.first_execution_run_id.clone(),
                 topics: recorded.topics.iter().map(|t| t.topic.clone()).collect(),
+                closes: commit.closes.clone(),
             });
             check_replayed_output_manifest(replayed, recorded)?;
             // History proves the commit, but the Worker that staged it may have stopped before
@@ -948,6 +949,7 @@ impl ManagedRun {
             run_id: self.wfm.machines.run_id.clone(),
             first_run_id: self.wfm.machines.first_execution_run_id.clone(),
             records: commit.records,
+            closes: commit.closes,
         };
         let terminal_boundary = if commands.iter().any(|c| c.variant.is_terminal()) {
             ExternalStreamBoundary::WorkflowCompleted

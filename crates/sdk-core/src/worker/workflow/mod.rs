@@ -197,7 +197,11 @@ impl Workflows {
         let shutdown_token = basics.shutdown_token.clone();
         #[cfg(feature = "streams")]
         let output_store = basics.worker_config.stream_store.clone().map(|store| {
-            stream_output::OutputStore::new(store, basics.worker_config.namespace.clone())
+            stream_output::OutputStore::new(
+                store,
+                basics.worker_config.namespace.clone(),
+                basics.shutdown_token.clone(),
+            )
         });
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
