@@ -11,11 +11,12 @@ use crate::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
         PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
+        StreamOwnerKind,
     },
 };
 use conn::{BlockingPool, Shared};
 use errors::{Call, Mapped};
-use keys::{ChainKeys, session_field};
+use keys::{ChainKeys, owner_pattern, session_field};
 use redis::{Cmd, Value, streams::StreamReadReply};
 use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
@@ -25,6 +26,7 @@ const RECORD_FIELD: &str = "r";
 const TOMBSTONE_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const STAGE_SEPARATOR: char = '\x1f';
 const CLOSED_FIELD: &str = "closed";
+const DELETE_BATCH: usize = 500;
 
 /// How to reach Redis and how long streams live there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -655,13 +657,40 @@ impl StreamStore for RedisStore {
             .collect()
     }
 
-    async fn delete_owner(
-        &self,
-        _request: DeleteOwnerRequest,
-    ) -> StreamResult<DeleteOwnerResponse> {
-        Err(StreamError::unsupported(
-            "the Redis store does not delete owners yet",
-        ))
+    async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
+        if request.owner_kind != StreamOwnerKind::Workflow as i32 {
+            return Err(StreamError::unsupported(format!(
+                "this release keeps streams of Workflows only, not owner kind {}",
+                request.owner_kind
+            )));
+        }
+        // A Workflow id's chains hash to different slots, so every primary is scanned. Some keys
+        // may be gone when a later step fails, which is why a failure leaves the outcome unknown.
+        let pattern = owner_pattern(&self.prefix, &request.namespace, &request.workflow_id);
+        let mut deleted = 0;
+        for node in self.shared.primaries().await.mapped(Call::Write)? {
+            let mut cursor = "0".to_string();
+            loop {
+                let (next, keys) = self
+                    .shared
+                    .scan(node.as_ref(), &cursor, &pattern)
+                    .await
+                    .mapped(Call::Write)?;
+                for batch in keys.chunks(DELETE_BATCH) {
+                    let removed: u64 = redis::cmd("UNLINK")
+                        .arg(batch)
+                        .query_async(&mut self.shared.clone())
+                        .await
+                        .mapped(Call::Write)?;
+                    deleted += removed;
+                }
+                if next == "0" {
+                    break;
+                }
+                cursor = next;
+            }
+        }
+        Ok(DeleteOwnerResponse { deleted })
     }
 }
 

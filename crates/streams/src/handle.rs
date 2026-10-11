@@ -8,9 +8,10 @@ use crate::{
     append_digest, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
-        AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, LatestRequest,
-        LatestResponse, PromoteOutcome, ReadRequest, ReadResponse, StageRef, StoreAppendRequest,
-        StoreLatestRequest, StreamAddress, StreamOwnerKind, append_request::Producer,
+        AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, DeleteOwnerRequest,
+        DeleteOwnerResponse, LatestRequest, LatestResponse, PromoteOutcome, ReadRequest,
+        ReadResponse, StageRef, StoreAppendRequest, StoreLatestRequest, StreamAddress,
+        StreamOwnerKind, append_request::Producer,
     },
     reader::{ReadState, read_with},
     repair::{Decision, decide_token},
@@ -451,6 +452,27 @@ impl Streams {
         let chain = self.chain(stream).await?;
         self.store.close_topic(&chain, &stream.topic).await?;
         Ok(CloseResponse {})
+    }
+
+    /// Deletes every stream of one owner, across all its chains. It asks Temporal nothing, so it
+    /// works after the owner is gone. Delete only after the chain closed and its producers
+    /// stopped, since a late append writes a fresh stream with no dedupe state and no close mark.
+    pub async fn delete_owner(
+        &self,
+        request: DeleteOwnerRequest,
+    ) -> StreamResult<DeleteOwnerResponse> {
+        if request.owner_kind != StreamOwnerKind::Workflow as i32 {
+            return Err(StreamError::unsupported(format!(
+                "this release keeps streams of Workflows only, not owner kind {}",
+                request.owner_kind
+            )));
+        }
+        if request.namespace.is_empty() || request.workflow_id.is_empty() {
+            return Err(StreamError::refused(
+                "a delete needs the namespace and the owner's Workflow id",
+            ));
+        }
+        self.store.delete_owner(request).await
     }
 
     /// The chain a producer writes on, asking about the owner when the producer is new or its
@@ -1692,5 +1714,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(values(&page), ["1"]);
+    }
+
+    #[tokio::test]
+    async fn an_owner_delete_asks_temporal_nothing() {
+        let setup = setup(StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let before = setup.owners.describes();
+        let request = DeleteOwnerRequest {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: "wf".to_string(),
+        };
+        assert!(
+            setup
+                .streams
+                .delete_owner(request.clone())
+                .await
+                .unwrap()
+                .deleted
+                > 0
+        );
+        assert_eq!(setup.owners.describes(), before);
+        for (field, refused) in [
+            ("namespace", StreamFailureKind::Refused),
+            ("workflow_id", StreamFailureKind::Refused),
+            ("owner_kind", StreamFailureKind::Unsupported),
+        ] {
+            let mut bad = request.clone();
+            match field {
+                "namespace" => bad.namespace.clear(),
+                "workflow_id" => bad.workflow_id.clear(),
+                _ => bad.owner_kind = StreamOwnerKind::Unspecified as i32,
+            }
+            assert_eq!(
+                kind(setup.streams.delete_owner(bad).await),
+                refused,
+                "{field}"
+            );
+        }
     }
 }
