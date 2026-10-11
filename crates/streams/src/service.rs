@@ -460,4 +460,58 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Refused);
     }
+
+    #[tokio::test]
+    async fn a_close_with_a_result_closes_the_store_and_then_the_notifier() {
+        let recorder = Arc::new(Recorder::default());
+        let service = service_notifying(true, recorder.clone()).await;
+        service
+            .call("Append", &append(1, &["a", "b"]))
+            .await
+            .unwrap();
+        flush(&service).await;
+        let result = Payload {
+            data: b"summary".to_vec(),
+            ..Default::default()
+        };
+        service
+            .call(
+                "Close",
+                &CloseRequest {
+                    stream: Some(address()),
+                    result: Some(result.clone()),
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        let sent = recorder.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].close_result, Some(result));
+        assert_eq!(sent[1].counter, 3, "above the newest record's counter");
+        let refused = service
+            .call("Append", &append(3, &["c"]))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, StreamFailureKind::Closed as i32);
+    }
+
+    #[tokio::test]
+    async fn a_close_without_a_result_leaves_the_notifier_alone() {
+        let recorder = Arc::new(Recorder::default());
+        let service = service_notifying(true, recorder.clone()).await;
+        service
+            .call(
+                "Close",
+                &CloseRequest {
+                    stream: Some(address()),
+                    result: None,
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        flush(&service).await;
+        assert!(recorder.0.lock().unwrap().is_empty());
+    }
 }

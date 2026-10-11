@@ -196,6 +196,10 @@ message LatestResponse {
 
 message CloseRequest {
   StreamAddress stream = 1;
+  // When set, the stream's notifier on the server closes too, once the store has, and every
+  // stream-returning Nexus operation that handed out the stream completes with it. After lang's
+  // payload codec. Needs the store config's `notify_on_append`.
+  temporal.api.common.v1.Payload result = 2;
 }
 
 message CloseResponse {}

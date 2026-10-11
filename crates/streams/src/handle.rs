@@ -349,11 +349,20 @@ impl Streams {
         })
     }
 
-    /// Closes one stream, so producers' new batches are refused and reads end.
+    /// Closes one stream, so producers' new batches are refused and reads end. With a result, the
+    /// stream's notifier closes too, and fails the call when the server doesn't take it, since
+    /// the close completes every caller's operation.
     pub async fn close(&self, request: CloseRequest) -> StreamResult<CloseResponse> {
         let stream = address(request.stream.as_ref())?;
         let chain = self.chain(stream).await?;
-        self.store.close_topic(&chain, &stream.topic).await?;
+        match request.result {
+            Some(result) => {
+                self.store
+                    .close_stream(&chain, &stream.topic, result)
+                    .await?
+            }
+            None => self.store.close_topic(&chain, &stream.topic).await?,
+        }
         Ok(CloseResponse {})
     }
 
@@ -1076,6 +1085,7 @@ mod tests {
             .streams
             .close(CloseRequest {
                 stream: Some(stream("out")),
+                result: None,
             })
             .await
             .unwrap();
@@ -1315,6 +1325,7 @@ mod tests {
             .streams
             .close(CloseRequest {
                 stream: Some(stream("out")),
+                result: None,
             })
             .await
             .unwrap();
