@@ -397,8 +397,10 @@ impl Workflows {
                     close,
                 } = stream_output.map(|o| *o).unwrap_or_default();
                 #[cfg(feature = "streams")]
+                let mut topic_closes = vec![];
+                #[cfg(feature = "streams")]
                 if let Some(store) = &self.output_store {
-                    store.promote_proven(run_id, &proven).await;
+                    topic_closes = store.promote_proven(run_id, &proven).await;
                 }
                 #[cfg(not(feature = "streams"))]
                 let _ = proven;
@@ -550,13 +552,14 @@ impl Workflows {
                 .await;
                 #[cfg(feature = "streams")]
                 if let Some(store) = &self.output_store {
-                    store.settle(run_id, output, output_outcome).await;
+                    topic_closes.extend(store.settle(run_id, output, output_outcome).await);
                     if let Some(chain) = close
                         && output_outcome == stream_output::CompletionOutcome::Accepted
                     {
                         store.close_after_final_task(
                             self.client.clone(),
                             chain,
+                            topic_closes,
                             self.shutdown_token.clone(),
                         );
                     }
