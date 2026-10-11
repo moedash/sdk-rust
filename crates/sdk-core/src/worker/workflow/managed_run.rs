@@ -17,7 +17,8 @@ use crate::{
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             stream_output::{
-                MARKER_SCHEMA_VERSION, build_output_manifest, check_replayed_output_manifest,
+                MARKER_SCHEMA_VERSION, build_output_manifest, check_output_closes,
+                check_replayed_output_manifest,
             },
         },
     },
@@ -890,6 +891,7 @@ impl ManagedRun {
         let Some(commit) = take_output_stream_commit(commands)? else {
             return Ok(());
         };
+        check_output_closes(&commit.records, &commit.closes)?;
         if self.wfm.machines.replaying {
             let replayed = build_output_manifest(
                 &commit.records,
@@ -1797,6 +1799,7 @@ mod tests {
                     kind: StreamRecordKind::Finish as i32,
                     ..Default::default()
                 }],
+                closes: vec![],
             }
         }
 
