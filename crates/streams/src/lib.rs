@@ -18,6 +18,7 @@ mod reader;
 mod record;
 #[cfg(feature = "redis")]
 mod redis;
+mod repair;
 mod store;
 
 #[cfg(feature = "redis")]
@@ -32,6 +33,7 @@ pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, append_digest, stored_append_record,
     stored_output_record,
 };
+pub use repair::{Decision, decide_token};
 pub use store::StreamStore;
 
 /// The protos stores and lang exchange.
