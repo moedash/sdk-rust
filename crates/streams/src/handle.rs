@@ -5,7 +5,7 @@
 
 use crate::{
     ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, activity_producer_id,
-    append_digest, mint_cursor,
+    check_append_digest, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, LatestRequest,
@@ -190,6 +190,7 @@ impl Streams {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
         }
+        check_append_digest(&request.digest)?;
         let chain = self
             .producer_chain(ProducerKey {
                 owner: owner_key(stream),
@@ -220,7 +221,9 @@ impl Streams {
                 producer_id,
                 attempt,
                 sequence: request.sequence,
-                digest: append_digest(&stream.topic, &request.records).to_vec(),
+                // Lang takes it before the codec, and only lang's own retries compare it, so the
+                // store keeps it as given.
+                digest: request.digest.clone(),
                 records,
             })
             .await?;
@@ -574,6 +577,7 @@ mod tests {
             StreamRecordKind,
         },
     };
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temporalio_common::protos::temporal::api::{
         common::v1::Payload, enums::v1::WorkflowExecutionStatus,
@@ -678,7 +682,6 @@ mod tests {
     }
 
     fn data(value: &str) -> AppendRecord {
-        use sha2::{Digest, Sha256};
         AppendRecord {
             kind: StreamRecordKind::Data as i32,
             body: Some(Payload {
@@ -698,6 +701,7 @@ mod tests {
             })),
             sequence,
             records: vec![data(value)],
+            digest: Sha256::digest(value.as_bytes()).to_vec(),
         }
     }
 
@@ -1322,5 +1326,64 @@ mod tests {
         let (delivered, _) = read_to_end(&setup.streams, Duration::from_secs(5)).await;
         assert_eq!(delivered, 1);
         assert_eq!(setup.owners.describes(), before);
+    }
+
+    /// The digest the Python SDK's Redis provider took over `[{"n": 1}, {"n": 2}]` from producer
+    /// `p`, attempt 1, sequence 1.
+    const PYTHON_DIGEST: &str = "0499768af1856bc6fd19cf6cf90e28e971099f1680e8347d70bdb4b65273f30f";
+
+    fn from_hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_retry_carrying_langs_digest_dedupes_and_the_store_keeps_it_unchanged() {
+        let setup = setup(StreamsOptions::default());
+        let mut request = append("p", 1, "1");
+        request.records.push(data("2"));
+        request.digest = from_hex(PYTHON_DIGEST);
+        let first = setup.streams.append(request.clone()).await.unwrap();
+        // A retry whose codec made other ciphertext still carries the same digest.
+        let mut retry = request.clone();
+        retry.records[0].body.as_mut().unwrap().data = b"other ciphertext".to_vec();
+        assert_eq!(setup.streams.append(retry).await.unwrap(), first);
+        // The store compares the bytes lang sent, so a store-level retry with them dedupes too.
+        let landed = setup
+            .store
+            .append(StoreAppendRequest {
+                chain: Some(chain("run-1")),
+                topic: "out".to_string(),
+                producer_id: "p".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: from_hex(PYTHON_DIGEST),
+                records: vec![b"\x1a\x03out".to_vec()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(landed.first_position, "0");
+        let mut divergent = request.clone();
+        divergent.digest = vec![7; 32];
+        assert_eq!(
+            kind(setup.streams.append(divergent).await),
+            StreamFailureKind::ProducerDivergent
+        );
+    }
+
+    #[tokio::test]
+    async fn an_append_without_langs_digest_is_refused_before_any_call() {
+        let setup = setup(StreamsOptions::default());
+        for digest in [Vec::new(), vec![1; 16]] {
+            let mut request = append("p", 1, "1");
+            request.digest = digest;
+            assert_eq!(
+                kind(setup.streams.append(request).await),
+                StreamFailureKind::Refused
+            );
+        }
+        assert_eq!(setup.owners.describes(), 0);
     }
 }
