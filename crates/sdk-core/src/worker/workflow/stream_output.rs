@@ -10,7 +10,7 @@ use temporalio_common::{
                 ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
                 ExternalOutputTopicManifest,
             },
-            workflow_commands::OutputRecord,
+            workflow_commands::{OutputClose, OutputRecord},
         },
         temporal::sdk::streams::v1::StreamRecordKind,
     },
@@ -214,6 +214,38 @@ pub(super) fn check_replayed_output_manifest(
             "External output committed while replaying differs from the manifest recorded in \
              History: committed {replayed:?}, recorded {recorded:?}"
         )));
+    }
+    Ok(())
+}
+
+/// Refuses closes the marker could not prove. Each close names a topic once, carries its result,
+/// and has its topic's FINISH record among the committed records.
+pub(super) fn check_output_closes(records: &[OutputRecord], closes: &[OutputClose]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for close in closes {
+        let reason = if close.topic.is_empty() {
+            Some("a close names no topic".to_string())
+        } else if !seen.insert(close.topic.as_str()) {
+            Some(format!("topic {:?} is closed twice", close.topic))
+        } else if close.result.is_none() {
+            Some(format!(
+                "the close of topic {:?} has no result",
+                close.topic
+            ))
+        } else if !records
+            .iter()
+            .any(|r| r.topic == close.topic && r.kind == StreamRecordKind::Finish as i32)
+        {
+            Some(format!(
+                "the close of topic {:?} has no FINISH record in the same commit",
+                close.topic
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(refused(reason));
+        }
     }
     Ok(())
 }
@@ -434,6 +466,32 @@ mod tests {
             check_replayed_output_manifest(manifest(), None),
             Err(WFMachinesError::Nondeterminism(message)) if message.contains("recorded none")
         ));
+    }
+
+    fn close(topic: &str) -> OutputClose {
+        OutputClose {
+            topic: topic.to_string(),
+            result: Some(Payload::default()),
+        }
+    }
+
+    #[test]
+    fn a_close_needs_its_topics_finish_in_the_same_commit() {
+        let records = [data("a", 1, 1), finish("a"), data("b", 2, 1)];
+        check_output_closes(&records, &[close("a")]).unwrap();
+        let mut no_result = close("a");
+        no_result.result = None;
+        for (closes, expected) in [
+            (vec![close("b")], "topic \"b\" has no FINISH"),
+            (vec![close("a"), close("a")], "closed twice"),
+            (vec![close("")], "names no topic"),
+            (vec![no_result], "has no result"),
+        ] {
+            let message = check_output_closes(&records, &closes)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
     }
 
     #[test]
