@@ -1693,8 +1693,9 @@ pub mod coresdk {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(
                         f,
-                        "WorkflowOutputStreamCommit({} record(s))",
-                        self.records.len()
+                        "WorkflowOutputStreamCommit({} record(s), {} close(s))",
+                        self.records.len(),
+                        self.closes.len()
                     )
                 }
             }
@@ -3262,7 +3263,8 @@ mod sdk_helpers {
             fn the_commit_command_converts_and_displays() {
                 use crate::protos::{
                     coresdk::workflow_commands::{
-                        OutputRecord, WorkflowCommand, WorkflowOutputStreamCommit, workflow_command,
+                        OutputClose, OutputRecord, WorkflowCommand, WorkflowOutputStreamCommit,
+                        workflow_command,
                     },
                     temporal::sdk::streams::v1::StreamRecordKind,
                 };
@@ -3282,11 +3284,15 @@ mod sdk_helpers {
                                 ..Default::default()
                             },
                         ],
+                        closes: vec![OutputClose {
+                            topic: "t".to_string(),
+                            result: Some(Payload::default()),
+                        }],
                     },
                 );
                 assert_eq!(
                     variant.to_string(),
-                    "WorkflowOutputStreamCommit(2 record(s))"
+                    "WorkflowOutputStreamCommit(2 record(s), 1 close(s))"
                 );
                 let command: WorkflowCommand = variant.into();
                 assert!(matches!(
