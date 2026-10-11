@@ -72,6 +72,18 @@ message WorkflowOutputStreamCommit {
     reserved 1;
     reserved "manifest";
     repeated OutputRecord records = 2;
+    // The topics this activation closed. Readers end once the output is promoted, and an
+    // operation that handed out a closed topic completes with its result. Each close needs its
+    // topic's FINISH record in `records`, so the marker proves it.
+    repeated OutputClose closes = 3;
+}
+
+// One topic a Workflow closed, with the result its readers' operations complete with.
+message OutputClose {
+    string topic = 1;
+    // After lang's payload codec. Sent again while replaying, since a close that History proves
+    // may still need sending.
+    temporal.api.common.v1.Payload result = 2;
 }
 
 // One record a Workflow published, in publish order across topics.

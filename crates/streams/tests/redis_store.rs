@@ -820,7 +820,21 @@ impl temporalio_streams::OwnerClient for OneOwner {
             run_id: "run-1".to_string(),
             first_run_id: "run-1".to_string(),
             status: *self.status.lock().unwrap(),
+            start_time: None,
         })
+    }
+
+    async fn history_after(
+        &self,
+        _namespace: &str,
+        _workflow_id: &str,
+        _run_id: &str,
+        _floor: i64,
+    ) -> Result<
+        Vec<temporalio_common::protos::temporal::api::history::v1::HistoryEvent>,
+        temporalio_streams::OwnerError,
+    > {
+        Ok(Vec::new())
     }
 }
 
@@ -866,6 +880,7 @@ async fn a_new_producer_marks_an_ended_chain_closed_until_it_expires() {
             kind: 2,
             ..Default::default()
         }],
+        digest: vec![1; 32],
     };
     streams.append(request("p")).await.unwrap();
     *owner.status.lock().unwrap() = WorkflowExecutionStatus::Terminated;
@@ -1108,4 +1123,389 @@ async fn rule_20_4_a_malformed_entry_fails_with_its_cursor() {
     .await
     .unwrap();
     assert_eq!(after.records.len(), 1);
+}
+
+/// Tests that change the server's eviction policy run one at a time.
+static POLICY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What the store logs while `connect` runs.
+async fn logs_of_connect(options: RedisStoreOptions) -> String {
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    RedisStore::connect(options).await.unwrap();
+    String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
+}
+
+async fn set_policy(url: &str, policy: &str) {
+    let mut admin = redis::Client::open(url)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory-policy")
+        .arg(policy)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_noeviction_server_is_not_warned_about() {
+    let Some(url) = url() else {
+        return;
+    };
+    let _serial = POLICY.lock().await;
+    set_policy(&url, "noeviction").await;
+    let logs = logs_of_connect(RedisStoreOptions::new(url)).await;
+    assert!(!logs.contains("maxmemory-policy"), "{logs}");
+}
+
+#[tokio::test]
+async fn an_evicting_server_is_warned_about() {
+    let Some(url) = url() else {
+        return;
+    };
+    let _serial = POLICY.lock().await;
+    set_policy(&url, "allkeys-lru").await;
+    let logs = logs_of_connect(RedisStoreOptions::new(url.clone())).await;
+    set_policy(&url, "noeviction").await;
+    assert!(logs.contains("allkeys-lru"), "{logs}");
+    assert_eq!(logs.matches("maxmemory-policy").count(), 1, "{logs}");
+}
+
+#[tokio::test]
+async fn a_server_that_refuses_config_is_not_warned_about() {
+    let Some(url) = url() else {
+        return;
+    };
+    let _serial = POLICY.lock().await;
+    set_policy(&url, "allkeys-lru").await;
+    // Managed services often refuse CONFIG, so the store goes on without the check.
+    let name = unique("no-config");
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(&name)
+        .arg("on")
+        .arg(">pw")
+        .arg("allkeys")
+        .arg("+@all")
+        .arg("-config")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let address = url.trim_start_matches("redis://");
+    let logs = logs_of_connect(RedisStoreOptions::new(format!(
+        "redis://{name}:pw@{address}"
+    )))
+    .await;
+    let _: () = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&name)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    set_policy(&url, "noeviction").await;
+    assert!(!logs.contains("maxmemory-policy"), "{logs}");
+}
+
+#[tokio::test]
+async fn an_evicting_primary_of_a_cluster_is_warned_about() {
+    let Ok(url) = std::env::var("STREAMS_REDIS_CLUSTER_URL") else {
+        eprintln!("set STREAMS_REDIS_CLUSTER_URL to run the Redis cluster tests");
+        return;
+    };
+    let _serial = POLICY.lock().await;
+    // One primary of three, so a check of only the seed would miss it.
+    let mut nodes = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let shards: String = redis::cmd("CLUSTER")
+        .arg("NODES")
+        .query_async(&mut nodes)
+        .await
+        .unwrap();
+    let seed = url
+        .trim_start_matches("redis://")
+        .split('/')
+        .next()
+        .unwrap();
+    let other = shards
+        .lines()
+        .filter(|line| line.contains("master"))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|address| address.split('@').next().unwrap().to_string())
+        .find(|address| !seed.ends_with(address.rsplit(':').next().unwrap()))
+        .unwrap();
+    let other_url = format!("redis://{other}/0");
+    set_policy(&other_url, "allkeys-lru").await;
+    let mut options = RedisStoreOptions::new(url);
+    options.cluster = true;
+    let logs = logs_of_connect(options).await;
+    set_policy(&other_url, "noeviction").await;
+    assert!(logs.contains("allkeys-lru"), "{logs}");
+    assert!(logs.contains(other.rsplit(':').next().unwrap()), "{logs}");
+}
+
+#[tokio::test]
+async fn the_documented_acl_is_the_python_sdks() {
+    // One rule set for every SDK, so an application's ACL keeps working across the move.
+    let Ok(checkout) = std::env::var("STREAMS_BROOK_PY") else {
+        eprintln!("set STREAMS_BROOK_PY to compare the documented ACL with the Python SDK's");
+        return;
+    };
+    let rules = |page: &str| -> Vec<String> {
+        page.lines()
+            .find_map(|line| line.strip_prefix("ACL SETUSER "))
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    let python = std::fs::read_to_string(
+        std::path::Path::new(&checkout).join("temporalio/contrib/streams/docs/redis-guarantees.md"),
+    )
+    .unwrap();
+    assert_eq!(rules(include_str!("../docs/redis.md")), rules(&python));
+}
+
+fn delete_request(workflow_id: &str) -> temporalio_streams::proto::DeleteOwnerRequest {
+    temporalio_streams::proto::DeleteOwnerRequest {
+        namespace: "ns".to_string(),
+        owner_kind: temporalio_streams::proto::StreamOwnerKind::Workflow as i32,
+        workflow_id: workflow_id.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn an_admin_deletes_one_workflows_stream_keys() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    let next = ChainId {
+        first_run_id: "run-2".to_string(),
+        ..chain.clone()
+    };
+    let bystander = self::chain();
+    // A log, its meta, a stage, the pending list and a close flag on one chain, and a log on the
+    // next chain of the same Workflow id.
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    setup.store.stage(stage_of(&chain, "t1", 1)).await.unwrap();
+    setup.store.close_chain(&chain).await.unwrap();
+    setup
+        .store
+        .append(append(&next, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    setup
+        .store
+        .append(append(&bystander, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let pattern = format!("{}:{{ns:{}:*", setup.prefix, part(&chain.workflow_id));
+    let before: Vec<String> = redis::cmd("KEYS")
+        .arg(&pattern)
+        .query_async(&mut setup.raw)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 7, "{before:?}");
+    let deleted = setup
+        .store
+        .delete_owner(delete_request(&chain.workflow_id))
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted, 7);
+    let after: Vec<String> = redis::cmd("KEYS")
+        .arg(&pattern)
+        .query_async(&mut setup.raw)
+        .await
+        .unwrap();
+    assert!(after.is_empty(), "{after:?}");
+    let left: usize = setup
+        .raw
+        .xlen(log_key(&setup.prefix, &bystander, "events"))
+        .await
+        .unwrap();
+    assert_eq!(left, 1);
+    let again = setup
+        .store
+        .delete_owner(delete_request(&chain.workflow_id))
+        .await
+        .unwrap();
+    assert_eq!(again.deleted, 0);
+}
+
+#[tokio::test]
+async fn a_store_error_on_delete_arrives_as_a_stream_error() {
+    let Some(url) = url() else {
+        return;
+    };
+    let faults = Faults::start(&url).await;
+    let setup = setup_at(&faults.url(), &url).await;
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    faults.next(LOSE_REQUEST);
+    // Some keys may already be gone when a later step fails.
+    let error = setup
+        .store
+        .delete_owner(delete_request(&chain.workflow_id))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::OutcomeUnknown, "{error}");
+}
+
+#[tokio::test]
+async fn a_delete_without_scan_is_refused_under_the_documented_acl() {
+    let Some(url) = url() else {
+        return;
+    };
+    let prefix = unique("acl-delete");
+    let rules = |page: &str| -> Vec<String> {
+        page.lines()
+            .find_map(|line| line.strip_prefix("ACL SETUSER "))
+            .unwrap()
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_string)
+            .collect()
+    };
+    let name = unique("streams-acl");
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let mut setuser = redis::cmd("ACL");
+    setuser.arg("SETUSER").arg(&name);
+    for rule in rules(include_str!("../docs/redis.md")) {
+        match rule.as_str() {
+            "~temporal-streams:{my-ns:*" => setuser.arg(format!("~{}:{{ns:*", part(&prefix))),
+            ">secret" => setuser.arg(">pw"),
+            rule => setuser.arg(rule),
+        };
+    }
+    let _: () = setuser.query_async(&mut admin).await.unwrap();
+    let address = url.trim_start_matches("redis://");
+    let mut options = RedisStoreOptions::new(format!("redis://{name}:pw@{address}"));
+    options.key_prefix = prefix;
+    let store = RedisStore::connect(options).await.unwrap();
+    let error = store.delete_owner(delete_request("wf")).await.unwrap_err();
+    let _: () = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&name)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(error.kind, StreamFailureKind::Refused, "{error}");
+    assert!(error.message.contains("NOPERM"), "{error}");
+}
+
+#[tokio::test]
+async fn a_delete_reaches_every_primary_of_a_cluster() {
+    let Ok(url) = std::env::var("STREAMS_REDIS_CLUSTER_URL") else {
+        eprintln!("set STREAMS_REDIS_CLUSTER_URL to run the Redis cluster tests");
+        return;
+    };
+    let prefix = unique("cluster-delete");
+    let mut options = RedisStoreOptions::new(url.clone());
+    options.cluster = true;
+    options.key_prefix = prefix.clone();
+    let store = RedisStore::connect(options).await.unwrap();
+    let workflow_id = unique("wf");
+    for run in 0..30 {
+        let chain = ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: workflow_id.clone(),
+            first_run_id: format!("run-{run}"),
+        };
+        store
+            .append(append(&chain, "p", 1, 1, b"\x01"))
+            .await
+            .unwrap();
+    }
+    let mut seed = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let nodes: String = redis::cmd("CLUSTER")
+        .arg("NODES")
+        .query_async(&mut seed)
+        .await
+        .unwrap();
+    let primaries: Vec<String> = nodes
+        .lines()
+        .filter(|line| line.contains("master"))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|address| address.split('@').next().unwrap().to_string())
+        .collect();
+    let pattern = format!("{}:{{ns:{}:*", part(&prefix), part(&workflow_id));
+    let mut held = Vec::new();
+    for primary in &primaries {
+        let mut node = redis::Client::open(format!("redis://{primary}/0"))
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(&pattern)
+            .query_async(&mut node)
+            .await
+            .unwrap();
+        held.push((node, keys.len()));
+    }
+    assert!(
+        held.iter().all(|(_, count)| *count > 0),
+        "the chains should land on every primary"
+    );
+    let deleted = store
+        .delete_owner(delete_request(&workflow_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.deleted as usize,
+        held.iter().map(|(_, count)| count).sum::<usize>()
+    );
+    for (mut node, _) in held {
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(&pattern)
+            .query_async(&mut node)
+            .await
+            .unwrap();
+        assert!(keys.is_empty(), "{keys:?}");
+    }
 }
