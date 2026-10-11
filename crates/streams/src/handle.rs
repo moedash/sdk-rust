@@ -453,7 +453,7 @@ impl Streams {
     pub async fn close(&self, request: CloseRequest) -> StreamResult<CloseResponse> {
         let stream = address(request.stream.as_ref())?;
         let chain = self.chain(stream).await?;
-        self.store.close_topic(&chain, &stream.topic).await?;
+        self.store.close_topic(&chain, &stream.topic, None).await?;
         Ok(CloseResponse {})
     }
 
