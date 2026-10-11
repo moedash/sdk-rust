@@ -156,6 +156,8 @@ path = "../macros"
 version = "~1.1.0"
 
 [dev-dependencies]
+# Turns on the stream store integration for this crate's own tests.
+temporalio-sdk-core = { path = ".", features = ["streams"] }
 assert_matches = "1.5"
 bimap = "0.6.3"
 bytes = "1.10"

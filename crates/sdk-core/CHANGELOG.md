@@ -43,6 +43,10 @@ relevant information.
   store name aside), or the task fails as nondeterministic. A workflow that wrote this marker
   can only move forward. A Worker on an older Core, or one whose lang doesn't commit the records
   again on replay, fails that workflow's next task, so don't roll such a fleet back.
+* Experimental: behind the new `streams` feature, `WorkerConfig::stream_store` takes the store a
+  workflow's stream output goes to. Core stages each completion's records in it before the
+  completion is sent, and fails the workflow task when the store refuses them or the Worker has
+  none, so a task the server accepts always has its output staged.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
