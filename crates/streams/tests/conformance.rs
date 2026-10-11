@@ -1168,8 +1168,7 @@ mod memory {
     );
 }
 
-/// Every case but the ones that need reads that check retention or owner deletes, which come
-/// with those features.
+/// Every case but owner deletes, which come with that feature.
 #[cfg(feature = "redis")]
 macro_rules! redis_cases {
     ($case:expr) => {
@@ -1184,6 +1183,8 @@ macro_rules! redis_cases {
             end_reads_only_what_arrives_after_the_read_starts,
             a_read_waits_no_longer_than_asked,
             dropping_a_waiting_read_releases_it,
+            beginning_starts_at_the_oldest_record_still_held,
+            a_reader_that_falls_behind_retention_is_told,
             a_retried_append_returns_the_original_positions,
             a_retry_with_other_ciphertext_still_deduplicates,
             a_divergent_retry_is_refused,
