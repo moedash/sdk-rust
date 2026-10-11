@@ -1026,7 +1026,7 @@ mod cases {
 
     pub(crate) async fn a_closed_topic_leaves_the_others_open(case: &dyn Case) {
         let chain = case.chain();
-        case.store().close_topic(&chain, OUT).await.unwrap();
+        case.store().close_topic(&chain, OUT, None).await.unwrap();
         assert_eq!(
             kind(
                 Producer::new(case, &chain, OUT, "p", 1)
@@ -1045,7 +1045,7 @@ mod cases {
         let landed = Producer::new(case, &chain, OUT, "p", 1)
             .append(&["1"])
             .await;
-        case.store().close_topic(&chain, OUT).await.unwrap();
+        case.store().close_topic(&chain, OUT, None).await.unwrap();
         let repeat = Producer::new(case, &chain, OUT, "p", 1)
             .append(&["1"])
             .await;
