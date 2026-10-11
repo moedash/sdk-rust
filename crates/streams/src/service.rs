@@ -329,6 +329,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_delete_is_checked_before_it_reaches_the_store() {
+        let service = service().await;
+        let other_owner = crate::proto::DeleteOwnerRequest {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Unspecified as i32,
+            workflow_id: "wf".to_string(),
+        };
+        let failure = service
+            .call("DeleteOwner", &other_owner.encode_to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind(), StreamFailureKind::Unsupported);
+        let no_id = crate::proto::DeleteOwnerRequest {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: String::new(),
+        };
+        let failure = service
+            .call("DeleteOwner", &no_id.encode_to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind(), StreamFailureKind::Refused);
+    }
+
+    #[tokio::test]
     async fn a_config_that_names_no_store_is_refused() {
         let error = StreamService::connect(StreamStoreConfig { store: None }, Arc::new(Running))
             .await
