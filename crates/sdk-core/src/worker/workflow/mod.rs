@@ -1573,7 +1573,7 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
-    /// Compact manifest for an external output batch already staged by lang.
+    /// The stream records lang published in this activation.
     ExternalOutputStreamCommit(WorkflowOutputStreamCommit),
 }
 

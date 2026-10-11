@@ -483,7 +483,6 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
-            history_floor_event_id: 0,
         }
     }
 

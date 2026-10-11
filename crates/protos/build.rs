@@ -19,6 +19,7 @@ static SERDE_ATTR: &str =
 /// added to the pbjson_build list below.
 const SERDE_DERIVE_PREFIXES: &[&str] = &[
     ".coresdk",
+    ".temporal.sdk.streams",
     ".grpc",
     ".temporal.api.activity",
     ".temporal.api.batch",
