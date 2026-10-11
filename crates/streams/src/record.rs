@@ -6,10 +6,7 @@ use crate::{
 };
 use temporalio_common::{
     protos::temporal::api::common::v1::Payload,
-    streams::{
-        CONTENT_HASH_KEY, FingerprintRecord, METADATA_ENCODING, RUN_ID_KEY, content_hash_text,
-        fingerprint,
-    },
+    streams::{CONTENT_HASH_KEY, METADATA_ENCODING, RUN_ID_KEY, content_hash_text},
 };
 
 /// The owner kind a Workflow's streams hash under in their cursors.
@@ -25,13 +22,19 @@ pub fn activity_producer_id(activity: &ActivityProducer) -> String {
     format!("{}@{}", activity.activity_id, activity.run_id)
 }
 
-/// The fingerprint a store compares when a producer repeats its newest batch on `topic`.
-pub fn append_digest(topic: &str, records: &[AppendRecord]) -> [u8; 32] {
-    fingerprint(records.iter().map(|record| FingerprintRecord {
-        topic,
-        kind: record.kind,
-        content_hash: &record.content_hash,
-    }))
+/// Refuses an append batch digest that isn't the 32-byte SHA-256 lang takes before the codec.
+///
+/// Stores compare it unchanged when a producer repeats its newest batch, so a digest Core made
+/// another way would turn a retry into a divergent write.
+pub fn check_append_digest(digest: &[u8]) -> StreamResult<()> {
+    if digest.len() != HASH_LENGTH {
+        return Err(StreamError::refused(format!(
+            "an append needs the {HASH_LENGTH}-byte digest lang takes over the batch before the \
+             codec, not {} bytes",
+            digest.len()
+        )));
+    }
+    Ok(())
 }
 
 /// The record a store keeps for one appended record of a producer.
@@ -225,20 +228,12 @@ mod tests {
     }
 
     #[test]
-    fn the_digest_ignores_the_encoded_body() {
-        let mut reencrypted = data(1);
-        reencrypted.body.as_mut().unwrap().data = b"other ciphertext".to_vec();
-        assert_eq!(
-            append_digest("out", &[data(1), finish()]),
-            append_digest("out", &[reencrypted, finish()])
-        );
-        assert_ne!(
-            append_digest("out", &[data(1)]),
-            append_digest("out", &[data(2)])
-        );
-        assert_ne!(
-            append_digest("out", &[data(1)]),
-            append_digest("other", &[data(1)])
-        );
+    fn an_append_needs_a_full_digest() {
+        assert_eq!(check_append_digest(&[9; HASH_LENGTH]), Ok(()));
+        for digest in [vec![], vec![9; 16]] {
+            let error = check_append_digest(&digest).unwrap_err();
+            assert_eq!(error.kind, StreamFailureKind::Refused);
+            assert!(error.message.contains("32-byte digest"), "{error}");
+        }
     }
 }

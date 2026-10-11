@@ -12,6 +12,7 @@ use redis::{
     aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
     cluster::ClusterClient,
     cluster_async::ClusterConnection,
+    cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo, SingleNodeRoutingInfo},
 };
 use std::{
     collections::HashMap,
@@ -75,6 +76,77 @@ impl Shared {
         Ok(Shared::Single(
             client.get_connection_manager_with_config(config).await?,
         ))
+    }
+
+    /// The primaries a scan must visit: the server itself, or each primary of a cluster.
+    pub(crate) async fn primaries(&self) -> RedisResult<Vec<Option<Node>>> {
+        if let Shared::Single(_) = self {
+            return Ok(vec![None]);
+        }
+        Ok(self
+            .on_each_primary(redis::cmd("PING"))
+            .await?
+            .into_iter()
+            .map(|(node, _)| {
+                node.rsplit_once(':')
+                    .and_then(|(host, port)| Some((host.to_string(), port.parse().ok()?)))
+            })
+            .collect())
+    }
+
+    /// One `SCAN` step on one primary, answering the next cursor and the keys found.
+    pub(crate) async fn scan(
+        &self,
+        node: Option<&Node>,
+        cursor: &str,
+        pattern: &str,
+    ) -> RedisResult<(String, Vec<String>)> {
+        let mut scan = redis::cmd("SCAN");
+        scan.arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(1000);
+        match (self.clone(), node) {
+            (Shared::Cluster(mut conn), Some((host, port))) => {
+                let routing = RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                    host: host.clone(),
+                    port: *port,
+                });
+                redis::from_redis_value(conn.route_command(scan, routing).await?)
+                    .map_err(RedisError::from)
+            }
+            (mut shared, _) => scan.query_async(&mut shared).await,
+        }
+    }
+
+    /// Runs `cmd` on the server, or on every primary of a cluster, and answers each reply with
+    /// the node that sent it. Each primary holds its own share of the keys and its own settings.
+    pub(crate) async fn on_each_primary(&self, cmd: Cmd) -> RedisResult<Vec<(String, Value)>> {
+        match self.clone() {
+            Shared::Single(mut conn) => {
+                Ok(vec![(String::new(), cmd.query_async(&mut conn).await?)])
+            }
+            Shared::Cluster(mut conn) => {
+                let routing = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllMasters, None));
+                match conn.route_command(cmd, routing).await? {
+                    Value::Map(replies) => Ok(replies
+                        .into_iter()
+                        .map(|(node, reply)| {
+                            let node = match node {
+                                Value::BulkString(bytes) => {
+                                    String::from_utf8_lossy(&bytes).into_owned()
+                                }
+                                Value::SimpleString(text) => text,
+                                other => format!("{other:?}"),
+                            };
+                            (node, reply)
+                        })
+                        .collect()),
+                    other => Ok(vec![(String::new(), other)]),
+                }
+            }
+        }
     }
 }
 

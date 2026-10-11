@@ -130,6 +130,105 @@ mod on_redis {
         pub(crate) store: Arc<RedisStore>,
         pub(crate) raw: Raw,
         pub(crate) prefix: String,
+        _user: Option<DocumentedUser>,
+    }
+
+    /// The rules of the documented `ACL SETUSER` line, after the user name.
+    pub(crate) fn documented_rules() -> Vec<String> {
+        let page = include_str!("../docs/redis.md");
+        let lines: Vec<_> = page
+            .lines()
+            .filter_map(|line| line.strip_prefix("ACL SETUSER "))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the Redis page should give one ACL SETUSER line"
+        );
+        lines[0]
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_string)
+            .collect()
+    }
+
+    const DOCUMENTED_KEYS: &str = "~temporal-streams:{my-ns:*";
+
+    /// A Redis user with exactly the documented rules, for one prefix and namespace. The page's
+    /// key pattern and password are swapped for the test's own, and nothing else changes.
+    pub(crate) struct DocumentedUser {
+        admin_url: String,
+        name: String,
+        pub(crate) url: String,
+    }
+
+    impl DocumentedUser {
+        pub(crate) async fn create(
+            url: &str,
+            prefix: &str,
+            namespace: &str,
+            extra: &[&str],
+        ) -> Self {
+            let rules = documented_rules();
+            assert!(
+                rules.iter().any(|rule| rule == DOCUMENTED_KEYS),
+                "{rules:?}"
+            );
+            assert!(rules.iter().any(|rule| rule == ">secret"), "{rules:?}");
+            let name = unique("streams-acl");
+            let password = unique("pw");
+            let keys = format!("~{}:{{{}:*", part(prefix), part(namespace));
+            let mut setuser = redis::cmd("ACL");
+            setuser.arg("SETUSER").arg(&name);
+            for rule in &rules {
+                match rule.as_str() {
+                    DOCUMENTED_KEYS => setuser.arg(&keys),
+                    ">secret" => setuser.arg(format!(">{password}")),
+                    rule => setuser.arg(rule),
+                };
+            }
+            for rule in extra {
+                setuser.arg(*rule);
+            }
+            let mut admin = Raw::connect(url, false).await;
+            let _: () = admin.query(&setuser).await;
+            let address = url.trim_start_matches("redis://");
+            Self {
+                admin_url: url.to_string(),
+                url: format!("redis://{name}:{password}@{address}"),
+                name,
+            }
+        }
+    }
+
+    impl Drop for DocumentedUser {
+        fn drop(&mut self) {
+            if let Ok(mut admin) = redis::Client::open(self.admin_url.as_str())
+                .and_then(|client| client.get_connection())
+            {
+                let _: redis::RedisResult<()> = redis::cmd("ACL")
+                    .arg("DELUSER")
+                    .arg(&self.name)
+                    .query(&mut admin);
+            }
+        }
+    }
+
+    pub(crate) async fn redis_as_documented_user(extra: &[&str]) -> Option<Redis> {
+        let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
+            eprintln!("set STREAMS_REDIS_URL to run the Redis store cases");
+            return None;
+        };
+        let prefix = unique("conformance-acl");
+        let user = DocumentedUser::create(&url, &prefix, "default", extra).await;
+        let mut options = RedisStoreOptions::new(user.url.clone());
+        options.key_prefix = prefix.clone();
+        Some(Redis {
+            store: Arc::new(RedisStore::connect(options).await.unwrap()),
+            raw: Raw::connect(&url, false).await,
+            prefix,
+            _user: Some(user),
+        })
     }
 
     pub(crate) async fn redis(variable: &str, cluster: bool) -> Option<Redis> {
@@ -146,6 +245,7 @@ mod on_redis {
             store: Arc::new(RedisStore::connect(options).await.unwrap()),
             raw: Raw::connect(&url, cluster).await,
             prefix,
+            _user: None,
         })
     }
 
@@ -592,6 +692,59 @@ mod cases {
             kind(read_with(case, &chain, OUT, &after_one, Duration::ZERO, &first.state).await),
             StreamFailureKind::Expired
         );
+    }
+
+    pub(crate) async fn an_empty_read_from_the_beginning_learns_of_a_trim(case: &dyn Case) {
+        // The read has delivered nothing, so it has no position, but records written after it
+        // started and dropped before its next call are still lost to it.
+        let chain = case.chain();
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert!(first.records.is_empty());
+        assert_eq!(first.cursor, BEGINNING);
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1", "2"])
+            .await;
+        case.drop_oldest(&chain, OUT, 1).await;
+        assert_eq!(
+            kind(
+                read_with(
+                    case,
+                    &chain,
+                    OUT,
+                    &first.cursor,
+                    Duration::ZERO,
+                    &first.state
+                )
+                .await
+            ),
+            StreamFailureKind::Expired
+        );
+        // A new read starts at the oldest record left, as a read from the beginning does.
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["2"]
+        );
+    }
+
+    pub(crate) async fn an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on(
+        case: &dyn Case,
+    ) {
+        let chain = case.chain();
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        let next = read_with(
+            case,
+            &chain,
+            OUT,
+            &first.cursor,
+            Duration::ZERO,
+            &first.state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values(&next), ["1"]);
     }
 
     pub(crate) async fn a_retried_append_returns_the_original_positions(case: &dyn Case) {
@@ -1142,6 +1295,8 @@ mod memory {
         dropping_a_waiting_read_releases_it,
         beginning_starts_at_the_oldest_record_still_held,
         a_reader_that_falls_behind_retention_is_told,
+        an_empty_read_from_the_beginning_learns_of_a_trim,
+        an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
         a_retried_append_returns_the_original_positions,
         a_retry_with_other_ciphertext_still_deduplicates,
         a_divergent_retry_is_refused,
@@ -1168,7 +1323,7 @@ mod memory {
     );
 }
 
-/// Every case but owner deletes, which come with that feature.
+/// Every case but owner deletes, which need a rule of their own under the documented ACL.
 #[cfg(feature = "redis")]
 macro_rules! redis_cases {
     ($case:expr) => {
@@ -1185,6 +1340,8 @@ macro_rules! redis_cases {
             dropping_a_waiting_read_releases_it,
             beginning_starts_at_the_oldest_record_still_held,
             a_reader_that_falls_behind_retention_is_told,
+            an_empty_read_from_the_beginning_learns_of_a_trim,
+            an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
             a_retried_append_returns_the_original_positions,
             a_retry_with_other_ciphertext_still_deduplicates,
             a_divergent_retry_is_refused,
@@ -1214,9 +1371,25 @@ macro_rules! redis_cases {
 #[cfg(feature = "redis")]
 mod standalone_redis {
     redis_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
+    conformance!(super::on_redis::redis("STREAMS_REDIS_URL", false);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
 }
 
 #[cfg(feature = "redis")]
 mod cluster_redis {
     redis_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
+    // A Workflow id's chains hash to different slots, so the delete reaches every primary.
+    conformance!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod documented_acl_redis {
+    redis_cases!(super::on_redis::redis_as_documented_user(&[]));
+    // The page names the one rule a delete needs beyond the others.
+    conformance!(super::on_redis::redis_as_documented_user(&["+scan"]);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
 }

@@ -5,21 +5,23 @@
 
 use crate::{
     ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, activity_producer_id,
-    append_digest, mint_cursor,
+    check_append_digest, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
-        AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, LatestRequest,
-        LatestResponse, ReadRequest, ReadResponse, StoreAppendRequest, StoreLatestRequest,
-        StreamAddress, StreamOwnerKind, append_request::Producer,
+        AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, DeleteOwnerRequest,
+        DeleteOwnerResponse, LatestRequest, LatestResponse, PromoteOutcome, ReadRequest,
+        ReadResponse, StageRef, StoreAppendRequest, StoreLatestRequest, StreamAddress,
+        StreamOwnerKind, append_request::Producer,
     },
     reader::{ReadState, read_with},
+    repair::{Decision, decide_token},
     stored_append_record, stream_hash,
 };
 use prost::Message;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 use tokio::time::Instant;
@@ -190,6 +192,7 @@ impl Streams {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
         }
+        check_append_digest(&request.digest)?;
         let chain = self
             .producer_chain(ProducerKey {
                 owner: owner_key(stream),
@@ -220,7 +223,9 @@ impl Streams {
                 producer_id,
                 attempt,
                 sequence: request.sequence,
-                digest: append_digest(&stream.topic, &request.records).to_vec(),
+                // Lang takes it before the codec, and only lang's own retries compare it, so the
+                // store keeps it as given.
+                digest: request.digest.clone(),
                 records,
             })
             .await?;
@@ -242,7 +247,8 @@ impl Streams {
     pub async fn read(&self, request: ReadRequest) -> StreamResult<ReadResponse> {
         let stream = address(request.stream.as_ref())?;
         let mut state = ReadState::decode_from(&request.state)?;
-        if state.first_run_id.is_empty() {
+        let starting = state.first_run_id.is_empty();
+        if starting {
             state.first_run_id = self.chain(stream).await?.first_run_id;
         }
         let target = ReadTarget {
@@ -250,6 +256,9 @@ impl Streams {
             topic: stream.topic.clone(),
             stream_hash: self.hash(stream),
         };
+        if starting {
+            self.repair(&target.chain).await;
+        }
         let wait = request
             .wait
             .and_then(|wait| Duration::try_from(wait).ok())
@@ -287,8 +296,10 @@ impl Streams {
                     .clamp(millis(minimum), millis(self.options.owner_check_max));
                 state.next_check_ms = unix_ms() + state.check_interval_ms;
                 // One more pass after learning the owner ended, so a record that landed
-                // between the read and the describe is delivered.
+                // between the read and the describe is delivered, and so is output a Worker
+                // committed but never promoted.
                 if state.owner_ended {
+                    self.repair(&target.chain).await;
                     continue;
                 }
             }
@@ -300,6 +311,95 @@ impl Streams {
             state: state.encode_to_vec(),
             ..response
         })
+    }
+
+    /// Settles the stages a Worker left behind on `chain`, as History decides them. Best effort:
+    /// a stage History has not decided stays for the next reader, and a failure only logs.
+    async fn repair(&self, chain: &ChainId) {
+        if let Err(error) = self.try_repair(chain).await {
+            tracing::warn!(
+                workflow_id = %chain.workflow_id,
+                "Could not settle the pending stream stages of the Workflow: {error}"
+            );
+        }
+    }
+
+    async fn try_repair(&self, chain: &ChainId) -> StreamResult<()> {
+        let mut pending = self.store.pending_stages(chain).await?;
+        let mut started: HashMap<String, Option<SystemTime>> = HashMap::new();
+        for stage in &pending {
+            if started.contains_key(&stage.run_id) {
+                continue;
+            }
+            let start = match self
+                .owner
+                .describe(&chain.namespace, &chain.workflow_id, &stage.run_id)
+                .await
+            {
+                Ok(described) => Some(described.start_time.unwrap_or(SystemTime::UNIX_EPOCH)),
+                Err(OwnerError::NotFound(_)) => None,
+                Err(error) => return Err(describe_failed(&error)),
+            };
+            started.insert(stage.run_id.clone(), start);
+        }
+        // Promotions append, so they go in commit order: by run, then by floor within the run.
+        pending.sort_by(|a, b| {
+            (started[&a.run_id], &a.run_id, a.history_floor_event_id).cmp(&(
+                started[&b.run_id],
+                &b.run_id,
+                b.history_floor_event_id,
+            ))
+        });
+        for stage in pending {
+            if started[&stage.run_id].is_none() {
+                // Retention may have removed the run, or a replica behind a failover may not have
+                // it yet. Aborting could drop committed output, so the stage waits for its expiry
+                // and holds back nothing.
+                tracing::debug!(
+                    token = %stage.token,
+                    run_id = %stage.run_id,
+                    "Leaving a stream stage whose run is not in History"
+                );
+                continue;
+            }
+            let events = match self
+                .owner
+                .history_after(
+                    &chain.namespace,
+                    &chain.workflow_id,
+                    &stage.run_id,
+                    stage.history_floor_event_id,
+                )
+                .await
+            {
+                Ok(events) => events,
+                Err(OwnerError::NotFound(_)) => continue,
+                Err(error) => return Err(describe_failed(&error)),
+            };
+            let reference = StageRef {
+                chain: Some(chain.clone()),
+                token: stage.token.clone(),
+                topics: stage.topics,
+            };
+            // A reader never holds an attempt in flight, so the same-floor rule always holds.
+            match decide_token(&events, &stage.token, stage.history_floor_event_id, true) {
+                Decision::Promote => {
+                    let promoted = self.store.promote(&reference).await?;
+                    if promoted.outcome == PromoteOutcome::Lost as i32 {
+                        tracing::warn!(
+                            token = %stage.token,
+                            workflow_id = %chain.workflow_id,
+                            "Stream output the Workflow committed was dropped by retention \
+                             before it was promoted"
+                        );
+                    }
+                }
+                Decision::Abort => self.store.abort(&reference).await?,
+                // A stage History has not decided holds back the ones after it.
+                Decision::Unknown => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     /// Whether the owner a read follows ended. Following the chain, a run that continued as
@@ -355,6 +455,27 @@ impl Streams {
         let chain = self.chain(stream).await?;
         self.store.close_topic(&chain, &stream.topic).await?;
         Ok(CloseResponse {})
+    }
+
+    /// Deletes every stream of one owner, across all its chains. It asks Temporal nothing, so it
+    /// works after the owner is gone. Delete only after the chain closed and its producers
+    /// stopped, since a late append writes a fresh stream with no dedupe state and no close mark.
+    pub async fn delete_owner(
+        &self,
+        request: DeleteOwnerRequest,
+    ) -> StreamResult<DeleteOwnerResponse> {
+        if request.owner_kind != StreamOwnerKind::Workflow as i32 {
+            return Err(StreamError::unsupported(format!(
+                "this release keeps streams of Workflows only, not owner kind {}",
+                request.owner_kind
+            )));
+        }
+        if request.namespace.is_empty() || request.workflow_id.is_empty() {
+            return Err(StreamError::refused(
+                "a delete needs the namespace and the owner's Workflow id",
+            ));
+        }
+        self.store.delete_owner(request).await
     }
 
     /// The chain a producer writes on, asking about the owner when the producer is new or its
@@ -574,25 +695,39 @@ mod tests {
             StreamRecordKind,
         },
     };
+    use crate::{
+        proto::{StagedBatch, StagedRecord},
+        repair::tests::{event, marker},
+        stored_output_record,
+    };
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temporalio_common::protos::temporal::api::{
-        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
+        common::v1::Payload,
+        enums::v1::{EventType, WorkflowExecutionStatus},
+        history::v1::HistoryEvent,
     };
 
-    /// Temporal as the tests need it: the latest run of each Workflow id, and pinned runs.
+    /// Temporal as the tests need it: the latest run of each Workflow id, pinned runs, and the
+    /// History of each run.
     #[derive(Default)]
     struct Owners {
         latest: Mutex<HashMap<String, Result<OwnerDescription, OwnerError>>>,
         runs: Mutex<HashMap<String, OwnerDescription>>,
+        histories: Mutex<HashMap<String, Vec<HistoryEvent>>>,
+        failing_runs: Mutex<Vec<String>>,
+        described_runs: Mutex<Vec<String>>,
         describes: AtomicUsize,
     }
 
     impl Owners {
         fn run(&self, workflow_id: &str, run_id: &str, first_run_id: &str) {
+            let started = self.runs.lock().unwrap().len() as u64;
             let described = OwnerDescription {
                 run_id: run_id.to_string(),
                 first_run_id: first_run_id.to_string(),
                 status: WorkflowExecutionStatus::Running,
+                start_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(started)),
             };
             self.runs
                 .lock()
@@ -632,6 +767,16 @@ mod tests {
         ) -> Result<OwnerDescription, OwnerError> {
             self.describes.fetch_add(1, Ordering::Relaxed);
             if !run_id.is_empty() {
+                self.described_runs.lock().unwrap().push(run_id.to_string());
+                if self
+                    .failing_runs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|run| run == run_id)
+                {
+                    return Err(OwnerError::Failed("unavailable".to_string()));
+                }
                 return self
                     .runs
                     .lock()
@@ -646,6 +791,24 @@ mod tests {
                 .get(workflow_id)
                 .cloned()
                 .unwrap_or_else(|| Err(OwnerError::NotFound(workflow_id.to_string())))
+        }
+
+        async fn history_after(
+            &self,
+            _namespace: &str,
+            _workflow_id: &str,
+            run_id: &str,
+            floor: i64,
+        ) -> Result<Vec<HistoryEvent>, OwnerError> {
+            let histories = self.histories.lock().unwrap();
+            let events = histories
+                .get(run_id)
+                .ok_or_else(|| OwnerError::NotFound(run_id.to_string()))?;
+            Ok(events
+                .iter()
+                .filter(|event| event.event_id > floor)
+                .cloned()
+                .collect())
         }
     }
 
@@ -678,7 +841,6 @@ mod tests {
     }
 
     fn data(value: &str) -> AppendRecord {
-        use sha2::{Digest, Sha256};
         AppendRecord {
             kind: StreamRecordKind::Data as i32,
             body: Some(Payload {
@@ -698,6 +860,7 @@ mod tests {
             })),
             sequence,
             records: vec![data(value)],
+            digest: Sha256::digest(value.as_bytes()).to_vec(),
         }
     }
 
@@ -1010,6 +1173,7 @@ mod tests {
                 run_id: String::new(),
                 first_run_id: String::new(),
                 status,
+                start_time: None,
             }
             .chain_ended()
         };
@@ -1322,5 +1486,335 @@ mod tests {
         let (delivered, _) = read_to_end(&setup.streams, Duration::from_secs(5)).await;
         assert_eq!(delivered, 1);
         assert_eq!(setup.owners.describes(), before);
+    }
+
+    /// A stage of `run_id` at `floor` that a Worker left behind, holding `value` on `out`.
+    async fn left_behind(store: &MemoryStore, run_id: &str, token: &str, floor: i64, value: &str) {
+        let record = data(value);
+        store
+            .stage(StagedBatch {
+                chain: Some(chain("run-1")),
+                run_id: run_id.to_string(),
+                token: token.to_string(),
+                history_floor_event_id: floor,
+                records: vec![StagedRecord {
+                    topic: "out".to_string(),
+                    record: stored_output_record(
+                        "out",
+                        record.kind,
+                        record.body,
+                        &record.content_hash,
+                        run_id,
+                    )
+                    .unwrap()
+                    .encode_to_vec(),
+                }],
+            })
+            .await
+            .unwrap();
+    }
+
+    fn history(owners: &Owners, run_id: &str, events: Vec<HistoryEvent>) {
+        owners
+            .histories
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), events);
+    }
+
+    fn values(page: &ReadResponse) -> Vec<String> {
+        page.records
+            .iter()
+            .filter_map(|record| match record.record.as_ref() {
+                Some(crate::proto::read_record::Record::Stored(stored)) => {
+                    Some(String::from_utf8(stored.body.clone().unwrap_or_default().data).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn pending(store: &MemoryStore) -> Vec<String> {
+        store
+            .pending_stages(&chain("run-1"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|stage| stage.token)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reader_promotes_output_a_stopped_worker_committed() {
+        // The run finished, so no Worker will ever replay it, and only a reader finds the stage.
+        let setup = setup(quick());
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        history(
+            &setup.owners,
+            "run-1",
+            vec![
+                event(4, EventType::WorkflowTaskCompleted),
+                marker(5, "t1", 3),
+            ],
+        );
+        let page = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1"]);
+        assert!(pending(&setup.store).await.is_empty());
+        // A second reader finds nothing left to repair and sees the record once.
+        let again = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&again), ["1"]);
+    }
+
+    #[tokio::test]
+    async fn rule_24_1_a_reader_aborts_a_stage_a_later_attempt_superseded() {
+        // A transient attempt's failure is not in History, but the attempt that completed
+        // carries every commit made at that floor.
+        let setup = setup(quick());
+        left_behind(&setup.store, "run-1", "orphan", 3, "0").await;
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        history(
+            &setup.owners,
+            "run-1",
+            vec![
+                event(4, EventType::WorkflowTaskCompleted),
+                marker(5, "t1", 3),
+            ],
+        );
+        let page = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1"]);
+        assert!(pending(&setup.store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rule_24_3_a_reader_repairs_pending_stages_in_commit_order() {
+        let setup = setup(quick());
+        setup.owners.run("wf", "run-2", "run-1");
+        // A store keeps no order a reader can rely on, so the stages are left in reverse.
+        left_behind(&setup.store, "run-2", "t4", 3, "4").await;
+        left_behind(&setup.store, "run-1", "t3", 9, "3").await;
+        left_behind(&setup.store, "run-1", "t2", 6, "2").await;
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        history(
+            &setup.owners,
+            "run-1",
+            vec![marker(5, "t1", 3), marker(8, "t2", 6), marker(11, "t3", 9)],
+        );
+        history(&setup.owners, "run-2", vec![marker(5, "t4", 3)]);
+        let page = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1", "2", "3", "4"]);
+        // One describe per run, however many stages it left.
+        let mut described = setup.owners.described_runs.lock().unwrap().clone();
+        described.sort();
+        assert_eq!(described, ["run-1", "run-2"]);
+    }
+
+    #[tokio::test]
+    async fn rule_24_3_a_stage_history_has_not_decided_holds_back_the_ones_after_it() {
+        let setup = setup(quick());
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        left_behind(&setup.store, "run-1", "t2", 6, "2").await;
+        // A Local Activity may hold the first task open, so neither may land yet.
+        history(
+            &setup.owners,
+            "run-1",
+            vec![
+                event(4, EventType::WorkflowTaskCompleted),
+                marker(8, "t2", 6),
+            ],
+        );
+        let page = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(page.records.is_empty());
+        assert_eq!(pending(&setup.store).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rule_24_4_a_reader_repairs_past_a_stage_whose_run_is_gone() {
+        let setup = setup(quick());
+        left_behind(&setup.store, "gone", "lost", 3, "0").await;
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        history(&setup.owners, "run-1", vec![marker(5, "t1", 3)]);
+        let page = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1"]);
+        // Not found can mean a replica behind a failover, so the stage waits for its expiry.
+        assert_eq!(pending(&setup.store).await, ["lost"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_repair_leaves_the_read_running() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        left_behind(&setup.store, "run-x", "t1", 3, "0").await;
+        setup
+            .owners
+            .failing_runs
+            .lock()
+            .unwrap()
+            .push("run-x".to_string());
+        let page = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1"]);
+        assert_eq!(pending(&setup.store).await, ["t1"]);
+    }
+
+    #[tokio::test]
+    async fn a_read_repairs_again_when_its_owner_ends() {
+        let setup = setup(quick());
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        history(
+            &setup.owners,
+            "run-1",
+            vec![event(4, EventType::WorkflowTaskStarted)],
+        );
+        let first = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(first.records.is_empty());
+        // The Worker committed and stopped before promoting, then the run finished.
+        history(
+            &setup.owners,
+            "run-1",
+            vec![
+                marker(5, "t1", 3),
+                event(9, EventType::WorkflowExecutionCompleted),
+            ],
+        );
+        setup.owners.end("wf", WorkflowExecutionStatus::Completed);
+        let page = setup
+            .streams
+            .read(read_after(
+                &first.cursor,
+                &first.state,
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1"]);
+    }
+
+    #[tokio::test]
+    async fn an_owner_delete_asks_temporal_nothing() {
+        let setup = setup(StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let before = setup.owners.describes();
+        let request = DeleteOwnerRequest {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: "wf".to_string(),
+        };
+        assert!(
+            setup
+                .streams
+                .delete_owner(request.clone())
+                .await
+                .unwrap()
+                .deleted
+                > 0
+        );
+        assert_eq!(setup.owners.describes(), before);
+        for (field, refused) in [
+            ("namespace", StreamFailureKind::Refused),
+            ("workflow_id", StreamFailureKind::Refused),
+            ("owner_kind", StreamFailureKind::Unsupported),
+        ] {
+            let mut bad = request.clone();
+            match field {
+                "namespace" => bad.namespace.clear(),
+                "workflow_id" => bad.workflow_id.clear(),
+                _ => bad.owner_kind = StreamOwnerKind::Unspecified as i32,
+            }
+            assert_eq!(
+                kind(setup.streams.delete_owner(bad).await),
+                refused,
+                "{field}"
+            );
+        }
+    }
+
+    /// The digest the Python SDK's Redis provider took over `[{"n": 1}, {"n": 2}]` from producer
+    /// `p`, attempt 1, sequence 1.
+    const PYTHON_DIGEST: &str = "0499768af1856bc6fd19cf6cf90e28e971099f1680e8347d70bdb4b65273f30f";
+
+    fn from_hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_retry_carrying_langs_digest_dedupes_and_the_store_keeps_it_unchanged() {
+        let setup = setup(StreamsOptions::default());
+        let mut request = append("p", 1, "1");
+        request.records.push(data("2"));
+        request.digest = from_hex(PYTHON_DIGEST);
+        let first = setup.streams.append(request.clone()).await.unwrap();
+        // A retry whose codec made other ciphertext still carries the same digest.
+        let mut retry = request.clone();
+        retry.records[0].body.as_mut().unwrap().data = b"other ciphertext".to_vec();
+        assert_eq!(setup.streams.append(retry).await.unwrap(), first);
+        // The store compares the bytes lang sent, so a store-level retry with them dedupes too.
+        let landed = setup
+            .store
+            .append(StoreAppendRequest {
+                chain: Some(chain("run-1")),
+                topic: "out".to_string(),
+                producer_id: "p".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: from_hex(PYTHON_DIGEST),
+                records: vec![b"\x1a\x03out".to_vec()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(landed.first_position, "0");
+        let mut divergent = request.clone();
+        divergent.digest = vec![7; 32];
+        assert_eq!(
+            kind(setup.streams.append(divergent).await),
+            StreamFailureKind::ProducerDivergent
+        );
+    }
+
+    #[tokio::test]
+    async fn an_append_without_langs_digest_is_refused_before_any_call() {
+        let setup = setup(StreamsOptions::default());
+        for digest in [Vec::new(), vec![1; 16]] {
+            let mut request = append("p", 1, "1");
+            request.digest = digest;
+            assert_eq!(
+                kind(setup.streams.append(request).await),
+                StreamFailureKind::Refused
+            );
+        }
+        assert_eq!(setup.owners.describes(), 0);
     }
 }

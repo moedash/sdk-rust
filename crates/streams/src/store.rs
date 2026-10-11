@@ -51,6 +51,13 @@ pub trait StreamStore: Send + Sync {
         position: &str,
     ) -> StreamResult<Option<Vec<u8>>>;
 
+    /// The position of the newest record retention dropped from a topic, or `None` when it
+    /// dropped none. A read that has delivered nothing yet compares it across calls, since it has
+    /// no position the store could check. A store that never drops records keeps the default.
+    async fn trimmed(&self, _chain: &ChainId, _topic: &str) -> StreamResult<Option<String>> {
+        Ok(None)
+    }
+
     /// Holds a Workflow Task's records, invisible to readers, until [StreamStore::promote] or
     /// [StreamStore::abort] names its token. A stage outlives the retention, since crash repair
     /// can come after it.

@@ -122,7 +122,7 @@ impl StreamService {
                 .await
                 .map(|r| r.encode_to_vec()),
             "DeleteOwner" => self
-                .store
+                .streams
                 .delete_owner(decode::<DeleteOwnerRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
@@ -200,7 +200,7 @@ mod tests {
         },
     };
     use temporalio_common::protos::temporal::api::{
-        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
     };
 
     /// Every Workflow's latest run is `run-1`, the first of its chain, and still running.
@@ -218,7 +218,18 @@ mod tests {
                 run_id: "run-1".to_string(),
                 first_run_id: "run-1".to_string(),
                 status: WorkflowExecutionStatus::Running,
+                start_time: None,
             })
+        }
+
+        async fn history_after(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<Vec<HistoryEvent>, OwnerError> {
+            Ok(vec![])
         }
     }
 
@@ -252,6 +263,7 @@ mod tests {
                 attempt: 1,
             })),
             sequence,
+            digest: vec![sequence as u8; 32],
             records: values
                 .iter()
                 .map(|value| AppendRecord {
@@ -348,6 +360,31 @@ mod tests {
         let garbled = service.call("Append", &[0xff, 0xff]).await.unwrap_err();
         assert_eq!(garbled.kind(), StreamFailureKind::Refused);
         assert!(garbled.message.contains("did not decode"));
+    }
+
+    #[tokio::test]
+    async fn a_delete_is_checked_before_it_reaches_the_store() {
+        let service = service().await;
+        let other_owner = crate::proto::DeleteOwnerRequest {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Unspecified as i32,
+            workflow_id: "wf".to_string(),
+        };
+        let failure = service
+            .call("DeleteOwner", &other_owner.encode_to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind(), StreamFailureKind::Unsupported);
+        let no_id = crate::proto::DeleteOwnerRequest {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: String::new(),
+        };
+        let failure = service
+            .call("DeleteOwner", &no_id.encode_to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind(), StreamFailureKind::Refused);
     }
 
     #[tokio::test]
