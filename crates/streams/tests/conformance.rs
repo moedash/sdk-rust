@@ -694,6 +694,59 @@ mod cases {
         );
     }
 
+    pub(crate) async fn an_empty_read_from_the_beginning_learns_of_a_trim(case: &dyn Case) {
+        // The read has delivered nothing, so it has no position, but records written after it
+        // started and dropped before its next call are still lost to it.
+        let chain = case.chain();
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert!(first.records.is_empty());
+        assert_eq!(first.cursor, BEGINNING);
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1", "2"])
+            .await;
+        case.drop_oldest(&chain, OUT, 1).await;
+        assert_eq!(
+            kind(
+                read_with(
+                    case,
+                    &chain,
+                    OUT,
+                    &first.cursor,
+                    Duration::ZERO,
+                    &first.state
+                )
+                .await
+            ),
+            StreamFailureKind::Expired
+        );
+        // A new read starts at the oldest record left, as a read from the beginning does.
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["2"]
+        );
+    }
+
+    pub(crate) async fn an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on(
+        case: &dyn Case,
+    ) {
+        let chain = case.chain();
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        let next = read_with(
+            case,
+            &chain,
+            OUT,
+            &first.cursor,
+            Duration::ZERO,
+            &first.state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values(&next), ["1"]);
+    }
+
     pub(crate) async fn a_retried_append_returns_the_original_positions(case: &dyn Case) {
         let chain = case.chain();
         let first = Producer::new(case, &chain, OUT, "p", 1)
@@ -1242,6 +1295,8 @@ mod memory {
         dropping_a_waiting_read_releases_it,
         beginning_starts_at_the_oldest_record_still_held,
         a_reader_that_falls_behind_retention_is_told,
+        an_empty_read_from_the_beginning_learns_of_a_trim,
+        an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
         a_retried_append_returns_the_original_positions,
         a_retry_with_other_ciphertext_still_deduplicates,
         a_divergent_retry_is_refused,
@@ -1285,6 +1340,8 @@ macro_rules! redis_cases {
             dropping_a_waiting_read_releases_it,
             beginning_starts_at_the_oldest_record_still_held,
             a_reader_that_falls_behind_retention_is_told,
+            an_empty_read_from_the_beginning_learns_of_a_trim,
+            an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
             a_retried_append_returns_the_original_positions,
             a_retry_with_other_ciphertext_still_deduplicates,
             a_divergent_retry_is_refused,
