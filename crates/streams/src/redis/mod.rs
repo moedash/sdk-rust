@@ -443,6 +443,15 @@ impl StreamStore for RedisStore {
             }))
     }
 
+    async fn trimmed(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
+        redis::cmd("HGET")
+            .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
+            .arg("trimmed")
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)
+    }
+
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
         let keys = self.keys(batch.chain.as_ref())?;
         let mut topics: Vec<&str> = Vec::new();
