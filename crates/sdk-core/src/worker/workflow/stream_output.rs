@@ -203,7 +203,14 @@ impl OutputStore {
     }
 
     /// Promotes the stages replay proved committed, in commit order, each once.
-    pub(crate) async fn promote_proven(&self, run_id: &str, proven: &[ProvenStage]) {
+    ///
+    /// Answers with the background tasks that close the promoted stages' topics.
+    pub(crate) async fn promote_proven(
+        &self,
+        run_id: &str,
+        proven: &[ProvenStage],
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut closing = vec![];
         for stage in proven {
             if let Some(undecided) = self.undecided.lock().get_mut(run_id) {
                 undecided.retain(|batch| batch.token != stage.token);
@@ -218,27 +225,38 @@ impl OutputStore {
                 stage.topics.clone(),
             );
             if self.promote(stage_ref).await {
-                self.close_topics(&stage.workflow_id, &stage.first_run_id, &stage.closes);
+                closing.extend(self.close_topics(
+                    &stage.workflow_id,
+                    &stage.first_run_id,
+                    &stage.closes,
+                ));
             }
         }
+        closing
     }
 
     /// Promotes or aborts `batches`, staged for one completion, by the server's answer to it.
     ///
     /// An accepted completion also settles the run's stages whose outcome was unknown. Replay
     /// before this completion proved and promoted every one of them that History holds, so the
-    /// rest never committed.
+    /// rest never committed. Answers with the background tasks that close the promoted batches'
+    /// topics.
     pub(crate) async fn settle(
         &self,
         run_id: &str,
         batches: Vec<OutputBatch>,
         outcome: CompletionOutcome,
-    ) {
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut closing = vec![];
         match outcome {
             CompletionOutcome::Accepted => {
                 for batch in &batches {
                     if self.promote(self.batch_ref(batch)).await {
-                        self.close_topics(&batch.workflow_id, &batch.first_run_id, &batch.closes);
+                        closing.extend(self.close_topics(
+                            &batch.workflow_id,
+                            &batch.first_run_id,
+                            &batch.closes,
+                        ));
                     }
                 }
                 let undecided = self.undecided.lock().pop(run_id).unwrap_or_default();
@@ -263,6 +281,7 @@ impl OutputStore {
                 }
             }
         }
+        closing
     }
 
     /// Closes `chain`'s streams in the background, retrying with backoff until it succeeds or the
@@ -270,14 +289,25 @@ impl OutputStore {
     ///
     /// The chain's latest run decides. A retried or cron run ends with a successor in the same
     /// chain, which keeps the streams open, so the successor's own final task closes them.
+    ///
+    /// It waits for `topic_closes`, the final task's own topic closes, first. A notifier keeps the
+    /// first close it hears, so the chain's close must not beat the result a topic closes with.
+    /// A topic close that was given up on still lets the chain close.
     pub(crate) fn close_after_final_task(
         self: &std::sync::Arc<Self>,
         client: std::sync::Arc<dyn crate::worker::client::WorkerClient>,
         chain: ChainToClose,
+        topic_closes: Vec<tokio::task::JoinHandle<()>>,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
         let this = self.clone();
         tokio::spawn(async move {
+            for topic_close in topic_closes {
+                let _ = topic_close.await;
+            }
+            if shutdown.is_cancelled() {
+                return;
+            }
             let mut delay = CLOSE_RETRY_FIRST;
             loop {
                 match this.close_if_ended(client.as_ref(), &chain).await {
@@ -365,15 +395,20 @@ impl OutputStore {
     /// Only after the promotion, so a reader that sees a topic end has every record before the
     /// close. The close lives only in this Worker, so a failure must not drop it. A refusal the
     /// store will give again is logged and given up on.
-    fn close_topics(&self, workflow_id: &str, first_run_id: &str, closes: &[OutputClose]) {
+    fn close_topics(
+        &self,
+        workflow_id: &str,
+        first_run_id: &str,
+        closes: &[OutputClose],
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if closes.is_empty() {
-            return;
+            return None;
         }
         let store = self.store.clone();
         let chain = self.chain(workflow_id, first_run_id);
         let closes = closes.to_vec();
         let shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             for close in closes {
                 let mut delay = CLOSE_RETRY_FIRST;
                 loop {
@@ -405,7 +440,7 @@ impl OutputStore {
                     delay = (delay * 2).min(CLOSE_RETRY_CAP);
                 }
             }
-        });
+        }))
     }
 
     async fn abort(&self, stage: temporalio_streams::proto::StageRef) {
