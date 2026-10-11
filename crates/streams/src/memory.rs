@@ -311,6 +311,15 @@ impl StreamStore for MemoryStore {
             .cloned())
     }
 
+    async fn trimmed(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
+        let chains = self.chains.lock().unwrap();
+        Ok(chains
+            .get(&chain_key(chain))
+            .and_then(|chain| chain.topics.get(topic))
+            .and_then(|topic| topic.base.checked_sub(1))
+            .map(|offset| offset.to_string()))
+    }
+
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
         let mut chains = self.chains.lock().unwrap();
         let chain = chains
